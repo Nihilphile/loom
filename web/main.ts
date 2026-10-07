@@ -1,0 +1,248 @@
+import './style.css';
+import type {AppState, Graph, Task, TaskInput, Session, Metrics, HarnessEvent} from '../src/shared/types.ts';
+
+const app = document.querySelector<HTMLDivElement>('#app')!;
+const dialog = document.querySelector<HTMLDialogElement>('#dialog')!;
+const notice = document.querySelector<HTMLDivElement>('#notice')!;
+let state: AppState | null = null;
+let page = 'graphs';
+let graphId = '';
+let taskId = '';
+let sessionId = '';
+let inspectTab = 'members';
+let mailAddress = '';
+let mailDirection = 'inbox';
+let events: HarnessEvent[] = [];
+let connected = false;
+let composing = false;
+let requestPending = false;
+let submitPending = false;
+let noticeTimer: ReturnType<typeof setTimeout>;
+let eventTimer: ReturnType<typeof setTimeout>;
+let eventGeneration = 0;
+const statusNames: Record<string, string> = {draft:'未运行',waiting:'等待',preparing:'准备中',running:'运行中',reviewing:'审查中',awaiting:'待续跑',blocked:'已阻塞',done:'已交付',queued:'等待加入',idle:'空闲',paused:'已暂停',pausing:'暂停中',merging:'汇总中',interrupted:'已中断',failed:'失败',ready:'已提交',approved:'通过',changes_requested:'需返修',injected:'已投递'};
+const esc = (value: unknown): string => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char] ?? char));
+const enc = encodeURIComponent;
+const badge = (status: string, label?: string) => `<span class="badge ${esc(status)}">${esc(label ?? statusNames[status] ?? status)}</span>`;
+const btn = (action: string, label: string, cls = '', disabled = false) => `<button class="btn ${cls}" data-action="${action}" ${disabled?'disabled':''}>${label}</button>`;
+const fmt = (n: number) => new Intl.NumberFormat('zh-CN',{maximumFractionDigits:1}).format(n);
+const time = (value: string) => new Date(value).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+const graph = () => state?.graphs.find(g => g.id === graphId);
+const task = () => graph()?.tasks.find(t => t.id === taskId);
+const session = () => state?.sessions.find(s => s.id === sessionId);
+const empty = (title: string, text: string, action = '') => `<div class="empty"><div class="symbol">◇</div><h2>${esc(title)}</h2><p>${esc(text)}</p>${action}</div>`;
+const field = (name: string, label: string, value = '', options = '') => `<label class="field"><span>${label}</span><input name="${name}" value="${esc(value)}" ${options}></label>`;
+const area = (name: string, label: string, value = '', options = '') => `<label class="field"><span>${label}</span><textarea name="${name}" ${options}>${esc(value)}</textarea></label>`;
+const reasonOptions = (selected = 'medium') => ['minimal','low','medium','high','xhigh'].map(r => `<option ${r===selected?'selected':''}>${r}</option>`).join('');
+const json = (value: unknown) => esc(JSON.stringify(value,null,2));
+
+async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+  const response = await fetch(path,{method,headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || `请求失败 (${response.status})`);
+  return payload;
+}
+function toast(message: string, error = false) {
+  clearTimeout(noticeTimer); notice.textContent = message; notice.className = `visible ${error?'error':''}`;
+  noticeTimer = setTimeout(() => notice.className = '', error?10000:4000);
+}
+function showError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  const target = dialog.open ? dialog.querySelector('.modalerror') : null;
+  if (target) target.textContent = message; else toast(message,true);
+}
+async function refresh() { state = await api<AppState>('/api/state'); render(); }
+async function mutate(path: string, body: unknown = {}, method = 'POST') {
+  if (requestPending) return;
+  requestPending = true;
+  const buttons = [...document.querySelectorAll<HTMLButtonElement>('button[type="submit"]')];
+  buttons.forEach(b => b.disabled = true);
+  try { const result = await api<unknown>(path,method,body); await refresh(); scheduleEvents(); return result; }
+  finally { requestPending = false; buttons.forEach(b => b.disabled = false); }
+}
+function acceptState(next: AppState) {
+  if (state?.project?.path !== next.project?.path) { graphId=''; taskId=''; sessionId=''; events=[]; }
+  state=next; render(); scheduleEvents();
+}
+function scheduleEvents() { clearTimeout(eventTimer); eventTimer=setTimeout(() => void loadEvents().catch(showError),200); }
+async function loadEvents() {
+  const generation = ++eventGeneration;
+  if (!state?.project) return;
+  const query = new URLSearchParams();
+  if(page==='sessions' && sessionId) query.set('sessionId',sessionId);
+  else if(page==='graphs' && graphId) query.set('graphId',graphId);
+  const loaded = await api<HarnessEvent[]>(`/api/events?${query}`);
+  if(generation!==eventGeneration) return;
+  events=loaded;
+  const target=document.querySelector('#trace'); if(target) { const top=target.scrollTop; target.innerHTML=traceBody(page==='logs'); target.scrollTop=top; }
+}
+function navigate(next: string) { page=next; render(false); scheduleEvents(); }
+
+function render(preserve = true) {
+  if (composing) return;
+  const controls = new Map<string,{value:string;checked?:boolean}>();
+  let focused = ''; let selectionStart: number | null=null; let selectionEnd: number | null=null;
+  if(preserve) app.querySelectorAll<HTMLInputElement|HTMLTextAreaElement|HTMLSelectElement>('input,textarea,select').forEach(el => {
+    const key=el.id||el.name; if(!key)return;
+    controls.set(key,{value:el.value,checked:el instanceof HTMLInputElement?el.checked:undefined});
+    if(el===document.activeElement){focused=key;if(el instanceof HTMLTextAreaElement){selectionStart=el.selectionStart;selectionEnd=el.selectionEnd;}}
+  });
+  const scrolls = [...app.querySelectorAll<HTMLElement>('[data-scroll]')].map(el=>({key:el.dataset.scroll,top:el.scrollTop,left:el.scrollLeft,bottom:el.scrollHeight-el.scrollTop-el.clientHeight<45}));
+  if(state && !graph()) graphId=state.graphs[0]?.id??'';
+  if(graph() && !task()) taskId=graph()?.tasks[0]?.id??'';
+  if(state && !session()) sessionId=state.sessions.find(s=>s.kind==='free')?.id??state.sessions[0]?.id??'';
+  if(!state){app.innerHTML='<div class="boot">正在连接本地工作区…</div>';return;}
+  app.innerHTML=`<div class="app">${sidebar()}<main><header class="topbar"><div class="crumb">WORKSPACE &nbsp; / &nbsp; <strong>${esc(state.project?.name??'打开项目')}</strong></div><div class="row"><span class="connection ${connected?'':'offline'}">${connected?'● 已连接':'○ 正在重连'}</span><span class="runtime">${esc(state.runtime.name)} · 本地运行</span></div></header><div class="page">${!state.project&&!['templates','types'].includes(page)?welcome():content()}</div></main></div>`;
+  if(preserve) app.querySelectorAll<HTMLInputElement|HTMLTextAreaElement|HTMLSelectElement>('input,textarea,select').forEach(el=>{
+    const key=el.id||el.name; const saved=controls.get(key);if(!saved)return;
+    el.value=saved.value;if(el instanceof HTMLInputElement && saved.checked!==undefined)el.checked=saved.checked;
+    if(key===focused){el.focus({preventScroll:true});if(el instanceof HTMLTextAreaElement && selectionStart!==null)el.setSelectionRange(selectionStart,selectionEnd);}
+  });
+  app.querySelectorAll<HTMLElement>('[data-scroll]').forEach(el=>{const old=scrolls.find(s=>s.key===el.dataset.scroll);if(old){el.scrollTop=old.bottom&&el.dataset.scroll==='messages'?el.scrollHeight:old.top;el.scrollLeft=old.left;}else if(el.dataset.scroll==='messages')el.scrollTop=el.scrollHeight;});
+}
+function sidebar() {
+  if(!state)return '';
+  const items=[['graphs','◇','Task graphs',state.graphs.length],['sessions','◷','Sessions',state.sessions.length],['mailbox','✉','Mailbox',state.letters.length],['logs','≋','运行记录',''],['stats','▤','统计',''],['types','◈','Task types',state.taskTypes.length],['templates','⊞','Agent templates',state.agentTemplates.length]];
+  return `<aside class="sidebar"><div class="brand"><span class="brandmark">⌘</span>new harness</div><div class="project"><strong>▧ &nbsp; ${esc(state.project?.name??'尚未打开项目')}</strong><div class="path mono">${esc(state.project?.path??'选择本地 Git 项目')}</div><button data-action="project">${state.project?'切换项目 ↗':'打开项目 ↗'}</button></div><div class="navlabel">WORKSPACE</div>${items.map(([id,icon,label,count])=>`${id==='types'?'<div class="navlabel">PERSONAL · 跨项目</div>':''}<button class="navbtn ${page===id?'active':''}" data-page="${id}"><span class="navicon">${icon}</span>${label}${count!==''?`<span class="count">${count}</span>`:''}</button>`).join('')}<div class="sidebarfoot"><div class="online">● &nbsp; Local workspace</div><div>${esc(state.runtime.name)}</div><div>运行记录保存在项目内</div></div></aside>`;
+}
+function welcome() {return `<section class="welcome"><div class="eyebrow">LOCAL FIRST / REAL EXECUTION</div><h1>让任务有序发生。</h1><p class="muted">打开本地项目，与 Codex 独立对话，或把工作拆成有依赖关系的任务。每次执行、工具调用与交付都有记录。</p><form data-form="project"><input name="path" aria-label="项目目录" placeholder="输入本地 Git 项目的绝对路径" required><button class="btn primary" type="submit">打开项目 →</button></form><div class="notice spaced">项目目录需要已经存在。Task graph 使用独立 Git 工作区，成果汇总到 Graph 基线。</div></section>`;}
+function content() {switch(page){case 'sessions':return sessionsPage();case 'mailbox':return mailboxPage();case 'logs':return `${intro('运行记录','原始事件与工具输入输出。点击记录查看完整内容。')}${trace(true)}`;case 'stats':return statsPage();case 'templates':return templatesPage();case 'types':return typesPage();default:return graphsPage();}}
+function intro(title: string, subtitle: string, actions = '', eyebrow = 'LOCAL WORKSPACE') {return `<div class="intro"><div><div class="eyebrow">${esc(eyebrow)}</div><h1>${esc(title)}</h1><p class="subtitle">${esc(subtitle)}</p></div><div class="row wrap">${actions}</div></div>`;}
+function cost(metrics: Metrics, command=false) {return command?'不计费':metrics.costUsd===null?'未知':`$${metrics.costUsd.toFixed(4)}`;}
+function metrics(items: Metrics[], tasks: Task[] = []) {
+  const total=items.reduce((sum,m)=>({seconds:sum.seconds+m.seconds,calls:sum.calls+m.toolCalls,tokens:sum.tokens+m.usage.inputTokens+m.usage.outputTokens}),{seconds:0,calls:0,tokens:0});
+  const known=items.length>0 && items.every(m=>m.costUsd!==null);
+  return `<div class="metrics"><div class="metric"><label>${tasks.length?'已交付 TASKS':'累计 TOKENS'}</label><div class="value">${tasks.length?tasks.filter(t=>t.status==='done').length:fmt(total.tokens)}<small>${tasks.length?`/ ${tasks.length}`:'输入 + 输出'}</small></div></div><div class="metric"><label>累计执行时间</label><div class="value">${fmt(total.seconds)}<small>sec</small></div></div><div class="metric"><label>TOOL CALLS</label><div class="value">${fmt(total.calls)}<small>实际调用</small></div></div><div class="metric"><label>模型费用</label><div class="value">${known?'$'+items.reduce((sum,m)=>sum+(m.costUsd??0),0).toFixed(4):'未知'}<small>${known?'USD':'无可信价格表'}</small></div></div></div>`;
+}
+function graphsPage() {
+  const g=graph();
+  const controls=g?`${btn('debug','Debug')}${btn('pause-soft','软暂停','',g.status!=='running')}${btn('pause-hard','硬暂停','danger',!['running','pausing'].includes(g.status))}${g.status==='blocked'?btn('resolve','重新检查阻塞','primary'):btn(g.status==='paused'?'resume':'run',g.status==='paused'?'▶ 继续运行':'▶ Run graph','primary',!['draft','paused'].includes(g.status))}`:'';
+  let output=intro(g?.name??'Task graphs','按依赖推进工作，在这里查看每个任务的真实进度。',`${btn('new-graph','＋ 新建 Graph')}${controls}`,g?`PROJECT / ${g.id}`:'PROJECT / TASK GRAPHS');
+  if(!g)return output+empty('创建第一个任务图','将目标拆分为任务，为每个任务选择类型，并连接它们的依赖。',btn('new-graph','＋ 创建任务图','primary'));
+  output+=metrics(g.tasks.flatMap(t=>t.units.filter(u=>u.kind==='agent').map(u=>u.metrics)),g.tasks);
+  return output+`<div class="workspace"><div class="stack"><section class="panel"><div class="panelhead"><div class="row"><strong>任务依赖图</strong>${badge(g.status,g.status==='done'?'已汇总':undefined)}</div><div class="row"><select class="graphchoice" id="graph-choice" aria-label="选择任务图">${state?.graphs.map(x=>`<option value="${esc(x.id)}" ${x.id===g.id?'selected':''}>${esc(x.name)}</option>`).join('')}</select>${btn('new-task','＋ Task','small',g.status==='done')}</div></div><div class="toolbar"><span>并行上限 ${g.concurrency}</span><span>·</span><span>${g.tasks.length} 个任务</span><span class="grow"></span><span>点击节点查看成员</span></div>${graphCanvas(g)}<div class="canvasfoot">连线表示前置依赖；所有前置交付后，下游才能启动。</div></section>${g.error?`<div class="notice amber">${esc(g.error)}</div>`:''}${g.status==='pausing'?'<div class="notice">正在等待活动执行结束。完全暂停后可编辑任务。</div>':''}${subscription(g)}${trace()}</div><aside class="panel">${inspector()}</aside></div>`;
+}
+function graphCanvas(g: Graph) {
+  if(!g.tasks.length)return empty('还没有任务','添加任务并选择 TaskType。',btn('new-task','＋ 添加任务'));
+  const ranks=new Map<string,number>();const visiting=new Set<string>();
+  function rank(t:Task):number {if(ranks.has(t.id))return ranks.get(t.id)??0;if(visiting.has(t.id))return 0;visiting.add(t.id);const level=t.deps.reduce((n,id)=>{const d=g.tasks.find(x=>x.id===id);return Math.max(n,d?rank(d)+1:0);},0);visiting.delete(t.id);ranks.set(t.id,level);return level;}
+  const rows=new Map<number,number>();const positions=new Map<string,{x:number;y:number}>();
+  g.tasks.forEach(t=>{const col=rank(t),row=rows.get(col)??0;rows.set(col,row+1);positions.set(t.id,{x:30+col*285,y:34+row*155});});
+  const width=Math.max(600,...[...positions.values()].map(p=>p.x+248));const height=Math.max(370,...[...positions.values()].map(p=>p.y+150));
+  return `<div class="canvas" data-scroll="canvas"><div class="world" style="width:${width}px;height:${height}px"><svg class="edges" width="${width}" height="${height}" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10z" fill="#a6bb98"/></marker></defs>${g.tasks.flatMap(t=>t.deps.map(dep=>{const a=positions.get(dep),b=positions.get(t.id);if(!a||!b)return '';return `<path d="M${a.x+216} ${a.y+52} C${a.x+250} ${a.y+52} ${b.x-35} ${b.y+52} ${b.x} ${b.y+52}" fill="none" stroke="#b9cbb0" stroke-width="1.4" marker-end="url(#arrow)"/>`;})).join('')}</svg>${g.tasks.map(t=>{const p=positions.get(t.id);return `<button class="node ${esc(t.status)} ${t.id===taskId?'selected':''}" style="left:${p?.x}px;top:${p?.y}px" data-task="${esc(t.id)}"><div class="row between"><code>${esc(t.id)}</code>${badge(t.status)}</div><h3 title="${esc(t.title)}">${esc(t.title)}</h3><div class="row between tiny muted"><span>${t.units.length} members</span><span>⑂ worktree</span></div><div class="deps">${t.deps.length?'依赖 '+t.deps.map(esc).join(' · '):'无前置依赖'}</div></button>`;}).join('')}</div></div>`;
+}
+function inspector() {
+  const t=task(),g=graph();if(!t||!g)return empty('任务详情','选择一个任务节点查看配置和交付。');
+  let body='';
+  if(inspectTab==='members')body=`<div class="prep"><div class="row between"><strong>⑂ Preparation</strong><span>程序执行 · 无模型费用</span></div><div>${t.workspace?'工作区已准备':'等待依赖交付后准备工作区'}</div></div>${t.units.map(u=>{const address=`${g.id}/${t.id}/${u.id}`;return `<div class="unit"><button class="unitmain" data-unit="${esc(u.id)}"><div class="row"><span class="avatar">${u.kind==='command'?'›_':esc(u.name.slice(0,1))}</span><div class="grow"><h3>${esc(u.name)}</h3><div class="tiny muted">${u.kind==='command'?'命令执行':`${esc(u.model||'运行时默认')} · ${esc(u.reasoning||'默认')}`}</div></div>${badge(u.status)}</div><div class="unitfoot"><span>${u.sessionId?esc(u.sessionId):'尚未启动'}</span><span>详情 ↗</span></div></button><div class="unitmetrics"><span>${fmt(u.metrics.seconds)}s<small>累计执行</small></span><span>${u.metrics.toolCalls}<small>tool calls</small></span><span>${cost(u.metrics,u.kind==='command')}<small>${u.kind==='command'?'程序成员':'模型费用'}</small></span></div><div class="unitmail"><button data-mail-address="${esc(address)}" data-direction="inbox">↓ 收件箱 ${state?.letters.filter(l=>l.to.includes(address)).length}</button><button data-mail-address="${esc(address)}" data-direction="sent">↑ 发件箱 ${state?.letters.filter(l=>l.from===address).length}</button></div></div>`;}).join('')}<p class="hint">成员配置来自 TaskType v${t.type.version} 的快照。点击成员查看初始 prompt、skills 与会话。</p>`;
+  if(inspectTab==='goal')body=`<pre>${esc(t.goal)}</pre><div class="rule">依赖：${t.deps.map(esc).join('、')||'无'}</div><div class="rule">工作区：${t.newWorktree?'独立 worktree':'共享基线'}</div>${btn('edit-task','编辑任务','spaced',!['draft','paused'].includes(g.status)||t.status==='done')}`;
+  if(inspectTab==='rules')body=`<div class="notice">规则由程序执行，不调用额外调度模型。</div><div class="rule">初始成员：${t.type.start.map(esc).join('、')}</div>${t.type.rules.map(r=>`<div class="rule"><code>${esc(r.from)} / ${esc(r.outcome)}</code><div>↓ ${r.action.type==='activate'?`启动 ${esc(r.action.unit)}`:r.action.type==='finish'?'交付任务':'标记阻塞'}</div></div>`).join('')}<p class="hint">执行轮数 ${t.round} / ${t.type.maxRounds}<br>漏报补跑上限 ${t.type.maxReportRetries}</p>`;
+  if(inspectTab==='reports')body=t.submissions.length?t.submissions.map(s=>`<button class="letter" data-report="${esc(s.id)}"><div class="row between"><code>${esc(s.unitId)}</code>${badge(s.outcome)}</div><h3>${esc(s.reportPath)}</h3><p>${esc(time(s.at))} · 查看固定内容 ↗</p></button>`).join(''):empty('暂无报告','收到报告、执行结束与任务交付是不同状态。');
+  return `<div class="tasksummary"><div class="row between"><code class="muted">TASK / ${esc(t.id)}</code>${badge(t.status)}</div><h2>${esc(t.title)}</h2><p>${esc(t.type.name)} · v${t.type.version}<br>${t.units.length} 个成员 · ${t.deps.length} 个依赖</p></div><div class="tabs">${[['members','成员'],['goal','任务说明'],['rules','调度'],['reports','交付']].map(([id,label])=>`<button data-inspect="${id}" class="${inspectTab===id?'active':''}">${label}</button>`).join('')}</div><div class="panelbody">${t.blockReason?`<div class="notice amber">${esc(t.blockReason)}<div class="spaced">${btn('resolve-task','重新检查','small')}</div></div>`:''}${t.appendBarrier?.length?`<div class="notice">等待加入：${t.appendBarrier.map(esc).join('、')} 完工后生效。</div>`:''}${body}</div>`;
+}
+function subscription(g:Graph) {return `<section class="panel"><div class="panelhead"><strong>主控订阅</strong><span class="tiny muted">通知与恢复分开</span></div><form class="panelbody inline-form" data-form="subscription"><select name="subscription" aria-label="通知范围">${[['blocked','仅阻塞'],['completed','阻塞 + 完成报告'],['review','阻塞 + 完成 + 单次审查']].map(([v,l])=>`<option value="${v}" ${g.subscription===v?'selected':''}>${l}</option>`).join('')}</select><select name="controllerSessionId" aria-label="主控会话"><option value="">选择主控自由会话</option>${state?.sessions.filter(s=>s.kind==='free').map(s=>`<option value="${esc(s.id)}" ${g.controllerSessionId===s.id?'selected':''}>${esc(s.title)}</option>`).join('')}</select><button class="btn small" type="submit">保存订阅</button></form></section>`;}
+function trace(full=false) {return `<section class="panel ${full?'full-log':''}"><div class="panelhead"><strong>运行轨迹 <span class="tiny muted">EVENTS & TOOLS</span></strong>${btn('refresh-events','↻ 刷新','small')}</div><div class="tracebody" id="trace" data-scroll="trace">${traceBody(full)}</div></section>`;}
+function traceBody(full:boolean) {const list=(full?events:events.slice(-12)).slice().reverse();return list.map(e=>`<button class="traceitem" data-event="${e.id}"><span class="mono muted">${esc(time(e.at))}</span><code>${esc([e.taskId,e.unitId].filter(Boolean).join('/')||e.type)}</code><span class="msg">${esc(e.message)}<br><span class="muted">${esc(e.type)}</span></span></button>`).join('')||empty('暂无运行记录','真实执行发生后，事件与工具记录会显示在这里。');}
+
+function sessionsPage() {
+  const s=session();
+  const list=(kind:'free'|'task')=>state?.sessions.filter(x=>x.kind===kind).map(x=>`<button class="sessionitem ${x.id===sessionId?'active':''}" data-session="${esc(x.id)}"><div class="row between"><h3>${esc(x.title)}</h3>${badge(x.status)}</div><small>${esc(x.model||'默认模型')} · ${x.turns} turns${x.taskId?` · ${esc(x.taskId)}`:''}</small></button>`).join('')||'<div class="empty">暂无会话</div>';
+  return `${intro('Sessions','自由对话与任务成员会话各自保留历史。',btn('new-session','＋ 自由会话','primary'))}<div class="sessionlayout"><section class="panel sessionlist" data-scroll="sessions"><div class="sessionsection">自由会话 · 独立对话</div>${list('free')}<div class="sessionsection">TASK 会话 · 由调度器创建</div>${list('task')}</section><div class="stack">${s?`<section class="panel"><div class="chathead"><div class="row between"><h2>${esc(s.title)}</h2>${badge(s.status)}</div><div class="tiny muted">${esc(s.model||'运行时默认模型')} · ${esc(s.reasoning||'默认推理')} · ${s.turns} turns · ${fmt(s.metrics.usage.inputTokens+s.metrics.usage.outputTokens)} tokens</div></div><div class="messages" data-scroll="messages">${s.messages.length?s.messages.map(m=>`<article class="message ${esc(m.role)}"><div class="messageheader">${esc(m.role==='user'?'你':m.role==='assistant'?'Codex':m.role==='mailbox'?'Mailbox':'系统')} · ${esc(time(m.at))}</div><p>${esc(m.text)}</p></article>`).join(''):empty('开始对话','输入目标或问题，发送后会实际调用本地 Codex。')}</div>${s.error?`<div class="notice amber">${esc(s.error)}</div>`:''}${s.kind==='free'?`<form class="composer" data-form="chat"><textarea id="chat-prompt-${esc(s.id)}" name="text" aria-label="消息" placeholder="向 Codex 发送消息…" required></textarea><div class="row between"><span class="tiny muted">Ctrl / ⌘ + Enter 发送</span><div class="row">${btn('interrupt','中断','danger',s.status!=='running'||!state?.runtime.capabilities.interrupt)}<button class="btn primary" type="submit" ${s.status==='running'?'disabled':''}>发送 ↑</button></div></div></form>`:`<div class="notice">Task 会话由调度器管理。请通过成员收发件箱发送报告文件，或在 Graph 中暂停和编辑任务。</div>`}</section>`:empty('创建一个自由会话','自由会话不属于任务图，适合调查、讨论与临时工作。',btn('new-session','＋ 创建自由会话','primary'))}${trace()}</div></div>`;
+}
+function mailboxPage() {
+  const letters=state?.letters.filter(l=>!mailAddress||(mailDirection==='sent'?l.from===mailAddress:l.to.includes(mailAddress)))??[];
+  return `${intro('Mailbox','同一 Letter 索引的收件与发件视图。每位收件人分别记录投递状态。',btn('compose','＋ 写信','primary'))}<section class="panel"><div class="letterfilters"><select id="mail-direction" aria-label="收件或发件"><option value="inbox" ${mailDirection==='inbox'?'selected':''}>收件箱</option><option value="sent" ${mailDirection==='sent'?'selected':''}>发件箱</option></select><input id="mail-address" aria-label="按成员地址筛选" placeholder="全部地址，或输入 graph/task/unit、session/id" value="${esc(mailAddress)}">${btn('filter-mail','筛选','small')}${btn('clear-mail','全部','small')}</div>${letters.length?letters.slice().reverse().map(l=>`<button class="letter" data-letter="${esc(l.id)}"><div class="row between"><span class="tiny muted">${esc(time(l.createdAt))} · ${esc(l.mode??'auto')}</span><span class="badge">${l.deliveries.filter(d=>d.status==='injected').length} / ${l.to.length} 已投递</span></div><h3>${esc(l.title)}</h3><p>${esc(l.from)} → ${l.to.map(esc).join('、')}</p></button>`).join(''):empty('暂无信件','信件引用项目中的报告文件。内容在发送时固定，之后修改文件不会改变已发送内容。')}</section>`;
+}
+function statsPage() {
+  const units=state?.graphs.flatMap(g=>g.tasks.flatMap(t=>t.units.map(u=>({g,t,u}))))??[];
+  const free=state?.sessions.filter(s=>s.kind==='free')??[];
+  const values=[...units.filter(x=>x.u.kind==='agent').map(x=>x.u.metrics),...free.map(s=>s.metrics)];
+  return `${intro('统计','每个 Agent Unit 独立累计，包含返修、补报与来信处理。')}${metrics(values)}<section class="panel scroller"><table class="table"><thead><tr><th>Unit / Session</th><th>Turns</th><th>累计执行</th><th>Tool calls</th><th>输入 / 缓存 / 输出 tokens</th><th>费用</th></tr></thead><tbody>${units.map(({g,t,u})=>`<tr><td>${esc(g.name)} / ${esc(t.title)} / ${esc(u.name)}<br><code class="muted">${esc(u.sessionId??'尚未启动')}</code></td><td>${state?.sessions.find(s=>s.id===u.sessionId)?.turns??0}</td>${metricCells(u.metrics,u.kind==='command')}</tr>`).join('')}${free.map(s=>`<tr><td><button data-session="${esc(s.id)}">${esc(s.title)}</button><br><small class="muted">自由会话</small></td><td>${s.turns}</td>${metricCells(s.metrics)}</tr>`).join('')}</tbody></table>${!values.length?empty('还没有执行数据','开始自由对话或运行任务图后，统计将来自实际运行。'):''}</section><div class="notice spaced">时间为各成员执行时间之和，并行执行时不等于 Graph 经过时间。没有可信价格表时费用保持未知；Command Unit 不产生模型费用。</div>`;
+}
+function metricCells(m:Metrics,command=false){return `<td>${fmt(m.seconds)}s</td><td>${m.toolCalls}</td><td>${fmt(m.usage.inputTokens)} / ${fmt(m.usage.cachedInputTokens)} / ${fmt(m.usage.outputTokens)}</td><td>${cost(m,command)}</td>`;}
+function templatesPage() {return `${intro('Agent templates','跨项目复用的成员配置。库更新不会回写已有任务的配置快照。',btn('new-template','＋ 创建模板','primary'),'PERSONAL LIBRARY / AGENTS')}<div class="grid3">${state?.agentTemplates.map(a=>`<article class="card"><span class="badge">v${a.version} · ${a.readOnly?'只读':'可写工作区'}</span><h2>${esc(a.name)}</h2><p>${esc(a.model||'运行时默认模型')} · ${esc(a.reasoning||'默认推理')}</p><div class="librarymeta">${a.skills.map(s=>`<span class="badge">${esc(s)}</span>`).join('')||'<span class="tiny muted">未指定 skills</span>'}</div><p>${esc(a.prompt.slice(0,150))}${a.prompt.length>150?'…':''}</p><button class="btn" data-template="${esc(a.id)}">编辑模板 ↗</button></article>`).join('')}</div>`;}
+function typesPage() {return `${intro('Task types','定义成员、初始执行与结果规则，Task 保存类型版本快照。',btn('new-type','＋ 创建类型','primary'),'PERSONAL LIBRARY / TASK TYPES')}<div class="grid3">${state?.taskTypes.map(t=>`<article class="card"><span class="badge">v${t.version} · 跨项目</span><h2>${esc(t.name)}</h2><p>${t.units.map(u=>esc(u.name)).join(' · ')}</p><div class="rule">启动：${t.start.map(esc).join('、')}</div><div class="rule">${t.rules.length} 条结果规则 · ${t.maxRounds} 轮执行上限</div><p>漏报补跑上限 ${t.maxReportRetries}</p><button class="btn" data-type="${esc(t.id)}">编辑类型 ↗</button></article>`).join('')}</div><div class="notice spaced">高级规则使用 JSON 编辑，支持 agent 与 command 成员。保存时由服务校验成员引用与规则。</div>`;}
+
+function modal(title:string,body:string,form='',submit='保存') {
+  dialog.innerHTML=`${form?`<form data-form="${form}">`:''}<header class="modalhead"><h2>${esc(title)}</h2><button type="button" class="btn small" data-action="close" aria-label="关闭对话框">✕</button></header><div class="modalbody"><div class="modalerror" role="alert"></div>${body}</div><footer class="modalfoot"><button type="button" class="btn" data-action="close">${form?'取消':'关闭'}</button>${form?`<button class="btn primary" type="submit">${submit}</button>`:''}</footer>${form?'</form>':''}`;
+  if(!dialog.open)dialog.showModal();
+}
+function projectModal(){modal('打开本地项目',field('path','项目绝对路径',state?.project?.path??'','required')+'<p class="hint">运行记录从所选项目的 .newharness 中恢复。有活动执行时，服务会拒绝切换项目。</p>','project','打开项目');}
+function sessionModal(){modal('创建自由会话',field('title','会话名称','','required placeholder="例如：梳理项目结构"')+`<div class="grid2">${field('model','模型（留空使用运行时默认）','','placeholder="Codex 模型 ID"')}<label class="field"><span>推理强度</span><select name="reasoning">${reasonOptions()}</select></label></div>`,'new-session','创建会话');}
+function taskFields(input:TaskInput,index:number,existing:Task[]=[]){return `<div class="taskrow" data-task-row><header><strong>Task ${index+1}</strong><button type="button" class="btn small danger" data-remove-row>移除</button></header><div class="grid2">${field('id','稳定 ID',input.id??`T${String(index+1).padStart(2,'0')}`,'required pattern="[A-Za-z0-9_-]+"')}${field('title','任务名称',input.title,'required')}</div>${area('goal','目标与验收要求',input.goal,'required')}<div class="grid2"><label class="field"><span>Task type</span><select name="taskTypeId">${state?.taskTypes.map(t=>`<option value="${esc(t.id)}" ${input.taskTypeId===t.id?'selected':''}>${esc(t.name)} · v${t.version}</option>`).join('')}</select></label>${field('deps','依赖任务 ID（逗号分隔）',input.deps.join(', '),`placeholder="${esc(existing.map(t=>t.id).join(', ')||'例如 T01, T02')}"`)}</div><label class="checkrow"><input name="newWorktree" type="checkbox" checked disabled>独立 worktree <span class="tiny muted">首版使用独立任务工作区</span></label></div>`;}
+function graphModal(){modal('创建任务图',`<div class="grid2">${field('name','Graph 名称','','required placeholder="例如：认证流程改造"')}${field('concurrency','并行任务上限','2','type="number" min="1" max="16" required')}</div><div id="task-rows">${taskFields({title:'',goal:'',deps:[],taskTypeId:state?.taskTypes[0]?.id??'',newWorktree:true},0)}</div><button type="button" class="btn" data-action="add-row">＋ 添加任务</button><p class="hint">任务 ID 保持稳定；依赖必须存在且不能成环。创建后可先检查任务图，再启动执行。</p>`,'new-graph','创建 Graph');}
+function taskModal(edit:boolean){const t=task();if(edit&&!t)return;const input=edit&&t?{id:t.id,title:t.title,goal:t.goal,deps:t.deps,taskTypeId:t.type.id,newWorktree:t.newWorktree}:{id:`T${String((graph()?.tasks.length??0)+1).padStart(2,'0')}`,title:'',goal:'',deps:[],taskTypeId:state?.taskTypes[0]?.id??'',newWorktree:true};modal(edit?'编辑任务':'添加任务',taskFields(input,0,graph()?.tasks??[])+(graph()?.status==='running'?'<div class="notice">运行中追加的任务将等待提交时的活动任务完工后生效。</div>':''),edit?'edit-task':'new-task',edit?'保存修改':'添加任务');dialog.querySelector('[data-remove-row]')?.remove();if(edit){const id=dialog.querySelector<HTMLInputElement>('[name=id]');if(id)id.readOnly=true;}}
+function unitModal(id:string){const t=task(),g=graph(),u=t?.units.find(x=>x.id===id);if(!u||!g||!t)return;modal(u.name,`<div class="row between">${badge(u.status)}<span class="tiny muted">${u.kind==='command'?'Command Unit':u.readOnly?'只读 Agent':'工作区可写 Agent'}</span></div><div class="rule">模型：${esc(u.model||'运行时默认')} · 推理：${esc(u.reasoning||'默认')}</div><div class="rule">Skills：${u.skills.map(esc).join('、')||'未指定'}</div><div class="rule">地址：<code>${esc(`${g.id}/${t.id}/${u.id}`)}</code></div><h3 class="spaced">初始 prompt</h3><pre class="report spaced">${esc(u.prompt||'未指定额外 prompt')}</pre>${u.command?`<h3 class="spaced">命令</h3><pre class="report spaced">${esc(u.command)}</pre>`:''}<div class="spaced">${u.sessionId?`<button class="btn primary" data-open-session="${esc(u.sessionId)}">查看真实会话 ↗</button>`:'<span class="muted">成员尚未创建会话</span>'}</div>`);}
+function composeModal(){const g=graph();const addresses=state?.graphs.flatMap(x=>x.tasks.flatMap(t=>t.units.filter(u=>u.kind==='agent').map(u=>`${x.id}/${t.id}/${u.id}`)))??[];const senders=[...state?.sessions.filter(s=>s.kind==='free').map(s=>`session/${s.id}`)??[],...addresses];modal('发送 Letter',`<label class="field"><span>Graph</span><select name="graphId" required>${state?.graphs.map(x=>`<option value="${esc(x.id)}" ${x.id===g?.id?'selected':''}>${esc(x.name)}</option>`).join('')}</select></label><label class="field"><span>发送者地址</span><select name="from" required>${senders.map(a=>`<option ${a===mailAddress?'selected':''}>${esc(a)}</option>`).join('')}</select></label>${area('to','收件人地址（可多人，每行一个或逗号分隔）',mailDirection==='inbox'?mailAddress:'','required placeholder="graph/task/unit 或 session/id"')}${field('title','标题（最多 20 个 Unicode 字符）','','required')}${field('path','报告文件路径','','required placeholder="例如 reports/findings.md"')}<label class="field"><span>投递模式</span><select name="mode"><option value="auto">auto · 按收件状态选择</option><option value="steer" ${state?.runtime.capabilities.inject?'':'disabled'}>steer · 活动执行输入${state?.runtime.capabilities.inject?'':'（运行时不支持）'}</option><option value="followup">followup · 当前执行结束后续聊</option></select></label><div class="notice">文件必须已存在。服务将固定文件内容，并单独记录每位收件人的投递结果。</div>`,'compose','发送信件');}
+function templateModal(id?:string){const a=state?.agentTemplates.find(x=>x.id===id);modal(a?'编辑 Agent template':'创建 Agent template',`<div class="grid2">${field('id','模板 ID',a?.id??'','required pattern="[A-Za-z0-9_-]+" '+(a?'readonly':''))}${field('name','显示名称',a?.name??'','required')}</div><div class="grid2">${field('model','模型',a?.model??'','placeholder="留空使用运行时默认"')}<label class="field"><span>推理强度</span><select name="reasoning">${reasonOptions(a?.reasoning)}</select></label></div>${field('skills','Skills（逗号或换行分隔）',a?.skills.join(', ')??'')}${area('prompt','初始 prompt',a?.prompt??'','rows="7"')}<label class="checkrow"><input type="checkbox" name="readOnly" ${a?.readOnly?'checked':''}>只读工作区权限</label><input type="hidden" name="version" value="${a?.version??0}"><div class="notice">保存为新的配置版本。已有 Task 的成员配置快照不变。</div>`,'template','保存模板');}
+function typeModal(id?:string){const t=state?.taskTypes.find(x=>x.id===id)??{id:'custom-type',name:'自定义类型',version:1,units:[{id:'worker',name:'Worker',kind:'agent',skills:[],prompt:'完成任务，按运行提示提交报告。',readOnly:false}],start:['worker'],rules:[{from:'worker',outcome:'ready',action:{type:'finish'}},{from:'worker',outcome:'blocked',action:{type:'block'}}],maxRounds:3,maxReportRetries:2};modal('TaskType · 高级配置',area('json','成员与调度规则 JSON',JSON.stringify(t,null,2),'class="codeeditor" spellcheck="false" required')+'<div class="notice">规则的 from 与 activate.unit 必须引用成员 ID。Command Unit 通过 command 字段配置程序验证。</div>','type','保存类型');}
+
+function value(form:HTMLFormElement|Element,name:string){const el=form.querySelector<HTMLInputElement|HTMLTextAreaElement|HTMLSelectElement>(`[name="${name}"]`);return el?.value.trim()??'';}
+function split(value:string){return value.split(/[,，\n]+/).map(s=>s.trim()).filter(Boolean);}
+function readTask(row:Element):TaskInput{return {id:value(row,'id'),title:value(row,'title'),goal:value(row,'goal'),deps:split(value(row,'deps')),taskTypeId:value(row,'taskTypeId'),newWorktree:true};}
+function validateTasks(tasks:TaskInput[]){const ids=new Set(tasks.map(t=>t.id));if(ids.size!==tasks.length)throw new Error('任务 ID 不能重复。');const visiting=new Set<string>();const visited=new Set<string>();function visit(t:TaskInput){const id=t.id??'';if(visiting.has(id))throw new Error('依赖存在环，请调整任务依赖。');if(visited.has(id))return;visiting.add(id);t.deps.forEach(d=>{const dep=tasks.find(t=>t.id===d);if(!dep)throw new Error(`依赖 ${d} 不存在。`);visit(dep);});visiting.delete(id);visited.add(id);}tasks.forEach(visit);}
+
+document.addEventListener('submit',event=>{
+  const form=event.target;if(!(form instanceof HTMLFormElement)||!form.dataset.form)return;event.preventDefault();
+  if(submitPending||requestPending)return;
+  submitPending=true;
+  const buttons=[...form.querySelectorAll<HTMLButtonElement>('button[type="submit"]')];
+  buttons.forEach(button=>button.disabled=true);
+  void submit(form).catch(showError).finally(()=>{submitPending=false;buttons.forEach(button=>button.disabled=false);});
+});
+async function submit(form:HTMLFormElement){
+  if(requestPending)return;
+  const kind=form.dataset.form;
+  if(kind==='project'){const next=await api<AppState>('/api/project','POST',{path:value(form,'path')});dialog.close();acceptState(next);toast('项目已打开');return;}
+  if(kind==='new-session'){const created=await api<Session>('/api/sessions','POST',{title:value(form,'title'),model:value(form,'model')||undefined,reasoning:value(form,'reasoning')});sessionId=created.id;dialog.close();page='sessions';await refresh();scheduleEvents();return;}
+  if(kind==='chat'){const s=session();if(!s||s.status==='running')return;const prompt=value(form,'text');if(!prompt)return;await mutate(`/api/sessions/${enc(s.id)}/turn`,{text:prompt});const input=app.querySelector<HTMLTextAreaElement>(`#chat-prompt-${CSS.escape(s.id)}`);if(input)input.value='';return;}
+  if(kind==='subscription'){const g=graph();if(!g)return;await mutate(`/api/graphs/${enc(g.id)}`,{subscription:value(form,'subscription'),controllerSessionId:value(form,'controllerSessionId')||null},'PATCH');toast('订阅已保存');return;}
+  if(kind==='new-graph'){const tasks=[...form.querySelectorAll('[data-task-row]')].map(readTask);if(!tasks.length)throw new Error('请至少添加一个任务。');validateTasks(tasks);const created=await api<Graph>('/api/graphs','POST',{name:value(form,'name'),concurrency:Number(value(form,'concurrency')),tasks});graphId=created.id;taskId=created.tasks[0]?.id??'';page='graphs';dialog.close();await refresh();scheduleEvents();return;}
+  if(kind==='new-task'||kind==='edit-task'){const g=graph(),row=form.querySelector('[data-task-row]');if(!g||!row)return;const input=readTask(row);if(kind==='new-task'&&g.tasks.some(t=>t.id===input.id))throw new Error('任务 ID 已存在，请使用新的 ID。');validateTasks([...g.tasks.filter(t=>t.id!==input.id).map(t=>({id:t.id,title:t.title,goal:t.goal,deps:t.deps,taskTypeId:t.type.id})),input]);await mutate(`/api/graphs/${enc(g.id)}/tasks${kind==='edit-task'?'/'+enc(input.id??''):''}`,input,kind==='edit-task'?'PATCH':'POST');taskId=input.id??'';dialog.close();render(false);return;}
+  if(kind==='compose'){const title=value(form,'title');if([...title].length>20)throw new Error('标题最多 20 个 Unicode 字符。');const to=split(value(form,'to'));if(!to.length)throw new Error('请至少指定一位收件人。');await mutate('/api/letters',{graphId:value(form,'graphId'),from:value(form,'from'),to,title,path:value(form,'path'),mode:value(form,'mode')});dialog.close();toast('信件已保存，投递状态见收发件箱');return;}
+  if(kind==='template'){const reason=value(form,'reasoning');if(!['minimal','low','medium','high','xhigh'].includes(reason))throw new Error('推理强度无效');const payload={id:value(form,'id'),name:value(form,'name'),version:Number(value(form,'version'))+1,model:value(form,'model')||undefined,reasoning:reason,skills:split(value(form,'skills')),prompt:value(form,'prompt'),readOnly:form.querySelector<HTMLInputElement>('[name=readOnly]')?.checked??false};await mutate('/api/catalog/agents',payload);dialog.close();toast('模板已保存');return;}
+  if(kind==='type'){const payload:unknown=JSON.parse(value(form,'json'));if(!payload||typeof payload!=='object'||!('id' in payload)||!('units' in payload)||!Array.isArray(payload.units))throw new Error('TaskType 必须包含 id 与 units 数组。');await mutate('/api/catalog/task-types',payload);dialog.close();toast('类型已保存');}
+}
+document.addEventListener('click',event=>{const target=event.target;if(!(target instanceof Element))return;const el=target.closest<HTMLElement>('button,[data-page]');if(!el || (el instanceof HTMLButtonElement&&el.disabled))return;void click(el).catch(showError);});
+async function click(el:HTMLElement){
+  if(el.dataset.page){navigate(el.dataset.page);return;}
+  if(el.dataset.task){taskId=el.dataset.task;render(false);return;}
+  if(el.dataset.inspect){inspectTab=el.dataset.inspect;render();return;}
+  if(el.dataset.session||el.dataset.openSession){sessionId=el.dataset.session??el.dataset.openSession??'';dialog.close();navigate('sessions');return;}
+  if(el.dataset.unit){unitModal(el.dataset.unit);return;}
+  if(el.dataset.mailAddress){mailAddress=el.dataset.mailAddress;mailDirection=el.dataset.direction??'inbox';navigate('mailbox');return;}
+  if(el.dataset.template){templateModal(el.dataset.template);return;}
+  if(el.dataset.type){typeModal(el.dataset.type);return;}
+  if(el.hasAttribute('data-remove-row')){el.closest('[data-task-row]')?.remove();return;}
+  if(el.dataset.event){const e=events.find(e=>String(e.id)===el.dataset.event);if(e)modal(e.type,`<p class="muted">${esc(e.at)}</p><p class="spaced">${esc(e.message)}</p><pre class="jsondetail">${json(e.detail??e)}</pre>`);return;}
+  if(el.dataset.report){const report=await api<{content:string;reportPath?:string}>(`/api/reports/${enc(el.dataset.report)}`);modal('报告 · 固定内容',`<p class="muted wordwrap">${esc(report.reportPath??'')}</p><pre class="report spaced">${esc(report.content)}</pre>`);return;}
+  if(el.dataset.letter){const l=state?.letters.find(l=>l.id===el.dataset.letter);if(l)modal(l.title,`<div class="rule address">${esc(l.from)} → ${l.to.map(esc).join('、')}</div><div class="rule">报告文件：${esc(l.path)}</div>${l.deliveries.map(d=>`<div class="rule address">${esc(d.to)} ${badge(d.status)}${d.error?`<p class="dangertext">${esc(d.error)}</p>`:''}</div>`).join('')}<pre class="report spaced">${esc(l.content)}</pre>`);return;}
+  const action=el.dataset.action;const g=graph();
+  switch(action){
+    case 'close':dialog.close();break;
+    case 'project':projectModal();break;
+    case 'new-session':sessionModal();break;
+    case 'new-graph':graphModal();break;
+    case 'new-task':taskModal(false);break;
+    case 'edit-task':taskModal(true);break;
+    case 'new-template':templateModal();break;
+    case 'new-type':typeModal();break;
+    case 'compose':composeModal();break;
+    case 'add-row':{const rows=dialog.querySelector('#task-rows');const index=rows?.children.length??0;rows?.insertAdjacentHTML('beforeend',taskFields({title:'',goal:'',deps:[],taskTypeId:state?.taskTypes[0]?.id??''},index));break;}
+    case 'run':case 'resume':if(g)await mutate(`/api/graphs/${enc(g.id)}/${action}`);break;
+    case 'pause-soft':case 'pause-hard':if(g)await mutate(`/api/graphs/${enc(g.id)}/pause`,{mode:action==='pause-soft'?'soft':'hard'});break;
+    case 'resolve':case 'resolve-task':if(g)await mutate(`/api/graphs/${enc(g.id)}/resolve`,action==='resolve-task'?{taskId}:{});break;
+    case 'interrupt':if(sessionId)await mutate(`/api/sessions/${enc(sessionId)}/interrupt`);break;
+    case 'debug':if(g){const debug=await api<unknown>(`/api/graphs/${enc(g.id)}/debug`);modal('Debug · 内部运行记录',`<div class="notice">Git 版本、工作区路径与内部运行状态。凭据不会显示在这里。</div><pre class="jsondetail">${json(debug)}</pre>`);}break;
+    case 'refresh-events':await loadEvents();break;
+    case 'filter-mail':mailAddress=app.querySelector<HTMLInputElement>('#mail-address')?.value.trim()??'';mailDirection=app.querySelector<HTMLSelectElement>('#mail-direction')?.value??'inbox';render(false);break;
+    case 'clear-mail':mailAddress='';render(false);break;
+  }
+}
+document.addEventListener('change',event=>{const el=event.target;if(el instanceof HTMLSelectElement&&el.id==='graph-choice'){graphId=el.value;taskId='';events=[];render(false);scheduleEvents();}});
+document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'&&event.target instanceof HTMLTextAreaElement&&event.target.closest('[data-form="chat"]')){event.preventDefault();event.target.closest('form')?.requestSubmit();}});
+app.addEventListener('compositionstart',()=>composing=true);
+app.addEventListener('compositionend',()=>{composing=false;render();});
+dialog.addEventListener('click',event=>{if(event.target===dialog){const r=dialog.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)dialog.close();}});
+async function start(){try{await refresh();const stream=new EventSource('/api/stream');stream.addEventListener('open',()=>{connected=true;render();});stream.addEventListener('state',event=>{try{acceptState(JSON.parse(event.data));}catch(error){showError(error);}});stream.addEventListener('error',()=>{connected=false;render();});scheduleEvents();}catch(error){app.innerHTML=`<div class="welcome"><h1>无法连接本地服务</h1><p class="muted">${esc(error instanceof Error?error.message:error)}</p><button class="btn primary" id="retry">重新连接</button></div>`;document.querySelector('#retry')?.addEventListener('click',()=>void start());}}
+void start();

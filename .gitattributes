@@ -3,4 +3,4 @@
 *.json text eol=lf
 *.css text eol=lf
 *.html text eol=lf
-.task-graph/snapshots/** -text
+.task-graph/snapshots/** -text whitespace=cr-at-eol

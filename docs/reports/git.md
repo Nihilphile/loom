@@ -6,7 +6,7 @@
 - 工作区位于 `<project>/.newharness/worktrees/<run>/<graph>/`。Task 从 Graph 固定起点创建，只合并传入的完整依赖 SHA。
 - 冲突抛出 `GitBlockedError`，消息包含工作区路径，`workspace` 字段提供完整工作区。未解决冲突不能快照；解决并暂存后，同一个 `createTask` 或 `mergeFinal` 请求继续合并，不删除工作区或自动丢弃冲突。
 - 快照以 Git 引用事务同时更新分支与操作回执。相同操作 ID 在新适配器实例中仍返回原 SHA；依赖使用固定 SHA，不追随上游后续提交。
-- 快照排除根目录的 `.newharness`、`.session`、`taskgraph`，包括之前被跟踪或暂存的文件。只移出索引，磁盘内容保留。
+- 整合后快照仅排除保留的 `.newharness` 目录，包括之前被跟踪或暂存的元数据。项目自己的 `.session` 或 `taskgraph` 文件不被误排除。元数据只移出索引，磁盘内容保留。
 - 最终成果只合并到 Graph 专用分支。没有 push、原分支合并、全局配置写入或自动清理。Git 使用分离参数与命令级身份配置，禁用交互和 hooks。
 
 验证环境为 Windows、Node v24.18.0、Git 2.53.0.windows.2。`npm test` 通过 5 项，包括现有基础测试和 4 项真实临时仓库测试；`npm run typecheck` 通过。最初缺失实现的测试及暂存元数据边界测试均观察到失败，再修正并通过。

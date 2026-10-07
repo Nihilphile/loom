@@ -1,0 +1,11 @@
+{
+  "graph": "G-001",
+  "tasks": [
+    {"key":"harness-foundation","summary":"打开本地项目并持久化会话记录","content":"docs/tasks/foundation.md","contracts":["C-0001"]},
+    {"key":"harness-runtime","summary":"执行与恢复真实 Codex 会话","content":"docs/tasks/runtime.md","contracts":["C-0001"],"depends_on":["@harness-foundation"]},
+    {"key":"harness-git","summary":"隔离工作区并自动固定 Git 成果","content":"docs/tasks/git-workspaces.md","contracts":["C-0001"],"depends_on":["@harness-foundation"]},
+    {"key":"harness-ui","summary":"在 Web 工作台操作真实会话与任务图","content":"docs/tasks/web-ui.md","contracts":["C-0001"],"depends_on":["@harness-foundation"]},
+    {"key":"harness-scheduler","summary":"通过 CLI 交卷驱动审查和 DAG","content":"docs/tasks/scheduler.md","contracts":["C-0001"],"depends_on":["@harness-runtime","@harness-git"]},
+    {"key":"harness-control","summary":"暂停恢复与自动投信并完成整体验收","content":"docs/tasks/control-mailbox.md","contracts":["C-0001"],"depends_on":["@harness-scheduler","@harness-ui"]}
+  ]
+}

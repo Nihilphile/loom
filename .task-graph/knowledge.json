@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "contracts": [
+    {
+      "id": "C-0001",
+      "graph": "G-001",
+      "title": "New Harness 首版行为规格",
+      "file": "docs/SPEC.md",
+      "references": [],
+      "history": [
+        {
+          "event": "created",
+          "at": "2026-10-08T05:17:04+08:00",
+          "actor": null
+        }
+      ]
+    }
+  ],
+  "references": [],
+  "decisions": []
+}

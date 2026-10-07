@@ -1,0 +1,9 @@
+version: 2
+name: new-harness
+graphs:
+  - id: G-001
+    title: New Harness 首版施工
+    config:
+      refine: false
+      auto_review: false
+sources: []

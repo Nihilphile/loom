@@ -7,7 +7,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "dev": "tsx src/server/main.ts",
+    "dev": "npm run build && node dist/server/main.js",
     "build": "tsc -p tsconfig.server.json && vite build",
     "start": "node dist/server/main.js",
     "typecheck": "tsc --noEmit",

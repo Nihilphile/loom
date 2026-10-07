@@ -11,3 +11,7 @@
 自检覆盖 Standards 与 Spec 两轴，修复了新增任务的稳定 ID 冲突检查，以及重复提交表单的防护。未增加第三方前端依赖。
 
 已执行：`npm ci`、`npm run typecheck`、`npm run build` 均通过。生产构建产物位于 `dist/web`。真实浏览器与 Codex 集成验收由主控在服务切片合并后执行；本报告不把编译成功当作浏览器或运行时验收。
+
+## Integrated browser acceptance
+
+Parent merged the UI and verified the actual service on 4317 using browser controls. Created a real free chat and an A(worker/reviewer) -> B(worker) graph; the graph completed with three actual CLI reports. Verified unit detail, Debug, statistics, separated session groups, persisted history after service restart, draft letter send/sent filtering and 390px layout. Fixed HTML pattern escaping found in Chromium. Screenshots and precise runtime evidence are listed in acceptance.md.

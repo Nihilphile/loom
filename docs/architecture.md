@@ -7,7 +7,7 @@
 `npm run dev` 启动 localhost:4317。打开一个项目，创建自由会话或 Graph，点击运行。Agent 由启动提示得知 `node <cli路径> unit report --outcome ready --report <文件>`；凭据在子进程环境中，不要求 agent 填运行 ID。
 
 ```ts
-const engine = await HarnessEngine.open(projectRoot, {runtime, git, catalog});
+const engine = new HarnessEngine(projectRoot, runtime, git, catalog);
 const session = engine.createSession({title: '调查接口'});
 await engine.sendMessage(session.id, '说明现有认证流程');
 const graph = engine.createGraph({name: '认证改造', tasks: [...]});

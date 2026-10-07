@@ -8,6 +8,8 @@ import type {
   RuntimeHandle,
   RuntimeInput,
   RuntimeResult,
+  RuntimeOptions,
+  Reasoning,
   Usage,
 } from "../shared/types.ts";
 
@@ -28,6 +30,47 @@ const string = (value: unknown): string =>
   typeof value === "string" ? value : "";
 const message = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+function nativeInput(
+  text: string,
+  input: Pick<RuntimeInput, "attachments" | "skills"> = {},
+): JsonObject[] {
+  const files = (input.attachments ?? []).filter(
+    (attachment) => attachment.kind === "file",
+  );
+  const prompt = [
+    text.trim() ? text : "",
+    ...files.map(
+      (file) =>
+        `Read the attached file ${JSON.stringify(file.name)} at ${JSON.stringify(file.path)}.`,
+    ),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  return [
+    ...(prompt ? [{ type: "text", text: prompt, text_elements: [] }] : []),
+    ...(input.attachments ?? [])
+      .filter((attachment) => attachment.kind === "image")
+      .map((image) => ({ type: "localImage", path: image.path })),
+    ...(input.skills ?? []).map((skill) => ({
+      type: "skill",
+      name: skill.name,
+      path: skill.path,
+    })),
+  ];
+}
+
+const reasoningValues: Reasoning[] = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+];
+const reasoning = (value: unknown): value is Reasoning =>
+  reasoningValues.includes(value as Reasoning);
 
 function redact(value: unknown, secrets: string[]): unknown {
   if (typeof value === "string")
@@ -95,6 +138,160 @@ export class CodexRuntime implements Runtime {
   private closed = false;
 
   constructor(private readonly options: CodexRuntimeOptions = {}) {}
+
+  async discoverOptions(cwd: string): Promise<RuntimeOptions> {
+    if (this.closed) throw new Error("Runtime is closed");
+    cwd = realpathSync.native(cwd);
+    const child = spawn(
+      this.options.executable ?? executable(),
+      this.options.args ?? ["app-server", "--listen", "stdio://"],
+      {
+        cwd,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    let sequence = 0;
+    const pending = new Map<
+      number,
+      {
+        resolve(value: unknown): void;
+        reject(error: Error): void;
+        timer: NodeJS.Timeout;
+      }
+    >();
+    const fail = (error: Error) => {
+      for (const request of pending.values()) {
+        clearTimeout(request.timer);
+        request.reject(error);
+      }
+      pending.clear();
+    };
+    const exited = new Promise<void>((resolve) =>
+      child.on("close", () => {
+        fail(new Error("Codex metadata process exited"));
+        resolve();
+      }),
+    );
+    child.on("error", fail);
+    child.stdin.on("error", fail);
+    child.stderr.resume();
+    createInterface({ input: child.stdout }).on("line", (line) => {
+      try {
+        const packet = object(JSON.parse(line));
+        const request = pending.get(Number(packet.id));
+        if (!request) return;
+        clearTimeout(request.timer);
+        pending.delete(Number(packet.id));
+        if (packet.error)
+          request.reject(
+            new Error(
+              string(object(packet.error).message) ||
+                "Codex metadata request failed",
+            ),
+          );
+        else request.resolve(packet.result);
+      } catch {
+        fail(new Error("Codex emitted invalid metadata JSON"));
+      }
+    });
+    const request = (method: string, params: unknown): Promise<unknown> =>
+      new Promise((resolve, reject) => {
+        const id = ++sequence;
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`Codex ${method} timed out`));
+        }, this.options.requestTimeoutMs ?? 30_000);
+        pending.set(id, { resolve, reject, timer });
+        child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
+      });
+    try {
+      await request("initialize", {
+        clientInfo: { name: "new_harness", version: "0.1.0" },
+        capabilities: { experimentalApi: true },
+      });
+      child.stdin.write(`${JSON.stringify({ method: "initialized" })}\n`);
+      const result: RuntimeOptions = { models: [], skills: [], warnings: [] };
+      let cursor: string | undefined;
+      const cursors = new Set<string>();
+      do {
+        const page = object(
+          await request("model/list", {
+            limit: 100,
+            ...(cursor ? { cursor } : {}),
+          }),
+        );
+        if (!Array.isArray(page.data))
+          throw new Error("Codex returned an invalid model catalog");
+        for (const value of page.data) {
+          const model = object(value);
+          if (model.hidden === true || !string(model.model)) continue;
+          result.models.push({
+            id: string(model.model),
+            name: string(model.displayName) || string(model.model),
+            reasoning: (Array.isArray(model.supportedReasoningEfforts)
+              ? model.supportedReasoningEfforts
+              : []
+            )
+              .map((entry) => object(entry).reasoningEffort)
+              .filter(reasoning),
+            ...(reasoning(model.defaultReasoningEffort)
+              ? { defaultReasoning: model.defaultReasoningEffort }
+              : {}),
+            isDefault: model.isDefault === true,
+            ...(Array.isArray(model.inputModalities)
+              ? {
+                  inputModalities: model.inputModalities.filter(
+                    (value): value is string => typeof value === "string",
+                  ),
+                }
+              : {}),
+          });
+        }
+        cursor = string(page.nextCursor) || undefined;
+        if (cursor && cursors.has(cursor))
+          throw new Error("Codex repeated its model catalog cursor");
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      const skills = object(
+        await request("skills/list", { cwds: [cwd], forceReload: true }),
+      );
+      if (!Array.isArray(skills.data))
+        throw new Error("Codex returned an invalid skill catalog");
+      for (const value of skills.data) {
+        const group = object(value);
+        for (const value of Array.isArray(group.skills) ? group.skills : []) {
+          const skill = object(value);
+          if (
+            skill.enabled === false ||
+            !string(skill.name) ||
+            !string(skill.path)
+          )
+            continue;
+          result.skills.push({
+            name: string(skill.name),
+            path: string(skill.path),
+            description: string(skill.description),
+          });
+        }
+        for (const value of Array.isArray(group.errors) ? group.errors : []) {
+          const error = object(value);
+          result.warnings.push(
+            `${string(error.path)}: ${string(error.message) || "Skill discovery failed"}`,
+          );
+        }
+      }
+      return result;
+    } finally {
+      child.stdin.end();
+      const timer = setTimeout(
+        () => child.kill(),
+        this.options.shutdownTimeoutMs ?? 5000,
+      );
+      await exited;
+      clearTimeout(timer);
+    }
+  }
 
   async start(
     input: RuntimeInput,
@@ -180,6 +377,7 @@ class CodexExecution {
   private baseline?: Usage;
   private turnRequested = false;
   private readonly previousTurns = new Set<string>();
+  private lastPreviousTurn?: string;
   private phase: "starting" | "running" | "stopping" | "closed" = "starting";
   private interrupted = false;
   private result?: RuntimeResult;
@@ -208,7 +406,7 @@ class CodexExecution {
       done,
       pid: child.pid,
       interrupt: () => this.interrupt(),
-      inject: (text) => this.inject(text),
+      inject: (text, input) => this.inject(text, input),
     };
     createInterface({ input: child.stdout }).on("line", (line) =>
       this.receive(line),
@@ -284,10 +482,16 @@ class CodexExecution {
     );
     this.threadId = string(object(response.thread).id);
     const turns = object(response.thread).turns;
-    if (Array.isArray(turns))
+    if (Array.isArray(turns)) {
       for (const turn of turns) this.previousTurns.add(string(object(turn).id));
+      this.lastPreviousTurn = string(object(turns.at(-1)).id) || undefined;
+    }
     if (!this.threadId) throw new Error("Codex did not return a thread ID");
-    this.emit({ type: "thread.started", threadId: this.threadId });
+    this.emit({
+      type: "thread.started",
+      threadId: this.threadId,
+      ...(string(response.model) ? { model: string(response.model) } : {}),
+    });
     if (this.phase !== "starting") return;
     const sandboxPolicy = this.input.readOnly
       ? { type: "readOnly", networkAccess: true }
@@ -305,7 +509,7 @@ class CodexExecution {
       await this.request("turn/start", {
         threadId: this.threadId,
         cwd: resolve(this.input.cwd),
-        input: [{ type: "text", text: this.input.prompt }],
+        input: nativeInput(this.input.prompt, this.input),
         model: this.input.model,
         effort: this.input.reasoning,
         approvalPolicy: "never",
@@ -418,6 +622,8 @@ class CodexExecution {
     if (params.threadId && this.threadId && params.threadId !== this.threadId)
       return;
     this.emit({ type: "log", detail: { method, params } });
+    if (method === "model/rerouted" && string(params.toModel))
+      this.emit({ type: "model.resolved", model: string(params.toModel) });
     const item = object(params.item);
     if (method === "turn/started")
       this.turnId = string(object(params.turn).id) || this.turnId;
@@ -447,7 +653,30 @@ class CodexExecution {
       });
     }
     if (method === "thread/tokenUsage/updated") {
-      const total = object(object(params.tokenUsage).total);
+      const tokenUsage = object(params.tokenUsage);
+      const total = object(tokenUsage.total);
+      const previous = this.previousTurns.has(string(params.turnId));
+      const lastTokens = object(tokenUsage.last).totalTokens;
+      const window = tokenUsage.modelContextWindow;
+      if (
+        !previous &&
+        typeof lastTokens === "number" &&
+        Number.isFinite(lastTokens) &&
+        lastTokens >= 0
+      ) {
+        this.emit({
+          type: "context.usage",
+          contextUsage: {
+            tokens: lastTokens,
+            window:
+              typeof window === "number" &&
+              Number.isFinite(window) &&
+              window > 0
+                ? window
+                : null,
+          },
+        });
+      }
       const values = [
         total.inputTokens,
         total.cachedInputTokens,
@@ -466,26 +695,22 @@ class CodexExecution {
         };
         if (
           !this.turnRequested ||
-          this.previousTurns.has(string(params.turnId))
+          (previous && params.turnId === this.lastPreviousTurn && !this.usage)
         )
           this.baseline = current;
-        else {
+        else if (!previous && (!this.input.threadId || this.baseline)) {
           this.usage = {
-            inputTokens: Math.max(
-              0,
+            inputTokens:
               current.inputTokens - (this.baseline?.inputTokens ?? 0),
-            ),
-            cachedInputTokens: Math.max(
-              0,
+            cachedInputTokens:
               current.cachedInputTokens -
-                (this.baseline?.cachedInputTokens ?? 0),
-            ),
-            outputTokens: Math.max(
-              0,
+              (this.baseline?.cachedInputTokens ?? 0),
+            outputTokens:
               current.outputTokens - (this.baseline?.outputTokens ?? 0),
-            ),
           };
-          this.emit({ type: "usage", usage: this.usage });
+          if (Object.values(this.usage).some((value) => value < 0))
+            this.usage = undefined;
+          else this.emit({ type: "usage", usage: this.usage });
         }
       }
     }
@@ -603,12 +828,16 @@ class CodexExecution {
     await this.handle.done;
   }
 
-  private async inject(text: string): Promise<boolean> {
+  private async inject(
+    text: string,
+    input?: Pick<RuntimeInput, "attachments" | "skills">,
+  ): Promise<boolean> {
+    const items = nativeInput(text, input);
     if (
       this.phase !== "running" ||
       !this.threadId ||
       !this.turnId ||
-      !text.trim()
+      !items.length
     )
       return false;
     try {
@@ -616,7 +845,7 @@ class CodexExecution {
         await this.request("turn/steer", {
           threadId: this.threadId,
           expectedTurnId: this.turnId,
-          input: [{ type: "text", text }],
+          input: items,
         }),
       );
       return response.turnId === this.turnId;

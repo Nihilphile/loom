@@ -5,6 +5,7 @@ import type {
   UnitConfig,
   AgentTemplate,
   Reasoning,
+  TurnInput,
 } from "../shared/types.ts";
 
 export function text(value: unknown, label: string): string {
@@ -25,7 +26,11 @@ export function strings(value: unknown, label: string): string[] {
 }
 export function reasoning(value: unknown): Reasoning | undefined {
   if (value === undefined || value === "") return undefined;
-  if (!["minimal", "low", "medium", "high", "xhigh"].includes(String(value)))
+  if (
+    !["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(
+      String(value),
+    )
+  )
     throw new Error("无效 reasoning");
   return value as Reasoning;
 }
@@ -120,4 +125,54 @@ export function validateDag(tasks: Pick<Graph, "tasks">["tasks"]) {
     visited.add(id);
   };
   tasks.forEach((t) => visit(t.id));
+}
+
+export function validateTurn(input: TurnInput): TurnInput {
+  if (!input || typeof input !== "object" || typeof input.text !== "string")
+    throw new Error("Invalid turn");
+  const mode = input.mode ?? "send";
+  if (!["send", "queue", "steer"].includes(mode))
+    throw new Error("Invalid turn mode");
+  if (
+    input.requestId !== undefined &&
+    (typeof input.requestId !== "string" ||
+      !input.requestId.trim() ||
+      input.requestId.length > 200)
+  )
+    throw new Error("Invalid requestId");
+  if (input.expectedExecutionId !== undefined)
+    identifier(input.expectedExecutionId);
+  if (
+    input.attachmentIds !== undefined &&
+    (!Array.isArray(input.attachmentIds) ||
+      input.attachmentIds.some((id) => typeof id !== "string"))
+  )
+    throw new Error("Invalid attachment IDs");
+  if (
+    input.skills !== undefined &&
+    (!Array.isArray(input.skills) ||
+      input.skills.some(
+        (skill) =>
+          !skill ||
+          typeof skill.name !== "string" ||
+          typeof skill.path !== "string",
+      ))
+  )
+    throw new Error("Invalid skills");
+  if (
+    !input.text.trim() &&
+    !input.attachmentIds?.length &&
+    !input.skills?.length
+  )
+    throw new Error("Empty turn");
+  return {
+    text: input.text.trim(),
+    mode,
+    requestId: input.requestId,
+    expectedExecutionId: input.expectedExecutionId,
+    model: input.model === undefined ? undefined : text(input.model, "model"),
+    reasoning: reasoning(input.reasoning),
+    attachmentIds: input.attachmentIds ? [...input.attachmentIds] : [],
+    skills: input.skills ? structuredClone(input.skills) : [],
+  };
 }

@@ -13,6 +13,8 @@ import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import type {
   AppState,
+  TurnInput,
+  RuntimeInput,
   HarnessEvent,
   ProjectState,
   Runtime,
@@ -35,6 +37,7 @@ import type {
   AgentTemplate,
 } from "../shared/types.ts";
 import { emptyMetrics } from "../shared/types.ts";
+import { resolveAttachments } from "./attachments.ts";
 import { ProjectStore } from "./store.ts";
 import { Catalog } from "./catalog.ts";
 import {
@@ -44,6 +47,7 @@ import {
   validateTask,
   validateType,
   validateAgent,
+  validateTurn,
 } from "./validation.ts";
 
 const now = () => new Date().toISOString();
@@ -63,6 +67,7 @@ export class HarnessEngine {
   private pumping = new Set<string>();
   private preparing = new Set<string>();
   private closing = false;
+  private turnOperations = new Map<string, Promise<unknown>>();
   constructor(
     root: string,
     readonly runtime: Runtime,
@@ -92,6 +97,9 @@ export class HarnessEngine {
         }
       }
     }
+    for (const session of this.state.sessions) {
+      if (session.queue?.length) session.queuePaused = true;
+    }
     for (const graph of this.state.graphs) {
       if (["running", "pausing", "merging"].includes(graph.status)) {
         graph.status = "paused";
@@ -116,6 +124,9 @@ export class HarnessEngine {
       sessions: this.state.sessions,
       graphs: this.state.graphs,
       letters: this.state.letters,
+      executions: this.state.executions.map(
+        ({ tokenHash, ...execution }) => execution,
+      ),
       agentTemplates: this.catalog.agents,
       taskTypes: this.catalog.taskTypes,
       runtime: {
@@ -168,18 +179,204 @@ export class HarnessEngine {
     this.record("session.created", "创建自由会话", { sessionId: session.id });
     return session;
   }
-  sendMessage(id: string, message: string) {
+  async sendMessage(id: string, message: string | TurnInput): Promise<Session> {
+    const input = validateTurn(
+      typeof message === "string" ? { text: message } : message,
+    );
+    const session = this.session(id);
+    const target = this.state.executions.find(
+      (e) => e.sessionId === id && activeExecution(e),
+    );
+    const previous = this.turnOperations.get(id) ?? Promise.resolve();
+    const operation = previous
+      .catch(() => {})
+      .then(async () => {
+        if (this.closing) throw new Error("Engine is closing");
+        if (session.kind !== "free")
+          throw new Error("Task sessions require Mailbox messages");
+        const fingerprint = hash(JSON.stringify(input));
+        const accepted = session.turnRequests?.find(
+          (r) => r.requestId === input.requestId,
+        );
+        if (accepted) {
+          if (accepted.fingerprint !== fingerprint)
+            throw new Error("requestId already used for a different turn");
+          if (accepted.error) throw new Error(accepted.error);
+          return session;
+        }
+        const attachments = resolveAttachments(
+          this.state.project.path,
+          input.attachmentIds ?? [],
+        );
+        if (input.skills?.length) {
+          if (!this.runtime.discoverOptions)
+            throw new Error("Runtime does not support skill discovery");
+          const options = await this.runtime.discoverOptions(
+            this.state.project.path,
+          );
+          for (const skill of input.skills)
+            if (
+              !options.skills.some(
+                (s) => s.name === skill.name && s.path === skill.path,
+              )
+            )
+              throw new Error("Skill is unavailable in this project");
+        }
+        if (this.closing) throw new Error("Engine is closing");
+        const remember = (error?: string) => {
+          if (!input.requestId) return;
+          const receipt = { requestId: input.requestId, fingerprint, error };
+          (session.turnRequests ??= []).push(receipt);
+          return receipt;
+        };
+        if (input.mode === "steer") {
+          if (
+            !target ||
+            !activeExecution(target) ||
+            (input.expectedExecutionId &&
+              input.expectedExecutionId !== target.id)
+          )
+            throw new Error("Target execution ended or changed");
+          if (input.model !== undefined || input.reasoning !== undefined)
+            throw new Error("Cannot change model or reasoning during steering");
+          const handle = this.handles.get(id);
+          if (!handle || !this.runtime.capabilities.inject)
+            throw new Error("Active execution cannot accept steering");
+          const receipt = remember(
+            "Steering delivery is unconfirmed; inspect the current session before sending another request",
+          );
+          this.record("session.steer_requested", "Steering requested", {
+            sessionId: id,
+          });
+          if (
+            !(await handle.inject(input.text, {
+              attachments,
+              skills: input.skills,
+            }))
+          ) {
+            const error = "Active execution did not confirm steering";
+            if (receipt) receipt.error = error;
+            this.record("session.steer_unconfirmed", error, { sessionId: id });
+            throw new Error(error);
+          }
+          if (!activeExecution(target) || this.handles.get(id) !== handle)
+            throw new Error("Target execution ended");
+          if (receipt) delete receipt.error;
+          session.messages.push({
+            id: randomUUID(),
+            role: "user",
+            text: input.text,
+            at: now(),
+            attachments: attachments.map(({ path, ...a }) => a),
+            skills: input.skills,
+            delivery: "steer",
+          });
+          this.record(
+            "session.steered",
+            "Message accepted by active execution",
+            { sessionId: id },
+          );
+          return session;
+        }
+        const snapshot = {
+          ...input,
+          model: input.model ?? session.model,
+          reasoning: input.reasoning ?? session.reasoning,
+        };
+        if (input.mode === "queue") {
+          (session.queue ??= []).push({
+            id: randomUUID(),
+            input: snapshot,
+            attachments: attachments.map(({ path, ...a }) => a),
+            createdAt: now(),
+          });
+          remember();
+          this.record("session.queued", "Message queued", { sessionId: id });
+          this.drainQueue(session);
+        } else {
+          this.ensureStopped(session);
+          if (session.queue?.length)
+            throw new Error(
+              "Continue or cancel existing queued messages first",
+            );
+          remember();
+          this.launchTurn(session, snapshot, attachments);
+        }
+        return session;
+      });
+    this.turnOperations.set(id, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.turnOperations.get(id) === operation)
+        this.turnOperations.delete(id);
+    }
+  }
+  cancelQueued(id: string, queueId: string): Session {
+    const session = this.session(id);
+    const index = session.queue?.findIndex((item) => item.id === queueId) ?? -1;
+    if (index < 0) throw new Error("Queued message not found");
+    session.queue!.splice(index, 1);
+    this.record("session.queue_cancelled", "Queued message cancelled", {
+      sessionId: id,
+    });
+    return session;
+  }
+  continueQueue(id: string): Session {
     const session = this.session(id);
     if (session.kind !== "free")
-      throw new Error("Task 会话由调度器驱动，请通过 Mailbox 发信");
+      throw new Error("Task sessions require scheduler control");
     this.ensureStopped(session);
+    session.queuePaused = false;
+    this.record("session.queue_continued", "Queue resumed", { sessionId: id });
+    this.drainQueue(session);
+    return session;
+  }
+  private launchTurn(
+    session: Session,
+    input: TurnInput,
+    attachments = resolveAttachments(
+      this.state.project.path,
+      input.attachmentIds ?? [],
+    ),
+  ) {
+    session.model = input.model;
+    session.reasoning = input.reasoning;
     this.launch(
       session,
-      text(message, "消息"),
+      input.text,
       "chat",
       this.state.project.path,
+      undefined,
+      { attachments, skills: input.skills },
+      input.mode === "queue",
     );
-    return session;
+  }
+  private drainQueue(session: Session) {
+    if (
+      this.closing ||
+      session.queuePaused ||
+      this.jobs.has(session.id) ||
+      session.status === "running" ||
+      !session.queue?.length
+    )
+      return;
+    try {
+      this.ensureStopped(session);
+      const next = session.queue[0];
+      const attachments = resolveAttachments(
+        this.state.project.path,
+        next.input.attachmentIds ?? [],
+      );
+      session.queue.shift();
+      this.launchTurn(session, next.input, attachments);
+    } catch (error) {
+      session.queuePaused = true;
+      session.error = errorText(error);
+      this.record("session.queue_paused", session.error, {
+        sessionId: session.id,
+      });
+    }
   }
   private ensureStopped(session: Session) {
     if (session.status === "running" || this.jobs.has(session.id))
@@ -753,6 +950,8 @@ export class HarnessEngine {
     purpose: Execution["purpose"],
     cwd: string,
     context?: { graph: Graph; task: Task; unit: Unit; reports: string },
+    turnInput?: Pick<RuntimeInput, "attachments" | "skills">,
+    queued = false,
   ) {
     this.ensureStopped(session);
     if (context?.unit.kind === "command") session.metrics.costUsd = 0;
@@ -768,6 +967,10 @@ export class HarnessEngine {
       startedAt: now(),
       tokenHash: context && purpose !== "mail" ? hash(token) : undefined,
       configRevision: context?.task.configRevision,
+      model: context?.unit.model || session.model,
+      reasoning: context?.unit.reasoning || session.reasoning,
+      metrics: emptyMetrics(),
+      usageKnown: false,
     };
     this.state.executions.push(execution);
     session.status = "running";
@@ -793,6 +996,11 @@ export class HarnessEngine {
       role: purpose === "chat" ? "user" : "system",
       text: prompt,
       at: now(),
+      attachments: turnInput?.attachments?.map(
+        ({ path, ...attachment }) => attachment,
+      ),
+      skills: turnInput?.skills,
+      delivery: queued ? "queued" : undefined,
     });
     this.record("execution.starting", "启动执行", {
       sessionId: session.id,
@@ -818,6 +1026,7 @@ export class HarnessEngine {
             : await this.runtime.start(
                 {
                   cwd,
+                  ...turnInput,
                   prompt: deliveredPrompt,
                   threadId: session.threadId,
                   model: context?.unit.model || session.model,
@@ -829,6 +1038,7 @@ export class HarnessEngine {
                       : undefined,
                   env: {
                     HARNESS_URL: this.endpoint,
+                    HARNESS_PROJECT_ID: this.state.project.id ?? "",
                     ...(execution.tokenHash ? { HARNESS_TOKEN: token } : {}),
                     HARNESS_ADDRESS: context
                       ? `${context.graph.id}/${context.task.id}/${context.unit.id}`
@@ -875,8 +1085,13 @@ export class HarnessEngine {
       session.threadId = execution.threadId;
       session.status = result.status === "completed" ? "idle" : result.status;
       session.error = result.error;
+      if (result.status !== "completed") session.queuePaused = true;
       const seconds = (Date.now() - Date.parse(execution.startedAt)) / 1000;
       session.metrics.seconds += seconds;
+      execution.metrics!.seconds = seconds;
+      execution.usageKnown = result.usage !== undefined;
+      if (result.usage)
+        execution.metrics!.usage = structuredClone(result.usage);
       if (result.usage) {
         for (const key of [
           "inputTokens",
@@ -922,6 +1137,7 @@ export class HarnessEngine {
         session.status = "failed";
         session.error = errorText(error);
         execution.status = "failed";
+        session.queuePaused = true;
         if (context) this.block(context.graph, context.task, errorText(error));
         else
           this.record("execution.failed", errorText(error), {
@@ -935,7 +1151,10 @@ export class HarnessEngine {
           this.schedule(context.graph);
         }
         if (!this.closing)
-          queueMicrotask(() => void this.deliverWaiting(session));
+          queueMicrotask(() => {
+            this.drainQueue(session);
+            void this.deliverWaiting(session);
+          });
       });
     this.jobs.set(session.id, job);
   }
@@ -945,6 +1164,12 @@ export class HarnessEngine {
     event: RuntimeEvent,
     unit?: Unit,
   ) {
+    if (event.usage) {
+      execution.metrics!.usage = structuredClone(event.usage);
+      execution.usageKnown = true;
+    }
+    if (event.contextUsage) session.contextUsage = event.contextUsage;
+    if (event.model) execution.model = event.model;
     if (event.type === "turn.started")
       queueMicrotask(() => void this.deliverWaiting(session));
     if (event.type === "assistant.delta" && event.text) {
@@ -965,6 +1190,7 @@ export class HarnessEngine {
     }
     if (event.type === "tool.started") {
       session.metrics.toolCalls++;
+      execution.metrics!.toolCalls++;
       if (unit) unit.metrics.toolCalls++;
     }
     this.record("runtime." + event.type, event.text || event.type, {
@@ -987,6 +1213,11 @@ export class HarnessEngine {
         : ["-c", command],
       {
         cwd,
+        env: {
+          ...process.env,
+          HARNESS_PROJECT_ID: this.state.project.id ?? "",
+          HARNESS_URL: this.endpoint,
+        },
         windowsHide: true,
         detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],
@@ -1257,16 +1488,28 @@ export class HarnessEngine {
     if (letter) return letter;
     throw new Error("报告不存在");
   }
-  async interrupt(id: string) {
+  async interrupt(id: string, expectedExecutionId?: string) {
     const session = this.session(id);
-    const handle = this.handles.get(id);
-    if (handle) await handle.interrupt();
-    else if (this.jobs.has(id)) {
-      while (this.jobs.has(id) && !this.handles.has(id))
-        await new Promise((resolve) => setTimeout(resolve, 20));
+    const execution = this.state.executions.find(
+      (e) => e.sessionId === id && activeExecution(e),
+    );
+    if (expectedExecutionId && execution?.id !== expectedExecutionId)
+      throw new Error("Target execution ended or changed");
+    session.queuePaused = true;
+    this.record("session.queue_paused", "Queue paused by interruption", {
+      sessionId: id,
+    });
+    const job = this.jobs.get(id);
+    if (!execution) return session;
+    while (
+      activeExecution(execution) &&
+      this.jobs.get(id) === job &&
+      !this.handles.has(id)
+    )
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    if (activeExecution(execution) && this.jobs.get(id) === job)
       await this.handles.get(id)?.interrupt();
-    }
-    await this.jobs.get(id);
+    await job;
     return session;
   }
   private address(session: Session) {
@@ -1414,6 +1657,9 @@ export class HarnessEngine {
       }
       if (this.jobs.has(session.id)) return;
       if (session.kind === "free") {
+        if (session.queuePaused) return;
+        this.drainQueue(session);
+        if (this.jobs.has(session.id)) return;
         this.launch(
           session,
           "处理下面的 Mailbox 通知，需要裁决时给出建议。本轮不要修改项目代码。",

@@ -29,6 +29,158 @@ function fake(body: string) {
   });
 }
 
+test("discovers paginated native models and enabled skills with visible load warnings", async () => {
+  const runtime = fake(`
+    if(r.method === 'model/list') {
+      if(!r.params.cursor) return reply(r,{data:[{model:'native-model',displayName:'Native',isDefault:true,inputModalities:['text','image'],supportedReasoningEfforts:[{reasoningEffort:'high'},{reasoningEffort:'future'}],defaultReasoningEffort:'high'}],nextCursor:'next'});
+      return reply(r,{data:[{model:'second',displayName:'Second',supportedReasoningEfforts:[]}],nextCursor:null});
+    }
+    if(r.method === 'skills/list') {
+      if(r.params.cwds.length !== 1 || r.params.cwds[0] !== process.cwd() || !r.params.forceReload) process.exit(9);
+      return reply(r,{data:[{skills:[{name:'enabled',path:'/skills/enabled/SKILL.md',description:'Useful',enabled:true},{name:'disabled',path:'/disabled',enabled:false}],errors:[{path:'/bad',message:'Invalid skill'}]}]});
+    }
+  `);
+  const options = await runtime.discoverOptions(process.cwd());
+  assert.deepEqual(options.models, [
+    {
+      id: "native-model",
+      name: "Native",
+      isDefault: true,
+      inputModalities: ["text", "image"],
+      reasoning: ["high"],
+      defaultReasoning: "high",
+    },
+    { id: "second", name: "Second", isDefault: false, reasoning: [] },
+  ]);
+  assert.deepEqual(options.skills, [
+    {
+      name: "enabled",
+      path: "/skills/enabled/SKILL.md",
+      description: "Useful",
+    },
+  ]);
+  assert.deepEqual(options.warnings, ["/bad: Invalid skill"]);
+  await runtime.close();
+});
+
+test("native catalog failures reject without substituting a static catalog", async () => {
+  const runtime = fake(
+    `if(r.method === 'model/list') return send({id:r.id,error:{message:'catalog unavailable'}});`,
+  );
+  await assert.rejects(
+    runtime.discoverOptions(process.cwd()),
+    /catalog unavailable/,
+  );
+  await runtime.close();
+});
+
+test("sends native images and skills and readable file references on start and steer", async () => {
+  const runtime = fake(`
+    if(r.method === 'thread/start') return reply(r,{thread:{id:'thread-one'},model:'resolved-model'});
+    if(r.method === 'turn/start' || r.method === 'turn/steer') {
+      const items = r.params.input;
+      if(items.length !== 3 || items[0].type !== 'text' || !items[0].text.includes('Read the attached file') || !items[0].text.includes('notes.txt') || items[1].type !== 'localImage' || !items[1].path.endsWith('photo.png') || items[2].type !== 'skill' || items[2].name !== 'example') process.exit(9);
+      if(r.method === 'turn/start') reply(r,{turn:{id:'active'}});
+      else {
+        reply(r,{turnId:'active'});
+        notify('model/rerouted',{threadId:'thread-one',turnId:'active',fromModel:'resolved-model',toModel:'fallback-model',reason:'highRiskRequest'});
+        notify('turn/completed',{threadId:'thread-one',turn:{id:'active',status:'completed'}});
+      }
+    }
+  `);
+  const attachments = [
+    {
+      id: "image",
+      name: "photo.png",
+      mediaType: "image/png",
+      size: 1,
+      kind: "image" as const,
+      path: join(process.cwd(), "photo.png"),
+    },
+    {
+      id: "file",
+      name: "notes.txt",
+      mediaType: "text/plain",
+      size: 1,
+      kind: "file" as const,
+      path: join(process.cwd(), "notes.txt"),
+    },
+  ];
+  const skills = [{ name: "example", path: join(process.cwd(), "SKILL.md") }];
+  const events: RuntimeEvent[] = [];
+  let started!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const handle = await runtime.start(
+    { cwd: process.cwd(), prompt: "inspect", attachments, skills },
+    (event) => {
+      events.push(event);
+      if (event.type === "turn.started") started();
+    },
+  );
+  await Promise.race([
+    ready,
+    handle.done.then(() => {
+      throw new Error("Ended before ready");
+    }),
+  ]);
+  assert.equal(await handle.inject("", { attachments, skills }), true);
+  assert.equal((await handle.done).status, "completed");
+  assert.equal(
+    events.find((event) => event.type === "thread.started")?.model,
+    "resolved-model",
+  );
+  assert.equal(
+    events.find((event) => event.type === "model.resolved")?.model,
+    "fallback-model",
+  );
+});
+
+test("resumed usage without a baseline is unknown while context uses the last native request", async () => {
+  const runtime = fake(`
+    if(r.method === 'turn/start') {
+      reply(r,{turn:{id:'active'}});
+      notify('thread/tokenUsage/updated',{threadId:'saved',turnId:'active',tokenUsage:{total:{inputTokens:1000,cachedInputTokens:500,outputTokens:100},last:{totalTokens:321},modelContextWindow:10000}});
+      notify('turn/completed',{threadId:'saved',turn:{id:'active',status:'completed'}});
+    }
+  `);
+  const events: RuntimeEvent[] = [];
+  const handle = await runtime.start(
+    { cwd: process.cwd(), prompt: "go", threadId: "saved" },
+    (event) => events.push(event),
+  );
+  assert.equal((await handle.done).usage, undefined);
+  assert.equal(
+    events.some((event) => event.type === "usage"),
+    false,
+  );
+  assert.deepEqual(events.find((event) => event.contextUsage)?.contextUsage, {
+    tokens: 321,
+    window: 10000,
+  });
+});
+
+test("missing native context data remains unknown despite cumulative tokens", async () => {
+  const runtime = fake(`
+    if(r.method === 'turn/start') {
+      reply(r,{turn:{id:'active'}});
+      notify('thread/tokenUsage/updated',{threadId:'thread-one',turnId:'active',tokenUsage:{total:{inputTokens:1000,cachedInputTokens:500,outputTokens:100}}});
+      notify('turn/completed',{threadId:'thread-one',turn:{id:'active',status:'completed'}});
+    }
+  `);
+  const events: RuntimeEvent[] = [];
+  const handle = await runtime.start(
+    { cwd: process.cwd(), prompt: "go" },
+    (event) => events.push(event),
+  );
+  await handle.done;
+  assert.equal(
+    events.some((event) => event.contextUsage),
+    false,
+  );
+});
+
 test("normalizes a real subprocess stream and waits for exit after completion", async () => {
   const runtime = fake(`
     if(r.method === 'turn/start') {

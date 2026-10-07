@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.newharness/
+.task-graph/generated/
+.task-graph/cache/
+.playwright-cli/
+output/
+.env
+.env.*
+!.env.example
+*.log

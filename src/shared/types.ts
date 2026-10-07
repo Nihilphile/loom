@@ -1,4 +1,45 @@
-export type Reasoning = "minimal" | "low" | "medium" | "high" | "xhigh";
+export type Reasoning = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export interface ProjectEntry {
+  id: string;
+  path: string;
+  name: string;
+  createdAt: string;
+  activeSessions?: number;
+  activeGraphs?: number;
+}
+export interface Attachment {
+  id: string;
+  name: string;
+  mediaType: string;
+  size: number;
+  kind: "image" | "file";
+}
+export interface SkillReference { name: string; path: string }
+export interface TurnInput {
+  text: string;
+  requestId?: string;
+  mode?: "send" | "queue" | "steer";
+  expectedExecutionId?: string;
+  model?: string;
+  reasoning?: Reasoning;
+  attachmentIds?: string[];
+  skills?: SkillReference[];
+}
+export interface QueuedTurn {
+  id: string;
+  input: TurnInput;
+  attachments: Attachment[];
+  createdAt: string;
+}
+export interface ContextUsage {
+  tokens: number;
+  window: number | null;
+}
+export interface RuntimeOptions {
+  models: { id: string; name: string; reasoning: Reasoning[]; defaultReasoning?: Reasoning; isDefault?: boolean; inputModalities?: string[] }[];
+  skills: (SkillReference & { description: string })[];
+  warnings: string[];
+}
 export type Outcome = "ready" | "approved" | "changes_requested" | "blocked";
 export interface Usage {
   inputTokens: number;
@@ -54,6 +95,9 @@ export interface ChatMessage {
   role: "user" | "assistant" | "system" | "mailbox";
   text: string;
   at: string;
+  attachments?: Attachment[];
+  skills?: SkillReference[];
+  delivery?: "steer" | "queued";
 }
 export interface Session {
   id: string;
@@ -70,6 +114,9 @@ export interface Session {
   metrics: Metrics;
   turns: number;
   error?: string;
+  queue?: QueuedTurn[];
+  queuePaused?: boolean;
+  contextUsage?: ContextUsage;
 }
 export interface Unit extends UnitConfig {
   sessionId?: string;
@@ -207,10 +254,14 @@ export interface Execution {
   configRevision?: number;
   pid?: number;
   error?: string;
+  model?: string;
+  reasoning?: Reasoning;
+  metrics?: Metrics;
+  usageKnown?: boolean;
 }
 export interface ProjectState {
   version: 1;
-  project: { path: string; name: string };
+  project: { id?: string; path: string; name: string };
   sessions: Session[];
   graphs: Graph[];
   letters: Letter[];
@@ -221,6 +272,7 @@ export interface AppState {
   sessions: Session[];
   graphs: Graph[];
   letters: Letter[];
+  executions?: Omit<Execution, "tokenHash">[];
   agentTemplates: AgentTemplate[];
   taskTypes: TaskType[];
   runtime: { name: string; capabilities: RuntimeCapabilities };
@@ -239,6 +291,8 @@ export interface RuntimeInput {
   readOnly?: boolean;
   writableRoots?: string[];
   env?: Record<string, string>;
+  attachments?: (Attachment & { path: string })[];
+  skills?: SkillReference[];
 }
 export interface RuntimeEvent {
   type: string;
@@ -247,6 +301,8 @@ export interface RuntimeEvent {
   itemId?: string;
   detail?: unknown;
   usage?: Usage;
+  contextUsage?: ContextUsage;
+  model?: string;
 }
 export interface RuntimeResult {
   status: "completed" | "interrupted" | "failed";
@@ -259,7 +315,7 @@ export interface RuntimeHandle {
   done: Promise<RuntimeResult>;
   pid?: number;
   interrupt(): Promise<void>;
-  inject(text: string): Promise<boolean>;
+  inject(text: string, input?: Pick<RuntimeInput, "attachments" | "skills">): Promise<boolean>;
 }
 export interface Runtime {
   name: string;
@@ -269,6 +325,7 @@ export interface Runtime {
     onEvent: (event: RuntimeEvent) => void,
   ): Promise<RuntimeHandle>;
   close?(): Promise<void>;
+  discoverOptions?(cwd: string): Promise<RuntimeOptions>;
 }
 export interface GitAdapter {
   createGraph(

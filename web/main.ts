@@ -7,12 +7,71 @@ import type {
   Session,
   Metrics,
   HarnessEvent,
+  ProjectEntry,
+  RuntimeOptions,
+  Attachment,
+  SkillReference,
+  Reasoning,
+  TurnInput,
 } from "../src/shared/types.ts";
+import { statistics, type StatsFilters } from "./statistics.ts";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 const dialog = document.querySelector<HTMLDialogElement>("#dialog")!;
 const notice = document.querySelector<HTMLDivElement>("#notice")!;
 let state: AppState | null = null;
+let projects: ProjectEntry[] = [];
+let projectId = sessionStorage.getItem("harness.project") ?? "";
+let projectGeneration = 0;
+let stream: EventSource | undefined;
+let options: RuntimeOptions = { models: [], skills: [], warnings: [] };
+let optionsLoading = false;
+const drafts = new Map<string, ChatDraft>();
+interface ChatDraft {
+  text: string;
+  attachments: Attachment[];
+  skills: SkillReference[];
+  model: string;
+  reasoning: string;
+  mode: "queue" | "steer";
+  uploading: number;
+  sending: boolean;
+}
+const statsFilters: StatsFilters = {
+  graph: "",
+  task: "",
+  unit: "",
+  session: "",
+  model: "",
+  status: "",
+  from: "",
+  to: "",
+  group: "project",
+};
+class StaleProjectResponse extends Error {}
+const projectUrl = (path: string, owner = projectId) =>
+  path.startsWith("/api/projects")
+    ? path
+    : `/api/projects/${enc(owner)}${path.slice(4)}`;
+const draftKey = (sid = sessionId, pid = projectId) => `${pid}/${sid}`;
+function draft(s = session()): ChatDraft {
+  const key = draftKey(s?.id);
+  let saved = drafts.get(key);
+  if (!saved) {
+    saved = {
+      text: "",
+      attachments: [],
+      skills: [],
+      model: s?.model ?? "",
+      reasoning: s?.reasoning ?? "",
+      mode: "queue",
+      uploading: 0,
+      sending: false,
+    };
+    drafts.set(key, saved);
+  }
+  return saved;
+}
 let page = "graphs";
 let graphId = "";
 let taskId = "";
@@ -26,7 +85,7 @@ let composing = false;
 let requestPending = false;
 let submitPending = false;
 let noticeTimer: ReturnType<typeof setTimeout>;
-let eventTimer: ReturnType<typeof setTimeout>;
+let eventTimer: ReturnType<typeof setTimeout> | undefined;
 let eventGeneration = 0;
 const statusNames: Record<string, string> = {
   draft: "未运行",
@@ -61,7 +120,7 @@ const enc = encodeURIComponent;
 const badge = (status: string, label?: string) =>
   `<span class="badge ${esc(status)}">${esc(label ?? statusNames[status] ?? status)}</span>`;
 const btn = (action: string, label: string, cls = "", disabled = false) =>
-  `<button class="btn ${cls}" data-action="${action}" ${disabled ? "disabled" : ""}>${label}</button>`;
+  `<button type="button" class="btn ${cls}" data-action="${action}" ${disabled ? "disabled" : ""}>${label}</button>`;
 const fmt = (n: number) =>
   new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(n);
 const time = (value: string) =>
@@ -89,13 +148,21 @@ async function api<T>(
   path: string,
   method = "GET",
   body?: unknown,
+  owner = projectId,
+  acceptDetached = false,
 ): Promise<T> {
-  const response = await fetch(path, {
+  const generation = projectGeneration;
+  const response = await fetch(projectUrl(path, owner), {
     method,
     headers: body === undefined ? {} : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const payload = await response.json();
+  if (
+    !acceptDetached &&
+    (owner !== projectId || generation !== projectGeneration)
+  )
+    throw new StaleProjectResponse();
   if (!response.ok)
     throw new Error(payload.error || `请求失败 (${response.status})`);
   return payload;
@@ -107,13 +174,17 @@ function toast(message: string, error = false) {
   noticeTimer = setTimeout(() => (notice.className = ""), error ? 10000 : 4000);
 }
 function showError(error: unknown) {
+  if (error instanceof StaleProjectResponse) return;
   const message = error instanceof Error ? error.message : String(error);
   const target = dialog.open ? dialog.querySelector(".modalerror") : null;
   if (target) target.textContent = message;
   else toast(message, true);
 }
 async function refresh() {
-  state = await api<AppState>("/api/state");
+  if (!projectId) return;
+  const next = await api<AppState>("/api/state");
+  if (next.project?.id !== projectId) return;
+  state = next;
   render();
 }
 async function mutate(path: string, body: unknown = {}, method = "POST") {
@@ -134,6 +205,7 @@ async function mutate(path: string, body: unknown = {}, method = "POST") {
   }
 }
 function acceptState(next: AppState) {
+  if (next.project?.id !== projectId) return;
   if (state?.project?.path !== next.project?.path) {
     graphId = "";
     taskId = "";
@@ -145,23 +217,43 @@ function acceptState(next: AppState) {
   scheduleEvents();
 }
 function scheduleEvents() {
-  clearTimeout(eventTimer);
-  eventTimer = setTimeout(() => void loadEvents().catch(showError), 200);
+  if (eventTimer) return;
+  eventTimer = setTimeout(() => {
+    eventTimer = undefined;
+    void loadEvents().catch(showError);
+  }, 200);
 }
 async function loadEvents() {
   const generation = ++eventGeneration;
+  const selection = [page, graphId, sessionId].join("/");
   if (!state?.project) return;
   const query = new URLSearchParams();
   if (page === "sessions" && sessionId) query.set("sessionId", sessionId);
   else if (page === "graphs" && graphId) query.set("graphId", graphId);
   const loaded = await api<HarnessEvent[]>(`/api/events?${query}`);
-  if (generation !== eventGeneration) return;
+  if (
+    generation !== eventGeneration ||
+    selection !== [page, graphId, sessionId].join("/")
+  )
+    return;
   events = loaded;
   const target = document.querySelector("#trace");
   if (target) {
     const top = target.scrollTop;
     target.innerHTML = traceBody(page === "logs");
     target.scrollTop = top;
+  }
+  const tools = document.querySelector("#chat-tools");
+  if (tools) {
+    const open = new Set(
+      [...tools.querySelectorAll<HTMLDetailsElement>("details[open]")].map(
+        (el) => el.dataset.detail,
+      ),
+    );
+    tools.innerHTML = chatTools();
+    tools.querySelectorAll<HTMLDetailsElement>("details").forEach((el) => {
+      el.open = open.has(el.dataset.detail);
+    });
   }
 }
 function navigate(next: string) {
@@ -180,10 +272,12 @@ function render(preserve = true) {
     app
       .querySelectorAll<
         HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
-      >("input,textarea,select")
+      >('input:not([type="file"]),textarea,select')
       .forEach((el) => {
         const key = el.id || el.name;
         if (!key) return;
+        if (key.startsWith("chat-") && !(el instanceof HTMLTextAreaElement))
+          return;
         controls.set(key, {
           value: el.value,
           checked: el instanceof HTMLInputElement ? el.checked : undefined,
@@ -204,6 +298,11 @@ function render(preserve = true) {
       bottom: el.scrollHeight - el.scrollTop - el.clientHeight < 45,
     }),
   );
+  const openDetails = new Set(
+    [
+      ...app.querySelectorAll<HTMLDetailsElement>("details[open][data-detail]"),
+    ].map((el) => el.dataset.detail),
+  );
   if (state && !graph()) graphId = state.graphs[0]?.id ?? "";
   if (graph() && !task()) taskId = graph()?.tasks[0]?.id ?? "";
   if (state && !session())
@@ -220,7 +319,7 @@ function render(preserve = true) {
     app
       .querySelectorAll<
         HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
-      >("input,textarea,select")
+      >('input:not([type="file"]),textarea,select')
       .forEach((el) => {
         const key = el.id || el.name;
         const saved = controls.get(key);
@@ -234,15 +333,21 @@ function render(preserve = true) {
             el.setSelectionRange(selectionStart, selectionEnd);
         }
       });
+  app
+    .querySelectorAll<HTMLDetailsElement>("details[data-detail]")
+    .forEach((el) => {
+      el.open = openDetails.has(el.dataset.detail);
+    });
   app.querySelectorAll<HTMLElement>("[data-scroll]").forEach((el) => {
     const old = scrolls.find((s) => s.key === el.dataset.scroll);
     if (old) {
       el.scrollTop =
-        old.bottom && el.dataset.scroll === "messages"
+        old.bottom && el.dataset.scroll?.startsWith("messages-")
           ? el.scrollHeight
           : old.top;
       el.scrollLeft = old.left;
-    } else if (el.dataset.scroll === "messages") el.scrollTop = el.scrollHeight;
+    } else if (el.dataset.scroll?.startsWith("messages-"))
+      el.scrollTop = el.scrollHeight;
   });
 }
 function sidebar() {
@@ -259,7 +364,7 @@ function sidebar() {
   return `<aside class="sidebar"><div class="brand"><span class="brandmark">⌘</span>new harness</div><div class="project"><strong>▧ &nbsp; ${esc(state.project?.name ?? "尚未打开项目")}</strong><div class="path mono">${esc(state.project?.path ?? "选择本地 Git 项目")}</div><button data-action="project">${state.project ? "切换项目 ↗" : "打开项目 ↗"}</button></div><div class="navlabel">WORKSPACE</div>${items.map(([id, icon, label, count]) => `${id === "types" ? '<div class="navlabel">PERSONAL · 跨项目</div>' : ""}<button class="navbtn ${page === id ? "active" : ""}" data-page="${id}"><span class="navicon">${icon}</span>${label}${count !== "" ? `<span class="count">${count}</span>` : ""}</button>`).join("")}<div class="sidebarfoot"><div class="online">● &nbsp; Local workspace</div><div>${esc(state.runtime.name)}</div><div>运行记录保存在项目内</div></div></aside>`;
 }
 function welcome() {
-  return `<section class="welcome"><div class="eyebrow">LOCAL FIRST / REAL EXECUTION</div><h1>让任务有序发生。</h1><p class="muted">打开本地项目，与 Codex 独立对话，或把工作拆成有依赖关系的任务。每次执行、工具调用与交付都有记录。</p><form data-form="project"><input name="path" aria-label="项目目录" placeholder="输入本地 Git 项目的绝对路径" required><button class="btn primary" type="submit">打开项目 →</button></form><div class="notice spaced">项目目录需要已经存在。Task graph 使用独立 Git 工作区，成果汇总到 Graph 基线。</div></section>`;
+  return `<section class="welcome"><div class="eyebrow">LOCAL FIRST / REAL EXECUTION</div><h1>让任务有序发生。</h1><p class="muted">打开本地项目，与 Codex 独立对话，或把工作拆成有依赖关系的任务。每次执行、工具调用与交付都有记录。</p><form data-form="project"><input name="path" aria-label="项目目录" placeholder="输入本地项目的绝对路径" required><button class="btn primary" type="submit">打开项目 →</button></form><div class="notice spaced">路径不存在时自动创建目录并初始化 Git。Task graph 使用独立 Git 工作区，成果汇总到 Graph 基线。</div></section>`;
 }
 function content() {
   switch (page) {
@@ -287,24 +392,21 @@ function intro(
 ) {
   return `<div class="intro"><div><div class="eyebrow">${esc(eyebrow)}</div><h1>${esc(title)}</h1><p class="subtitle">${esc(subtitle)}</p></div><div class="row wrap">${actions}</div></div>`;
 }
-function cost(metrics: Metrics, command = false) {
-  return command
-    ? "不计费"
-    : metrics.costUsd === null
-      ? "未知"
-      : `$${metrics.costUsd.toFixed(4)}`;
+function tokenSummary(m: Metrics) {
+  return `${fmt(m.usage.inputTokens)} / ${fmt(m.usage.cachedInputTokens)} / ${fmt(m.usage.outputTokens)}`;
 }
 function metrics(items: Metrics[], tasks: Task[] = []) {
   const total = items.reduce(
     (sum, m) => ({
+      input: sum.input + m.usage.inputTokens,
+      cached: sum.cached + m.usage.cachedInputTokens,
+      output: sum.output + m.usage.outputTokens,
       seconds: sum.seconds + m.seconds,
       calls: sum.calls + m.toolCalls,
-      tokens: sum.tokens + m.usage.inputTokens + m.usage.outputTokens,
     }),
-    { seconds: 0, calls: 0, tokens: 0 },
+    { input: 0, cached: 0, output: 0, seconds: 0, calls: 0 },
   );
-  const known = items.length > 0 && items.every((m) => m.costUsd !== null);
-  return `<div class="metrics"><div class="metric"><label>${tasks.length ? "已交付 TASKS" : "累计 TOKENS"}</label><div class="value">${tasks.length ? tasks.filter((t) => t.status === "done").length : fmt(total.tokens)}<small>${tasks.length ? `/ ${tasks.length}` : "输入 + 输出"}</small></div></div><div class="metric"><label>累计执行时间</label><div class="value">${fmt(total.seconds)}<small>sec</small></div></div><div class="metric"><label>TOOL CALLS</label><div class="value">${fmt(total.calls)}<small>实际调用</small></div></div><div class="metric"><label>模型费用</label><div class="value">${known ? "$" + items.reduce((sum, m) => sum + (m.costUsd ?? 0), 0).toFixed(4) : "未知"}<small>${known ? "USD" : "无可信价格表"}</small></div></div></div>`;
+  return `<div class="metrics"><div class="metric"><label>输入 TOKENS</label><div class="value">${fmt(total.input)}<small>含缓存</small></div></div><div class="metric"><label>缓存输入 TOKENS</label><div class="value">${fmt(total.cached)}<small>输入的子集</small></div></div><div class="metric"><label>输出 TOKENS</label><div class="value">${fmt(total.output)}</div></div><div class="metric"><label>执行记录</label><div class="value">${fmt(total.seconds)}<small>秒 · ${fmt(total.calls)} 次工具调用</small></div></div></div>${tasks.length ? `<p class="tiny muted">已交付 ${tasks.filter((t) => t.status === "done").length} / ${tasks.length} Tasks</p>` : ""}`;
 }
 function graphsPage() {
   const g = graph();
@@ -393,10 +495,10 @@ function inspector() {
   if (!t || !g) return empty("任务详情", "选择一个任务节点查看配置和交付。");
   let body = "";
   if (inspectTab === "members")
-    body = `<div class="prep"><div class="row between"><strong>⑂ Preparation</strong><span>程序执行 · 无模型费用</span></div><div>${t.workspace ? "工作区已准备" : "等待依赖交付后准备工作区"}</div></div>${t.units
+    body = `<div class="prep"><div class="row between"><strong>⑂ Preparation</strong><span>程序执行 · 无模型 tokens</span></div><div>${t.workspace ? "工作区已准备" : "等待依赖交付后准备工作区"}</div></div>${t.units
       .map((u) => {
         const address = `${g.id}/${t.id}/${u.id}`;
-        return `<div class="unit"><button class="unitmain" data-unit="${esc(u.id)}"><div class="row"><span class="avatar">${u.kind === "command" ? "›_" : esc(u.name.slice(0, 1))}</span><div class="grow"><h3>${esc(u.name)}</h3><div class="tiny muted">${u.kind === "command" ? "命令执行" : `${esc(u.model || "运行时默认")} · ${esc(u.reasoning || "默认")}`}</div></div>${badge(u.status)}</div><div class="unitfoot"><span>${u.sessionId ? esc(u.sessionId) : "尚未启动"}</span><span>详情 ↗</span></div></button><div class="unitmetrics"><span>${fmt(u.metrics.seconds)}s<small>累计执行</small></span><span>${u.metrics.toolCalls}<small>tool calls</small></span><span>${cost(u.metrics, u.kind === "command")}<small>${u.kind === "command" ? "程序成员" : "模型费用"}</small></span></div><div class="unitmail"><button data-mail-address="${esc(address)}" data-direction="inbox">↓ 收件箱 ${state?.letters.filter((l) => l.to.includes(address)).length}</button><button data-mail-address="${esc(address)}" data-direction="sent">↑ 发件箱 ${state?.letters.filter((l) => l.from === address).length}</button></div></div>`;
+        return `<div class="unit"><button class="unitmain" data-unit="${esc(u.id)}"><div class="row"><span class="avatar">${u.kind === "command" ? "›_" : esc(u.name.slice(0, 1))}</span><div class="grow"><h3>${esc(u.name)}</h3><div class="tiny muted">${u.kind === "command" ? "命令执行" : `${esc(u.model || "运行时默认")} · ${esc(u.reasoning || "默认")}`}</div></div>${badge(u.status)}</div><div class="unitfoot"><span>${u.sessionId ? esc(u.sessionId) : "尚未启动"}</span><span>详情 ↗</span></div></button><div class="unitmetrics"><span>${fmt(u.metrics.seconds)}s<small>累计执行</small></span><span>${u.metrics.toolCalls}<small>tool calls</small></span><span>${u.kind === "command" ? "无模型 tokens" : tokenSummary(u.metrics)}<small>输入 / 缓存 / 输出</small></span></div><div class="unitmail"><button data-mail-address="${esc(address)}" data-direction="inbox">↓ 收件箱 ${state?.letters.filter((l) => l.to.includes(address)).length}</button><button data-mail-address="${esc(address)}" data-direction="sent">↑ 发件箱 ${state?.letters.filter((l) => l.from === address).length}</button></div></div>`;
       })
       .join(
         "",
@@ -466,6 +568,78 @@ function traceBody(full: boolean) {
   );
 }
 
+const commands = [
+  { name: "new", description: "创建新的自由会话" },
+  { name: "model", description: "选择模型和推理强度" },
+  { name: "skills", description: "选择本项目可用的技能" },
+  { name: "status", description: "查看当前会话和上下文状态" },
+  { name: "help", description: "查看命令与输入说明" },
+  { name: "stop", description: "中断当前执行" },
+];
+function suggestions() {
+  const text = draft().text;
+  if (/^\/[^\s]*$/.test(text))
+    return commands
+      .filter((c) => c.name.startsWith(text.slice(1)))
+      .map(
+        (c) =>
+          `<button type="button" data-command="${c.name}"><strong>/${c.name}</strong><span>${c.description}</span></button>`,
+      )
+      .join("");
+  const match = text.match(/(?:^|\s)\$([^\s$]*)$/);
+  if (!match) return "";
+  const skills = options.skills.filter((s) =>
+    s.name.toLowerCase().includes(match[1].toLowerCase()),
+  );
+  return (
+    skills
+      .map(
+        (s) =>
+          `<button type="button" data-skill="${esc(s.path)}"><strong>$${esc(s.name)}</strong><span>${esc(s.description)}</span></button>`,
+      )
+      .join("") ||
+    `<p class="tiny muted">${optionsLoading ? "正在发现可用技能…" : "没有匹配的可用技能"}</p>`
+  );
+}
+function contextLabel(s: Session) {
+  const usage = s.contextUsage;
+  if (!usage) return "上下文用量未知";
+  return usage.window
+    ? `上下文 ${fmt(usage.tokens)} / ${fmt(usage.window)} · ${fmt((usage.tokens / usage.window) * 100)}%`
+    : `上下文 ${fmt(usage.tokens)} tokens · 容量未知`;
+}
+function attachmentView(a: Attachment) {
+  const url = projectUrl(`/api/attachments/${enc(a.id)}`);
+  return `<a class="attachment" href="${esc(url)}" target="_blank" rel="noopener">${a.kind === "image" ? `<img src="${esc(url)}" alt="${esc(a.name)}" loading="lazy">` : "▧ "}<span>${esc(a.name)} <small>${fmt(a.size / 1024)} KB</small></span></a>`;
+}
+function chatTools() {
+  return events
+    .filter(
+      (e) =>
+        e.sessionId === sessionId && /tool\.|command\.|reasoning/.test(e.type),
+    )
+    .map(
+      (e) =>
+        `<details class="tool-detail" data-detail="tool-${e.id}"><summary><span>${esc(e.type)}</span> · ${esc(e.message.slice(0, 130))}</summary><pre>${json(e.detail ?? e.message)}</pre></details>`,
+    )
+    .join("");
+}
+function composer(s: Session) {
+  const d = draft(s);
+  const active = state?.executions?.find(
+    (e) => e.sessionId === s.id && ["running", "starting"].includes(e.status),
+  );
+  const canSteer = !!active && !!state?.runtime.capabilities.inject;
+  const paused = !!s.queuePaused;
+  return `<form class="composer" data-form="chat" data-session-owner="${esc(s.id)}" data-project-owner="${esc(projectId)}">
+    <div id="composer-suggestions" class="suggestions" role="listbox" aria-label="命令和技能">${suggestions()}</div>
+    <div class="draft-references">${d.attachments.map((a) => `<span class="reference-chip">${attachmentView(a)}<button type="button" data-remove-attachment="${esc(a.id)}" aria-label="移除 ${esc(a.name)}">×</button></span>`).join("")}${d.skills.map((skill) => `<span class="reference-chip">$${esc(skill.name)}<button type="button" data-remove-skill="${esc(skill.path)}" aria-label="移除技能 ${esc(skill.name)}">×</button></span>`).join("")}${d.uploading ? `<span class="tiny muted">正在上传 ${d.uploading} 个附件…</span>` : ""}</div>
+    <textarea id="chat-prompt-${esc(s.id)}" name="text" aria-label="消息" placeholder="发送消息，/ 查看命令，$ 选择技能。可粘贴或拖入文件。">${esc(d.text)}</textarea>
+    <div class="composer-controls"><div class="row wrap"><button class="btn small" type="button" data-action="attach" aria-label="添加图片或文件">＋ 附件</button><select id="chat-model" aria-label="模型">${modelOptions(d.model)}</select><select id="chat-reasoning" aria-label="推理强度">${nativeReasonOptions(d.model, d.reasoning)}</select><button type="button" class="btn small" data-command="skills">$ Skills</button></div>
+    <div class="row">${s.status === "running" ? `<select id="chat-mode" aria-label="发送方式"><option value="queue" ${d.mode === "queue" ? "selected" : ""}>排队下一轮</option><option value="steer" ${d.mode === "steer" ? "selected" : ""} ${canSteer ? "" : "disabled"}>立即引导当前执行</option></select>${btn("interrupt", "停止", "danger small", !state?.runtime.capabilities.interrupt)}` : ""}<button class="btn primary" type="submit" ${d.uploading || d.sending ? "disabled" : ""}>${d.sending ? "发送中…" : s.status === "running" ? (d.mode === "steer" ? "引导 ↑" : "排队 ↑") : paused ? "加入队列 ↑" : "发送 ↑"}</button></div></div>
+    <div class="row between tiny muted"><span>Ctrl / ⌘ + Enter · 每个附件最多 10 MB</span><span>${esc(contextLabel(s))}</span></div>${optionsLoading ? '<div class="tiny muted">正在读取模型与技能目录…</div>' : ""}${options.warnings.map((w) => `<div class="tiny dangertext">${esc(w)}</div>`).join("")}
+  </form>`;
+}
 function sessionsPage() {
   const s = session();
   const list = (kind: "free" | "task") =>
@@ -473,10 +647,11 @@ function sessionsPage() {
       .filter((x) => x.kind === kind)
       .map(
         (x) =>
-          `<button class="sessionitem ${x.id === sessionId ? "active" : ""}" data-session="${esc(x.id)}"><div class="row between"><h3>${esc(x.title)}</h3>${badge(x.status)}</div><small>${esc(x.model || "默认模型")} · ${x.turns} turns${x.taskId ? ` · ${esc(x.taskId)}` : ""}</small></button>`,
+          `<button class="sessionitem ${x.id === sessionId ? "active" : ""}" data-session="${esc(x.id)}"><div class="row between"><h3>${esc(x.title)}</h3>${badge(x.status)}</div><small>${esc(x.model || "默认模型")} · ${x.turns} turns${x.queue?.length ? ` · ${x.queue.length} 条待发送` : ""}</small></button>`,
       )
       .join("") || '<div class="empty">暂无会话</div>';
-  return `${intro("Sessions", "自由对话与任务成员会话各自保留历史。", btn("new-session", "＋ 自由会话", "primary"))}<div class="sessionlayout"><section class="panel sessionlist" data-scroll="sessions"><div class="sessionsection">自由会话 · 独立对话</div>${list("free")}<div class="sessionsection">TASK 会话 · 由调度器创建</div>${list("task")}</section><div class="stack">${s ? `<section class="panel"><div class="chathead"><div class="row between"><h2>${esc(s.title)}</h2>${badge(s.status)}</div><div class="tiny muted">${esc(s.model || "运行时默认模型")} · ${esc(s.reasoning || "默认推理")} · ${s.turns} turns · ${fmt(s.metrics.usage.inputTokens + s.metrics.usage.outputTokens)} tokens</div></div><div class="messages" data-scroll="messages">${s.messages.length ? s.messages.map((m) => `<article class="message ${esc(m.role)}"><div class="messageheader">${esc(m.role === "user" ? "你" : m.role === "assistant" ? "Codex" : m.role === "mailbox" ? "Mailbox" : "系统")} · ${esc(time(m.at))}</div><p>${esc(m.text)}</p></article>`).join("") : empty("开始对话", "输入目标或问题，发送后会实际调用本地 Codex。")}</div>${s.error ? `<div class="notice amber">${esc(s.error)}</div>` : ""}${s.kind === "free" ? `<form class="composer" data-form="chat"><textarea id="chat-prompt-${esc(s.id)}" name="text" aria-label="消息" placeholder="向 Codex 发送消息…" required></textarea><div class="row between"><span class="tiny muted">Ctrl / ⌘ + Enter 发送</span><div class="row">${btn("interrupt", "中断", "danger", s.status !== "running" || !state?.runtime.capabilities.interrupt)}<button class="btn primary" type="submit" ${s.status === "running" ? "disabled" : ""}>发送 ↑</button></div></div></form>` : `<div class="notice">Task 会话由调度器管理。请通过成员收发件箱发送报告文件，或在 Graph 中暂停和编辑任务。</div>`}</section>` : empty("创建一个自由会话", "自由会话不属于任务图，适合调查、讨论与临时工作。", btn("new-session", "＋ 创建自由会话", "primary"))}${trace()}</div></div>`;
+  const queue = s?.queue ?? [];
+  return `${intro("Sessions", "对话、工具记录和待发送消息。切换项目后执行继续运行。", btn("new-session", "＋ 自由会话", "primary"))}<div class="sessionlayout"><section class="panel sessionlist" data-scroll="sessions"><div class="sessionsection">自由会话</div>${list("free")}<div class="sessionsection">TASK 会话</div>${list("task")}</section><div class="stack">${s ? `<section class="panel chat-panel"><div class="chathead"><div class="row between"><h2>${esc(s.title)}</h2>${badge(s.status)}</div><div class="tiny muted">${esc(s.model || "运行时默认模型")} · ${esc(s.reasoning || "默认推理")} · ${s.turns} turns</div><div class="chat-usage">输入 ${fmt(s.metrics.usage.inputTokens)} <span>缓存 ${fmt(s.metrics.usage.cachedInputTokens)}</span> 输出 ${fmt(s.metrics.usage.outputTokens)} <span>${esc(contextLabel(s))}</span></div></div><div class="messages" data-scroll="messages-${esc(s.id)}">${s.messages.length ? s.messages.map((m) => `<article class="message ${esc(m.role)}"><div class="messageheader">${esc(m.role === "user" ? "你" : m.role === "assistant" ? "Codex" : m.role === "mailbox" ? "Mailbox" : "系统")} · ${esc(time(m.at))}${m.delivery ? ` · ${m.delivery === "steer" ? "已引导" : "来自队列"}` : ""}</div><p>${esc(m.text)}</p><div class="message-attachments">${(m.attachments ?? []).map(attachmentView).join("")}</div>${(m.skills ?? []).map((skill) => `<span class="badge">$${esc(skill.name)}</span>`).join("")}</article>`).join("") : empty("开始对话", "输入目标或问题，或用 / 查看命令。")}${s.status === "running" ? '<div class="stream-indicator"><span></span> Codex 正在工作…</div>' : ""}</div><div id="chat-tools" class="chat-tools">${chatTools()}</div>${s.error ? `<div class="notice amber">${esc(s.error)}</div>` : ""}${queue.length || s.queuePaused ? `<section class="queued-messages"><div class="row between"><strong>待发送 ${queue.length}${s.queuePaused ? " · 已暂停" : ""}</strong>${s.queuePaused ? btn("continue-queue", "继续队列", "small", s.status === "running" || !queue.length) : ""}</div>${queue.map((q, i) => `<div class="queued-message"><span class="muted">${i + 1}</span><div class="grow"><p>${esc(q.input.text || "附件消息")}</p><small>${q.attachments.map((a) => esc(a.name)).join(" · ")}${q.input.skills?.map((skill) => ` $${esc(skill.name)}`).join("") ?? ""}</small></div><button class="btn small" data-cancel-queue="${esc(q.id)}">取消</button></div>`).join("")}</section>` : ""}${s.kind === "free" ? composer(s) : '<div class="notice">Task 会话由调度器管理。请通过成员收发件箱发送报告文件，或在 Graph 中暂停和编辑任务。</div>'}</section>` : empty("创建一个自由会话", "自由会话不属于任务图，适合调查、讨论与临时工作。", btn("new-session", "＋ 创建自由会话", "primary"))}${trace()}</div></div>`;
 }
 function mailboxPage() {
   const letters =
@@ -504,19 +679,7 @@ function mailboxPage() {
   }</section>`;
 }
 function statsPage() {
-  const units =
-    state?.graphs.flatMap((g) =>
-      g.tasks.flatMap((t) => t.units.map((u) => ({ g, t, u }))),
-    ) ?? [];
-  const free = state?.sessions.filter((s) => s.kind === "free") ?? [];
-  const values = [
-    ...units.filter((x) => x.u.kind === "agent").map((x) => x.u.metrics),
-    ...free.map((s) => s.metrics),
-  ];
-  return `${intro("统计", "每个 Agent Unit 独立累计，包含返修、补报与来信处理。")}${metrics(values)}<section class="panel scroller"><table class="table"><thead><tr><th>Unit / Session</th><th>Turns</th><th>累计执行</th><th>Tool calls</th><th>输入 / 缓存 / 输出 tokens</th><th>费用</th></tr></thead><tbody>${units.map(({ g, t, u }) => `<tr><td>${esc(g.name)} / ${esc(t.title)} / ${esc(u.name)}<br><code class="muted">${esc(u.sessionId ?? "尚未启动")}</code></td><td>${state?.sessions.find((s) => s.id === u.sessionId)?.turns ?? 0}</td>${metricCells(u.metrics, u.kind === "command")}</tr>`).join("")}${free.map((s) => `<tr><td><button data-session="${esc(s.id)}">${esc(s.title)}</button><br><small class="muted">自由会话</small></td><td>${s.turns}</td>${metricCells(s.metrics)}</tr>`).join("")}</tbody></table>${!values.length ? empty("还没有执行数据", "开始自由对话或运行任务图后，统计将来自实际运行。") : ""}</section><div class="notice spaced">时间为各成员执行时间之和，并行执行时不等于 Graph 经过时间。没有可信价格表时费用保持未知；Command Unit 不产生模型费用。</div>`;
-}
-function metricCells(m: Metrics, command = false) {
-  return `<td>${fmt(m.seconds)}s</td><td>${m.toolCalls}</td><td>${fmt(m.usage.inputTokens)} / ${fmt(m.usage.cachedInputTokens)} / ${fmt(m.usage.outputTokens)}</td><td>${cost(m, command)}</td>`;
+  return state ? statistics(state, statsFilters) : "";
 }
 function templatesPage() {
   return `${intro("Agent templates", "跨项目复用的成员配置。库更新不会回写已有任务的配置快照。", btn("new-template", "＋ 创建模板", "primary"), "PERSONAL LIBRARY / AGENTS")}<div class="grid3">${state?.agentTemplates.map((a) => `<article class="card"><span class="badge">v${a.version} · ${a.readOnly ? "只读" : "可写工作区"}</span><h2>${esc(a.name)}</h2><p>${esc(a.model || "运行时默认模型")} · ${esc(a.reasoning || "默认推理")}</p><div class="librarymeta">${a.skills.map((s) => `<span class="badge">${esc(s)}</span>`).join("") || '<span class="tiny muted">未指定 skills</span>'}</div><p>${esc(a.prompt.slice(0, 150))}${a.prompt.length > 150 ? "…" : ""}</p><button class="btn" data-template="${esc(a.id)}">编辑模板 ↗</button></article>`).join("")}</div>`;
@@ -529,14 +692,37 @@ function modal(title: string, body: string, form = "", submit = "保存") {
   dialog.innerHTML = `${form ? `<form data-form="${form}">` : ""}<header class="modalhead"><h2>${esc(title)}</h2><button type="button" class="btn small" data-action="close" aria-label="关闭对话框">✕</button></header><div class="modalbody"><div class="modalerror" role="alert"></div>${body}</div><footer class="modalfoot"><button type="button" class="btn" data-action="close">${form ? "取消" : "关闭"}</button>${form ? `<button class="btn primary" type="submit">${submit}</button>` : ""}</footer>${form ? "</form>" : ""}`;
   if (!dialog.open) dialog.showModal();
 }
+function projectOptions() {
+  return projects
+    .map(
+      (p) =>
+        `<button type="button" class="project-option ${p.id === projectId ? "selected" : ""}" data-project="${esc(p.id)}"><strong>${esc(p.name)} ${p.id === projectId ? "✓" : ""}</strong><small>${esc(p.path)}</small><span>${p.activeSessions ?? 0} 个活动会话 · ${p.activeGraphs ?? 0} 个活动图</span></button>`,
+    )
+    .join("");
+}
 function projectModal() {
   modal(
-    "打开本地项目",
-    field("path", "项目绝对路径", state?.project?.path ?? "", "required") +
-      '<p class="hint">运行记录从所选项目的 .newharness 中恢复。有活动执行时，服务会拒绝切换项目。</p>',
+    "项目",
+    `<div class="project-list">${projectOptions()}</div><h3 class="spaced">打开或创建项目</h3>${field("path", "本地绝对路径", "", "required")}${field("name", "项目名称（可选）")}<p class="hint">路径不存在时创建目录并初始化 Git。切换项目后，原项目的执行继续运行。</p>`,
     "project",
     "打开项目",
   );
+  void api<{ projects: ProjectEntry[] }>("/api/projects")
+    .then((result) => {
+      projects = result.projects;
+      const list = dialog.querySelector(".project-list");
+      if (list) list.innerHTML = projectOptions();
+    })
+    .catch(showError);
+}
+function modelOptions(selected = "") {
+  return `<option value="">运行时默认</option>${options.models.map((m) => `<option value="${esc(m.id)}" ${m.id === selected ? "selected" : ""}>${esc(m.name)}</option>`).join("")}${selected && !options.models.some((m) => m.id === selected) ? `<option value="${esc(selected)}" selected>${esc(selected)}（当前配置）</option>` : ""}`;
+}
+function nativeReasonOptions(model = "", selected = "") {
+  const catalog =
+    options.models.find((m) => m.id === model) ??
+    options.models.find((m) => m.isDefault);
+  return `<option value="">默认推理强度</option>${(catalog?.reasoning ?? []).map((r) => `<option value="${esc(r)}" ${r === selected ? "selected" : ""}>${esc(r)}</option>`).join("")}`;
 }
 function sessionModal() {
   modal(
@@ -547,7 +733,7 @@ function sessionModal() {
       "",
       'required placeholder="例如：梳理项目结构"',
     ) +
-      `<div class="grid2">${field("model", "模型（留空使用运行时默认）", "", 'placeholder="Codex 模型 ID"')}<label class="field"><span>推理强度</span><select name="reasoning">${reasonOptions()}</select></label></div>`,
+      `<div class="grid2"><label class="field"><span>模型</span><select name="model" id="new-session-model">${modelOptions()}</select></label><label class="field"><span>推理强度</span><select name="reasoning" id="new-session-reasoning">${nativeReasonOptions()}</select></label></div>${options.warnings.map((w) => `<p class="notice amber">${esc(w)}</p>`).join("")}`,
     "new-session",
     "创建会话",
   );
@@ -742,11 +928,13 @@ async function submit(form: HTMLFormElement) {
   if (requestPending) return;
   const kind = form.dataset.form;
   if (kind === "project") {
-    const next = await api<AppState>("/api/project", "POST", {
+    const entry = await api<ProjectEntry>("/api/projects", "POST", {
       path: value(form, "path"),
+      name: value(form, "name") || undefined,
     });
+    if (!projects.some((p) => p.id === entry.id)) projects.push(entry);
     dialog.close();
-    acceptState(next);
+    await selectProject(entry.id);
     toast("项目已打开");
     return;
   }
@@ -754,7 +942,7 @@ async function submit(form: HTMLFormElement) {
     const created = await api<Session>("/api/sessions", "POST", {
       title: value(form, "title"),
       model: value(form, "model") || undefined,
-      reasoning: value(form, "reasoning"),
+      reasoning: value(form, "reasoning") || undefined,
     });
     sessionId = created.id;
     dialog.close();
@@ -763,16 +951,82 @@ async function submit(form: HTMLFormElement) {
     scheduleEvents();
     return;
   }
+  if (kind === "chat-settings") {
+    const d = draft();
+    d.model = value(form, "model");
+    d.reasoning = value(form, "reasoning");
+    dialog.close();
+    render(false);
+    return;
+  }
   if (kind === "chat") {
     const s = session();
-    if (!s || s.status === "running") return;
+    if (
+      !s ||
+      form.dataset.sessionOwner !== s.id ||
+      form.dataset.projectOwner !== projectId
+    )
+      return;
+    const d = draft(s);
     const prompt = value(form, "text");
-    if (!prompt) return;
-    await mutate(`/api/sessions/${enc(s.id)}/turn`, { text: prompt });
-    const input = app.querySelector<HTMLTextAreaElement>(
-      `#chat-prompt-${CSS.escape(s.id)}`,
+    if (prompt.startsWith("/")) {
+      await runCommand(prompt);
+      return;
+    }
+    if (
+      (!prompt && !d.attachments.length && !d.skills.length) ||
+      d.uploading ||
+      d.sending
+    )
+      return;
+    const active = state?.executions?.find(
+      (e) => e.sessionId === s.id && ["running", "starting"].includes(e.status),
     );
-    if (input) input.value = "";
+    const mode =
+      s.status === "running" ? d.mode : s.queuePaused ? "queue" : "send";
+    if (mode === "steer" && !active)
+      throw new Error("当前执行已结束，请重新选择发送方式。");
+    const input: TurnInput = {
+      text: prompt,
+      mode,
+      requestId: crypto.randomUUID(),
+      model: d.model || undefined,
+      reasoning: (d.reasoning || undefined) as Reasoning | undefined,
+      expectedExecutionId: mode === "steer" ? active?.id : undefined,
+      attachmentIds: d.attachments.map((a) => a.id),
+      skills: [...d.skills],
+    };
+    const owner = projectId;
+    d.sending = true;
+    render();
+    try {
+      await api<Session>(
+        `/api/sessions/${enc(s.id)}/turn`,
+        "POST",
+        input,
+        owner,
+        true,
+      );
+      if (d.text.trim() === prompt) d.text = "";
+      d.attachments = d.attachments.filter(
+        (a) => !input.attachmentIds?.includes(a.id),
+      );
+      d.skills = d.skills.filter(
+        (skill) => !input.skills?.some((sent) => sent.path === skill.path),
+      );
+      if (owner === projectId) {
+        if (sessionId === s.id) render(false);
+        await refresh();
+        scheduleEvents();
+      }
+    } catch (error) {
+      if (owner !== projectId || s.id !== sessionId)
+        throw new StaleProjectResponse();
+      throw error;
+    } finally {
+      d.sending = false;
+      if (owner === projectId && sessionId === s.id) render(false);
+    }
     return;
   }
   if (kind === "subscription") {
@@ -897,6 +1151,43 @@ document.addEventListener("click", (event) => {
   void click(el).catch(showError);
 });
 async function click(el: HTMLElement) {
+  if (el.dataset.project) {
+    await selectProject(el.dataset.project);
+    return;
+  }
+  if (el.dataset.command) {
+    await runCommand(`/${el.dataset.command}`);
+    return;
+  }
+  if (el.dataset.skill) {
+    const skill = options.skills.find((s) => s.path === el.dataset.skill);
+    if (!skill) return;
+    const d = draft();
+    if (!d.skills.some((s) => s.path === skill.path))
+      d.skills.push({ name: skill.name, path: skill.path });
+    d.text = d.text.replace(/(^|\s)\$[^\s$]*$/, "$1");
+    dialog.close();
+    render(false);
+    app.querySelector<HTMLTextAreaElement>('[name="text"]')?.focus();
+    return;
+  }
+  if (el.dataset.removeAttachment || el.dataset.removeSkill) {
+    const d = draft();
+    d.attachments = d.attachments.filter(
+      (a) => a.id !== el.dataset.removeAttachment,
+    );
+    d.skills = d.skills.filter((s) => s.path !== el.dataset.removeSkill);
+    render(false);
+    return;
+  }
+  if (el.dataset.cancelQueue) {
+    await mutate(
+      `/api/sessions/${enc(sessionId)}/queue/${enc(el.dataset.cancelQueue)}`,
+      undefined,
+      "DELETE",
+    );
+    return;
+  }
   if (el.dataset.page) {
     navigate(el.dataset.page);
     return;
@@ -970,6 +1261,45 @@ async function click(el: HTMLElement) {
   const action = el.dataset.action;
   const g = graph();
   switch (action) {
+    case "attach": {
+      const owner = projectId;
+      const s = session();
+      const picker = document.createElement("input");
+      picker.type = "file";
+      picker.multiple = true;
+      picker.hidden = true;
+      document.body.append(picker);
+      picker.addEventListener(
+        "change",
+        () => {
+          void uploadFiles([...(picker.files ?? [])], s, owner).catch(
+            showError,
+          );
+          picker.remove();
+        },
+        { once: true },
+      );
+      picker.addEventListener("cancel", () => picker.remove(), { once: true });
+      picker.click();
+      break;
+    }
+    case "continue-queue":
+      await mutate(`/api/sessions/${enc(sessionId)}/continue`);
+      break;
+    case "reset-stats":
+      Object.assign(statsFilters, {
+        graph: "",
+        task: "",
+        unit: "",
+        session: "",
+        model: "",
+        status: "",
+        from: "",
+        to: "",
+        group: "project",
+      });
+      render(false);
+      break;
     case "close":
       dialog.close();
       break;
@@ -1034,7 +1364,7 @@ async function click(el: HTMLElement) {
         );
       break;
     case "interrupt":
-      if (sessionId) await mutate(`/api/sessions/${enc(sessionId)}/interrupt`);
+      await stopSession();
       break;
     case "debug":
       if (g) {
@@ -1063,8 +1393,151 @@ async function click(el: HTMLElement) {
       break;
   }
 }
+async function stopSession() {
+  const active = state?.executions?.find(
+    (e) =>
+      e.sessionId === sessionId && ["starting", "running"].includes(e.status),
+  );
+  if (!active) throw new Error("没有正在执行的消息。");
+  await mutate(`/api/sessions/${enc(sessionId)}/interrupt`, {
+    expectedExecutionId: active.id,
+  });
+}
+async function runCommand(text: string) {
+  const [name, ...args] = text.trim().slice(1).split(/\s+/);
+  if (!commands.some((c) => c.name === name))
+    throw new Error(`未知命令 /${name}。输入 /help 查看支持的命令。`);
+  const s = session();
+  if (!s) return;
+  const d = draft(s);
+  if (name === "stop") await stopSession();
+  if (name === "new") {
+    const next = await api<Session>("/api/sessions", "POST", {
+      title: args.join(" ") || "新会话",
+      model: d.model || undefined,
+      reasoning: d.reasoning || undefined,
+    });
+    sessionId = next.id;
+    page = "sessions";
+    await refresh();
+    scheduleEvents();
+  }
+  if (name === "model") {
+    if (args.length) {
+      const selected = options.models.find((m) => m.id === args[0]);
+      if (!selected)
+        throw new Error("模型不在运行时目录中，请用 /model 查看可用模型。");
+      d.model = selected.id;
+      d.reasoning = selected.defaultReasoning ?? "";
+    } else
+      modal(
+        "模型与推理强度",
+        `<p class="hint">设置应用于下一条消息。</p><label class="field"><span>模型</span><select name="model" id="new-session-model">${modelOptions(d.model)}</select></label><label class="field"><span>推理强度</span><select name="reasoning" id="new-session-reasoning">${nativeReasonOptions(d.model, d.reasoning)}</select></label>${options.warnings.map((w) => `<p class="notice amber">${esc(w)}</p>`).join("")}`,
+        "chat-settings",
+        "应用",
+      );
+  }
+  if (name === "skills")
+    modal(
+      "本项目可用的 Skills",
+      `<p class="hint">选择后，技能以原生引用随下一条消息发送。</p><div class="skill-list">${options.skills.map((skill) => `<button type="button" data-skill="${esc(skill.path)}"><strong>$${esc(skill.name)}</strong><p>${esc(skill.description)}</p><small>${esc(skill.path)}</small></button>`).join("") || `<p>${optionsLoading ? "正在加载技能目录…" : "运行时没有返回可用技能。"}</p>`}</div>${options.warnings.map((w) => `<p class="notice amber">${esc(w)}</p>`).join("")}`,
+    );
+  if (name === "status")
+    modal(
+      "会话状态",
+      `<div class="rule">${esc(s.title)} ${badge(s.status)}</div><div class="rule">模型 ${esc(s.model ?? "运行时默认")} · ${esc(s.reasoning ?? "默认推理")}</div><div class="rule">${esc(contextLabel(s))}</div><div class="rule">累计输入 / 缓存 / 输出 ${tokenSummary(s.metrics)}</div><div class="rule">待发送 ${s.queue?.length ?? 0} · ${s.queuePaused ? "队列已暂停" : "队列正常"}</div><div class="rule">项目 ${esc(state?.project?.path)}</div>`,
+    );
+  if (name === "help")
+    modal(
+      "命令与输入",
+      `${commands.map((c) => `<div class="rule"><code>/${c.name}</code> ${esc(c.description)}</div>`).join("")}<p class="hint">输入 $ 可搜索技能。附件支持选择、拖入或粘贴，每个文件最多 10 MB。执行期间可选择排队下一轮或引导当前执行；停止后队列等待你手动继续。</p>`,
+    );
+  if (d.text.startsWith("/")) d.text = "";
+  render(false);
+}
+async function uploadFiles(files: File[], s = session(), owner = projectId) {
+  if (!s || s.kind !== "free") return;
+  const d = drafts.get(draftKey(s.id, owner));
+  if (!d) return;
+  for (const file of files) {
+    if (file.size > 10 * 1024 * 1024) {
+      toast(`${file.name} 超过 10 MB，未上传。`, true);
+      continue;
+    }
+    d.uploading++;
+    render();
+    try {
+      const base64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(",")[1]);
+        reader.onerror = () => reject(new Error(`无法读取 ${file.name}`));
+        reader.readAsDataURL(file);
+      });
+      const attachment = await api<Attachment>(
+        "/api/attachments",
+        "POST",
+        {
+          name: file.name,
+          mediaType: file.type || "application/octet-stream",
+          base64,
+        },
+        owner,
+        true,
+      );
+      d.attachments.push(attachment);
+    } catch (error) {
+      if (owner === projectId && s.id === sessionId) showError(error);
+    } finally {
+      d.uploading--;
+      if (owner === projectId && s.id === sessionId) render();
+    }
+  }
+}
+document.addEventListener("input", (event) => {
+  const el = event.target;
+  if (el instanceof HTMLTextAreaElement && el.closest('[data-form="chat"]')) {
+    draft().text = el.value;
+    const target = app.querySelector("#composer-suggestions");
+    if (target) target.innerHTML = suggestions();
+  }
+});
 document.addEventListener("change", (event) => {
   const el = event.target;
+  if (
+    (el instanceof HTMLSelectElement || el instanceof HTMLInputElement) &&
+    el.dataset.statFilter
+  ) {
+    statsFilters[el.dataset.statFilter as keyof StatsFilters] = el.value;
+    if (el.dataset.statFilter === "graph") {
+      statsFilters.task = "";
+      statsFilters.unit = "";
+    }
+    if (el.dataset.statFilter === "task") statsFilters.unit = "";
+    render(false);
+    return;
+  }
+  if (el instanceof HTMLSelectElement && el.id === "new-session-model") {
+    const reason = dialog.querySelector<HTMLSelectElement>(
+      "#new-session-reasoning",
+    );
+    if (reason) reason.innerHTML = nativeReasonOptions(el.value);
+    return;
+  }
+  if (
+    el instanceof HTMLSelectElement &&
+    ["chat-model", "chat-reasoning", "chat-mode"].includes(el.id)
+  ) {
+    const d = draft();
+    if (el.id === "chat-model") {
+      d.model = el.value;
+      d.reasoning = "";
+    }
+    if (el.id === "chat-reasoning") d.reasoning = el.value;
+    if (el.id === "chat-mode")
+      d.mode = el.value === "steer" ? "steer" : "queue";
+    render(false);
+    return;
+  }
   if (el instanceof HTMLSelectElement && el.id === "graph-choice") {
     graphId = el.value;
     taskId = "";
@@ -1072,6 +1545,34 @@ document.addEventListener("change", (event) => {
     render(false);
     scheduleEvents();
   }
+});
+app.addEventListener("paste", (event) => {
+  if (
+    !(event.target instanceof Element) ||
+    !event.target.closest('[data-form="chat"]')
+  )
+    return;
+  const files = [...(event.clipboardData?.files ?? [])];
+  if (files.length) {
+    event.preventDefault();
+    void uploadFiles(files).catch(showError);
+  }
+});
+app.addEventListener("dragover", (event) => {
+  if (
+    event.target instanceof Element &&
+    event.target.closest('[data-form="chat"]')
+  )
+    event.preventDefault();
+});
+app.addEventListener("drop", (event) => {
+  if (
+    !(event.target instanceof Element) ||
+    !event.target.closest('[data-form="chat"]')
+  )
+    return;
+  event.preventDefault();
+  void uploadFiles([...(event.dataTransfer?.files ?? [])]).catch(showError);
 });
 document.addEventListener("keydown", (event) => {
   if (
@@ -1101,27 +1602,97 @@ dialog.addEventListener("click", (event) => {
       dialog.close();
   }
 });
-async function start() {
+async function loadOptions(owner: string) {
+  const generation = projectGeneration;
+  optionsLoading = true;
   try {
-    await refresh();
-    const stream = new EventSource("/api/stream");
-    stream.addEventListener("open", () => {
+    options = await api<RuntimeOptions>(
+      "/api/runtime/options",
+      "GET",
+      undefined,
+      owner,
+    );
+  } catch (error) {
+    if (owner !== projectId || generation !== projectGeneration) return;
+    options = {
+      models: [],
+      skills: [],
+      warnings: [error instanceof Error ? error.message : String(error)],
+    };
+  } finally {
+    if (owner === projectId && generation === projectGeneration) {
+      optionsLoading = false;
+      render();
+    }
+  }
+}
+async function selectProject(id: string) {
+  projectGeneration++;
+  stream?.close();
+  projectId = id;
+  sessionStorage.setItem("harness.project", id);
+  graphId = taskId = sessionId = "";
+  Object.assign(statsFilters, {
+    graph: "",
+    task: "",
+    unit: "",
+    session: "",
+    model: "",
+    status: "",
+    from: "",
+    to: "",
+    group: "project",
+  });
+  composing = false;
+  events = [];
+  eventGeneration++;
+  clearTimeout(eventTimer);
+  eventTimer = undefined;
+  connected = false;
+  state = null;
+  options = { models: [], skills: [], warnings: [] };
+  optionsLoading = true;
+  dialog.close();
+  render(false);
+  const optionsRequest = loadOptions(id);
+  await refresh();
+  if (projectId !== id) return;
+  const source = new EventSource(projectUrl("/api/stream", id));
+  stream = source;
+  source.addEventListener("open", () => {
+    if (projectId === id && stream === source) {
       connected = true;
       render();
-    });
-    stream.addEventListener("state", (event) => {
-      try {
-        acceptState(JSON.parse(event.data));
-      } catch (error) {
-        showError(error);
-      }
-    });
-    stream.addEventListener("error", () => {
+    }
+  });
+  source.addEventListener("state", (event) => {
+    if (projectId !== id || stream !== source) return;
+    try {
+      acceptState(JSON.parse(event.data));
+    } catch (error) {
+      showError(error);
+    }
+  });
+  source.addEventListener("error", () => {
+    if (projectId === id && stream === source) {
       connected = false;
       render();
-    });
-    scheduleEvents();
+    }
+  });
+  scheduleEvents();
+  await optionsRequest;
+}
+async function start() {
+  try {
+    const registry = await api<{ projects: ProjectEntry[] }>("/api/projects");
+    projects = registry.projects;
+    const id = projects.find((p) => p.id === projectId)?.id ?? projects[0]?.id;
+    if (id) await selectProject(id);
+    else {
+      app.innerHTML = `<div class="welcome"><h1>打开本地项目</h1><p class="muted">选择目录，或输入新路径创建项目。</p><button class="btn primary" data-action="project">打开或创建项目</button></div>`;
+    }
   } catch (error) {
+    if (error instanceof StaleProjectResponse) return;
     app.innerHTML = `<div class="welcome"><h1>无法连接本地服务</h1><p class="muted">${esc(error instanceof Error ? error.message : error)}</p><button class="btn primary" id="retry">重新连接</button></div>`;
     document
       .querySelector("#retry")

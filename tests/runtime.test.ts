@@ -122,15 +122,56 @@ test("observer reads are bounded to ordinary project files and hide runtime stor
   );
 });
 
+test("observer can read absolute task worktree files and task reports without exposing runtime state", async (t) => {
+  const project = await mkdtemp(join(tmpdir(), "loom-observer-worktree-"));
+  t.after(() => rm(project, { recursive: true, force: true }));
+  const root = join(project, ".newharness", "worktrees", "task");
+  const reports = join(root, ".newharness", "reports", "worker");
+  await mkdir(reports, { recursive: true });
+  await writeFile(join(root, "source.ts"), "export const value = 1;");
+  await writeFile(join(reports, "review.md"), "Review evidence");
+  await writeFile(join(reports, "execution.txt"), "Execution report");
+  await writeFile(join(root, ".newharness", "state.sqlite"), "secret database");
+  await writeFile(
+    join(project, ".newharness", "state.sqlite"),
+    "project database",
+  );
+  assert.match(
+    await observerRead(root, "read_file", { path: join(root, "source.ts") }),
+    /export const value/,
+  );
+  assert.equal(
+    await observerRead(root, "read_file", { path: join(reports, "review.md") }),
+    "1: Review evidence",
+  );
+  assert.equal(
+    await observerRead(root, "read_file", {
+      path: ".newharness/reports/worker/execution.txt",
+    }),
+    "1: Execution report",
+  );
+  assert.match(
+    await observerRead(root, "list_files", { path: reports }),
+    /review.md/,
+  );
+  for (const path of [
+    join(root, ".newharness", "state.sqlite"),
+    join(project, ".newharness", "state.sqlite"),
+    ".newharness/reports/../state.sqlite",
+  ])
+    await assert.rejects(observerRead(root, "read_file", { path }));
+});
+
 test("observer forks a checkpoint into a separate native thread and resumes only its own identity", async () => {
   const runtime = fake(`
-    if(r.method === 'config/read') return reply(r,{config:{mcp_servers:{remote:{},local:{}}}});
+    if(r.method === 'config/read') return reply(r,{config:{mcp_servers:{remote:{},local:{},'remote.with.dots':{}},plugins:{'plugin@vendor':{enabled:true}},hooks:{Stop:[{command:'forbidden'}]}}});
     if(r.method === 'mcpServerStatus/list') return reply(r,{data:[{name:'remote',runtimeStatus:'disabled'},{name:'loom_observer',runtimeStatus:'connected'}]});
     if(r.method === 'thread/fork' || r.method === 'thread/resume') {
       const p=r.params;
       if(r.method === 'thread/fork' && (p.threadId!=='source' || p.lastTurnId!=='checkpoint' || p.deferGoalContinuation!==true)) process.exit(9);
       if(r.method === 'thread/resume' && p.threadId!=='side-thread') process.exit(10);
-      if(p.sandbox!=='read-only' || p.config['mcp_servers.remote.enabled']!==false || p.config['mcp_servers.local.enabled']!==false || !p.config['mcp_servers.loom_observer'].enabled || p.config['features.shell_tool']!==false) process.exit(11);
+      if(p.sandbox!=='read-only' || p.config.mcp_servers.remote.enabled!==false || p.config.mcp_servers.local.enabled!==false || !p.config.mcp_servers.loom_observer.enabled || p.config['features.shell_tool']!==false) process.exit(11);
+      if(p.config.mcp_servers['remote.with.dots'].enabled!==false || p.config.plugins['plugin@vendor'].enabled!==false || p.config['hooks.Stop'].length!==0) process.exit(14);
       if(process.env.HARNESS_TEST_TOKEN || process.env.LOOM_CALLBACK_TOKEN) process.exit(12);
       return reply(r,{thread:{id:'side-thread',turns:[{id:'checkpoint'}]},sandbox:{type:'readOnly',networkAccess:false}});
     }

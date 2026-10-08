@@ -9,12 +9,15 @@ const blocked = new Set([
   ".codex",
   "node_modules",
 ]);
-const hidden = (path: string) =>
-  path
-    .split(/[\\/]/)
-    .some(
-      (part) => blocked.has(part.toLowerCase()) || /^\.env(?:\.|$)/i.test(part),
-    );
+const hidden = (path: string) => {
+  const parts = path.split(/[\\/]/);
+  const report =
+    [".newharness", ".loom"].includes(parts[0]?.toLowerCase()) &&
+    parts[1]?.toLowerCase() === "reports";
+  return (report ? parts.slice(2) : parts).some(
+    (part) => blocked.has(part.toLowerCase()) || /^\.env(?:\.|$)/i.test(part),
+  );
+};
 
 export async function observerRead(
   root: string,
@@ -23,7 +26,6 @@ export async function observerRead(
 ): Promise<string> {
   root = await realpath(root);
   const requested = typeof args.path === "string" ? args.path : ".";
-  if (hidden(requested)) throw new Error("Path is private to the runtime");
   const target = await realpath(resolve(root, requested));
   const within = relative(root, target);
   if (
@@ -36,7 +38,11 @@ export async function observerRead(
   if (operation === "list_files") {
     const entries = await readdir(target, { withFileTypes: true });
     return entries
-      .filter((entry) => !entry.isSymbolicLink() && !hidden(entry.name))
+      .filter(
+        (entry) =>
+          !entry.isSymbolicLink() &&
+          !hidden([within, entry.name].filter(Boolean).join(sep)),
+      )
       .slice(0, 500)
       .map((entry) => `${entry.name}${entry.isDirectory() ? "/" : ""}`)
       .join("\n");

@@ -535,22 +535,36 @@ class CodexExecution {
           includeLayers: false,
         }),
       );
-      for (const name of Object.keys(
-        object(object(effective.config).mcp_servers),
-      ))
-        config[`mcp_servers.${name}.enabled`] = false;
+      const settings = object(effective.config);
+      const servers = Object.fromEntries(
+        Object.keys(object(settings.mcp_servers)).map((name) => [
+          name,
+          { enabled: false },
+        ]),
+      );
+      config.plugins = Object.fromEntries(
+        Object.keys(object(settings.plugins)).map((name) => [
+          name,
+          { enabled: false },
+        ]),
+      );
+      for (const [event, hooks] of Object.entries(object(settings.hooks)))
+        if (Array.isArray(hooks)) config[`hooks.${event}`] = [];
       const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
-      config["mcp_servers.loom_observer"] = {
-        command: process.execPath,
-        args: [
-          fileURLToPath(
-            new URL(`./observer-tools.${extension}`, import.meta.url),
-          ),
-          "--serve",
-          this.input.cwd,
-        ],
-        enabled: true,
-        required: true,
+      config.mcp_servers = {
+        ...servers,
+        loom_observer: {
+          command: process.execPath,
+          args: [
+            fileURLToPath(
+              new URL(`./observer-tools.${extension}`, import.meta.url),
+            ),
+            "--serve",
+            this.input.cwd,
+          ],
+          enabled: true,
+          required: true,
+        },
       };
     }
     if (reportProfile)

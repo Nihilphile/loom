@@ -405,7 +405,8 @@ export interface ResolvedConfig {
 }
 export interface ResolvedContextItem {
   id: string;
-  kind: "role" | "goal" | "report" | "skill" | "file" | "letter" | "instruction";
+  kind:
+    "role" | "goal" | "report" | "skill" | "file" | "letter" | "instruction";
   digest: string;
   content: string;
   path?: string;
@@ -423,6 +424,7 @@ export interface Preparation {
   receipt: RuntimeAcceptance | { status: "prepared" | "dispatching" };
 }
 export interface ObserverSource {
+  cwd: string;
   sessionId: string;
   threadId: string;
   turnId: string;
@@ -457,6 +459,7 @@ export const defaultInterviews = (): InterviewSettings => ({
   enabled: false,
   onCompleted: true,
   onBlocked: true,
-  prompt: "回顾本次任务中实际遇到的工程、工具或工作流摩擦。说明当时目标、具体障碍、相关操作或错误、采用的绕行办法，以及最有价值的改进。没有遇到的问题不要编造。只在此独立访谈回答，不执行源任务，不修改文件。",
+  prompt:
+    "回顾本次任务中实际遇到的工程、工具或工作流摩擦。说明当时目标、具体障碍、相关操作或错误、采用的绕行办法，以及最有价值的改进。没有遇到的问题不要编造。只在此独立访谈回答，不执行源任务，不修改文件。",
   skills: [],
 });

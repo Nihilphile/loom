@@ -24,6 +24,7 @@ export class Catalog {
           ? "独立审查实现并提供证据。只读代码，返回 approved 或 changes_requested。"
           : "完成任务并验证，通过 CLI 交卷。",
       readOnly,
+      context: { goal: true, dependencies: true, previousResult: true },
     });
     this.agents = ["worker", "reviewer", "explorer"].map((id) => ({
       id,

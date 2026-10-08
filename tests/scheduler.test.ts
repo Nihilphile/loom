@@ -46,6 +46,11 @@ class ControlledRuntime implements Runtime {
       threadId: input.threadId || "thread-" + this.turns.length,
     });
     return {
+      accepted: Promise.resolve({
+        status: "accepted" as const,
+        threadId: input.threadId || "thread",
+        turnId: "turn",
+      }),
       done,
       interrupt: async () => {
         finish({ status: "interrupted" });

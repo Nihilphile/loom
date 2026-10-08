@@ -19,6 +19,7 @@ import type {
   Graph,
   Session,
   TurnInput,
+  InterviewSettings,
 } from "../shared/types.ts";
 
 export async function createHttpServer(options: {
@@ -178,7 +179,7 @@ export async function createHttpServer(options: {
         return;
       }
       let body: Record<string, unknown> = {};
-      if (["POST", "PATCH"].includes(req.method || "")) {
+      if (["POST", "PATCH", "PUT"].includes(req.method || "")) {
         let raw = "";
         req.setEncoding("utf8");
         for await (const chunk of req) {
@@ -215,6 +216,48 @@ export async function createHttpServer(options: {
         }
         const parts = path.split("/").filter(Boolean).map(decodeURIComponent),
           method = req.method;
+        if (method === "PUT" && path === "/api/developer/interviews") {
+          json(
+            200,
+            engine.updateInterviews(body as unknown as InterviewSettings),
+          );
+          return;
+        }
+        if (
+          method === "POST" &&
+          parts[1] === "sessions" &&
+          parts[3] === "sidechats"
+        ) {
+          json(
+            201,
+            engine.createSidechat(parts[2], body as { title?: string }),
+          );
+          return;
+        }
+        if (
+          method === "POST" &&
+          parts[1] === "sessions" &&
+          parts[3] === "interviews"
+        ) {
+          json(202, await engine.interview(parts[2]));
+          return;
+        }
+        if (
+          method === "POST" &&
+          parts[1] === "sessions" &&
+          parts[3] === "preparations" &&
+          parts[5] === "resolve"
+        ) {
+          json(
+            200,
+            engine.resolvePreparation(
+              parts[2],
+              parts[4],
+              body as { accepted: boolean; threadId?: string; turnId?: string },
+            ),
+          );
+          return;
+        }
         if (method === "GET" && path === "/api/runtime/options") {
           if (!options.runtime.discoverOptions)
             throw new Error("当前 Runtime 不支持模型与 Skill 查询");

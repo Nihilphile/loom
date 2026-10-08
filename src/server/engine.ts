@@ -35,8 +35,15 @@ import type {
   Letter,
   TaskType,
   AgentTemplate,
+  Preparation,
+  ResolvedContextItem,
+  ResolvedConfig,
+  InterviewSettings,
+  Feedback,
+  ObserverSource,
 } from "../shared/types.ts";
-import { emptyMetrics } from "../shared/types.ts";
+import { SessionInputs, contextItem } from "./session-inputs.ts";
+import { emptyMetrics, defaultInterviews } from "../shared/types.ts";
 import { resolveAttachments } from "./attachments.ts";
 import { ProjectStore } from "./store.ts";
 import { Catalog } from "./catalog.ts";
@@ -54,6 +61,7 @@ const now = () => new Date().toISOString();
 const hash = (value: string) =>
   createHash("sha256").update(value).digest("hex");
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const inputAccepted = (p: Preparation) => p.receipt.status === "accepted";
 const activeExecution = (e: Execution) =>
   e.status === "starting" || e.status === "running";
 
@@ -62,6 +70,7 @@ export class HarnessEngine {
   readonly store: ProjectStore;
   readonly listeners = new Set<() => void>();
   endpoint = "";
+  private inputs: SessionInputs;
   private handles = new Map<string, RuntimeHandle>();
   private jobs = new Map<string, Promise<void>>();
   private pumping = new Set<string>();
@@ -76,6 +85,23 @@ export class HarnessEngine {
   ) {
     this.store = new ProjectStore(root);
     this.state = this.store.load();
+    this.state.preparations ??= [];
+    this.state.interviews ??= defaultInterviews();
+    this.state.feedback ??= [];
+    this.inputs = new SessionInputs(this.state);
+    for (const p of this.state.preparations) {
+      if (["prepared", "dispatching"].includes(p.receipt.status))
+        p.receipt = {
+          status: "uncertain",
+          reason: "服务在输入确认前结束，请检查运行历史",
+        };
+    }
+    for (const f of this.state.feedback) {
+      if (["pending", "running"].includes(f.status)) {
+        f.status = "failed";
+        f.error = "服务在访谈完成前结束";
+      }
+    }
     for (const execution of this.state.executions.filter(activeExecution)) {
       execution.status = "interrupted";
       execution.error = "服务中断，需检查原进程并显式恢复";
@@ -124,6 +150,9 @@ export class HarnessEngine {
       sessions: this.state.sessions,
       graphs: this.state.graphs,
       letters: this.state.letters,
+      preparations: this.state.preparations,
+      interviews: this.state.interviews,
+      feedback: this.state.feedback,
       executions: this.state.executions.map(
         ({ tokenHash, ...execution }) => execution,
       ),
@@ -179,6 +208,200 @@ export class HarnessEngine {
     this.record("session.created", "创建自由会话", { sessionId: session.id });
     return session;
   }
+  createSidechat(
+    id: string,
+    input: { title?: string } = {},
+    kind: "sidechat" | "interview" = "sidechat",
+  ): Session {
+    const source = this.session(id);
+    if (source.source) throw new Error("不能从侧聊或访谈递归创建访谈");
+    if (!this.runtime.capabilities.fork)
+      throw new Error("当前 Runtime 不支持隔离只读分叉");
+    if (!source.threadId || !source.lastCompletedTurnId)
+      throw new Error("源会话尚无已完成轮次，暂时不能分叉");
+    const session: Session = {
+      id: randomUUID(),
+      title: input.title
+        ? text(input.title, "标题")
+        : `${kind === "interview" ? "访谈" : "侧聊"} · ${source.title}`,
+      kind,
+      status: "idle",
+      model: source.model,
+      reasoning: source.reasoning,
+      source: {
+        cwd: source.acceptedConfig?.cwd ?? this.state.project.path,
+        sessionId: source.id,
+        threadId: source.threadId,
+        turnId: source.lastCompletedTurnId,
+        createdAt: now(),
+        graphId: source.graphId,
+        taskId: source.taskId,
+        unitId: source.unitId,
+      },
+      messages: [],
+      metrics: emptyMetrics(),
+      turns: 0,
+    };
+    this.state.sessions.push(session);
+    this.record("session." + kind, "创建独立只读会话", {
+      sessionId: session.id,
+    });
+    return session;
+  }
+  updateInterviews(input: InterviewSettings): InterviewSettings {
+    if (
+      typeof input.enabled !== "boolean" ||
+      typeof input.onCompleted !== "boolean" ||
+      typeof input.onBlocked !== "boolean"
+    )
+      throw new Error("访谈开关必须是布尔值");
+    const validated = validateTurn({
+      text: text(input.prompt, "访谈提示词"),
+      model: input.model,
+      reasoning: input.reasoning,
+      skills: input.skills,
+    });
+    this.state.interviews = {
+      enabled: input.enabled,
+      onCompleted: input.onCompleted,
+      onBlocked: input.onBlocked,
+      prompt: validated.text,
+      model: validated.model,
+      reasoning: validated.reasoning,
+      skills: validated.skills ?? [],
+    };
+    this.record("interviews.updated", "更新开发者访谈设置");
+    return this.state.interviews;
+  }
+  async interview(
+    id: string,
+    trigger: Feedback["trigger"] = "manual",
+    eventKey: string = randomUUID(),
+  ): Promise<Feedback> {
+    const source = this.session(id);
+    if (source.source) throw new Error("访谈不能再次触发访谈");
+    const key = `${eventKey}/${id}`;
+    const existing = this.state.feedback.find((f) => f.eventKey === key);
+    if (existing) return existing;
+    const settings = structuredClone(this.state.interviews);
+    const feedback: Feedback = {
+      id: randomUUID(),
+      eventKey: key,
+      trigger,
+      status: "pending",
+      prompt: settings.prompt,
+      content: "",
+      createdAt: now(),
+      source: {
+        cwd: source.acceptedConfig?.cwd ?? this.state.project.path,
+        sessionId: id,
+        threadId: source.threadId ?? "",
+        turnId: source.lastCompletedTurnId ?? "",
+        createdAt: now(),
+        graphId: source.graphId,
+        taskId: source.taskId,
+        unitId: source.unitId,
+      },
+    };
+    this.state.feedback.push(feedback);
+    this.record("interview.pending", "已收取访谈请求");
+    try {
+      const session = this.createSidechat(id, {}, "interview");
+      feedback.sessionId = session.id;
+      feedback.source = structuredClone(session.source!);
+      feedback.status = "running";
+      await this.sendMessage(session.id, {
+        text: settings.prompt,
+        model: settings.model ?? source.model,
+        reasoning: settings.reasoning ?? source.reasoning,
+        skills: settings.skills,
+      });
+      if (session.status === "failed")
+        throw new Error(session.error ?? "访谈启动失败");
+    } catch (error) {
+      feedback.status = "failed";
+      feedback.error = errorText(error);
+      feedback.completedAt = now();
+    }
+    this.record(
+      "interview." + feedback.status,
+      feedback.error ?? "访谈已启动",
+      { sessionId: feedback.sessionId },
+    );
+    return feedback;
+  }
+  private interviewTask(
+    graph: Graph,
+    task: Task,
+    trigger: "completed" | "blocked",
+  ) {
+    const settings = this.state.interviews;
+    if (
+      !settings.enabled ||
+      !(trigger === "completed" ? settings.onCompleted : settings.onBlocked)
+    )
+      return;
+    const execution = this.state.executions
+      .filter((e) => e.graphId === graph.id && e.taskId === task.id)
+      .at(-1);
+    const eventKey = `${graph.id}/${task.id}/${task.configRevision}/${trigger}/${execution?.id ?? "workspace"}`;
+    for (const unit of task.units)
+      if (unit.kind === "agent" && unit.sessionId) {
+        void this.interview(unit.sessionId, trigger, eventKey).catch((error) =>
+          this.record("interview.failed", errorText(error)),
+        );
+      }
+  }
+  private finishInterview(session: Session, result: RuntimeResult) {
+    if (session.kind !== "interview") return;
+    const feedback = this.state.feedback.find(
+      (f) => f.sessionId === session.id,
+    );
+    if (!feedback) return;
+    feedback.status =
+      result.status === "completed"
+        ? "completed"
+        : result.status === "interrupted"
+          ? "cancelled"
+          : "failed";
+    feedback.content = session.messages
+      .filter((m) => m.role === "assistant")
+      .map((m) => m.text)
+      .join("\n\n");
+    feedback.error = result.error;
+    feedback.completedAt = now();
+    this.record("feedback.updated", "访谈结果已保存", {
+      sessionId: session.id,
+    });
+  }
+  resolvePreparation(
+    sessionId: string,
+    id: string,
+    input: { accepted: boolean; threadId?: string; turnId?: string },
+  ) {
+    const session = this.session(sessionId);
+    this.ensureStopped(session);
+    const preparation = this.state.preparations.find(
+      (p) => p.id === id && p.sessionId === sessionId,
+    );
+    if (!preparation || preparation.receipt.status !== "uncertain")
+      throw new Error("只允许核对接收结果未知的输入");
+    if (typeof input.accepted !== "boolean")
+      throw new Error("必须明确确认是否已接收");
+    const receipt = input.accepted
+      ? {
+          status: "accepted" as const,
+          threadId: text(input.threadId, "threadId"),
+          turnId: text(input.turnId, "turnId"),
+        }
+      : { status: "rejected" as const, reason: "用户检查运行历史后确认未接收" };
+    this.inputs.accept(session, preparation, receipt);
+    if (receipt.status === "accepted") this.acceptLetters(session, preparation);
+    this.record("preparation.resolved", "用户已核对输入接收结果", {
+      sessionId,
+    });
+    return preparation;
+  }
   async sendMessage(id: string, message: string | TurnInput): Promise<Session> {
     const input = validateTurn(
       typeof message === "string" ? { text: message } : message,
@@ -192,7 +415,7 @@ export class HarnessEngine {
       .catch(() => {})
       .then(async () => {
         if (this.closing) throw new Error("Engine is closing");
-        if (session.kind !== "free")
+        if (session.kind === "task")
           throw new Error("Task sessions require Mailbox messages");
         const fingerprint = hash(JSON.stringify(input));
         const accepted = session.turnRequests?.find(
@@ -230,6 +453,7 @@ export class HarnessEngine {
           return receipt;
         };
         if (input.mode === "steer") {
+          if (session.source) throw new Error("只读侧聊支持排队和下一轮追问，不支持执行中 steer");
           if (
             !target ||
             !activeExecution(target) ||
@@ -245,20 +469,58 @@ export class HarnessEngine {
           const receipt = remember(
             "Steering delivery is unconfirmed; inspect the current session before sending another request",
           );
+          const config =
+            session.acceptedConfig ??
+            this.configFor(session, this.state.project.path, target.purpose);
+          const prepared = this.inputs.prepare(
+            session,
+            target.id,
+            config,
+            [],
+            input.text,
+            true,
+          );
+          prepared.receipt = { status: "dispatching" };
           this.record("session.steer_requested", "Steering requested", {
             sessionId: id,
           });
-          if (
-            !(await handle.inject(input.text, {
+          let confirmed: boolean;
+          try {
+            confirmed = await handle.inject(input.text, {
               attachments,
               skills: input.skills,
-            }))
-          ) {
+            });
+          } catch (error) {
+            prepared.receipt = {
+              status: "uncertain",
+              reason: errorText(error),
+            };
+            this.record("session.steer_unconfirmed", errorText(error), {
+              sessionId: id,
+            });
+            throw error;
+          }
+          if (!confirmed) {
             const error = "Active execution did not confirm steering";
+            prepared.receipt = { status: "uncertain", reason: error };
             if (receipt) receipt.error = error;
             this.record("session.steer_unconfirmed", error, { sessionId: id });
             throw new Error(error);
           }
+          const accepted = this.state.preparations.find(
+            (p) =>
+              p.executionId === target.id &&
+              p.mode !== "steer" &&
+              p.receipt.status === "accepted",
+          )?.receipt;
+          prepared.receipt =
+            accepted?.status === "accepted"
+              ? structuredClone(accepted)
+              : {
+                  status: "uncertain",
+                  reason:
+                    "Steer accepted but target turn identity is unavailable",
+                };
           if (receipt) delete receipt.error;
           session.messages.push({
             id: randomUUID(),
@@ -343,8 +605,12 @@ export class HarnessEngine {
     this.launch(
       session,
       input.text,
-      "chat",
-      this.state.project.path,
+      session.kind === "sidechat" || session.kind === "interview"
+        ? session.kind
+        : "chat",
+      session.acceptedConfig?.cwd ??
+        session.source?.cwd ??
+        this.state.project.path,
       undefined,
       { attachments, skills: input.skills },
       input.mode === "queue",
@@ -620,12 +886,19 @@ export class HarnessEngine {
       mode === "soft" ? "等待活动执行正常收尾" : "正在中断活动执行",
       { graphId: id },
     );
-    if (mode === "hard")
-      await Promise.all(
-        this.state.executions
-          .filter((e) => e.graphId === id && activeExecution(e))
-          .map((e) => this.interrupt(e.sessionId)),
-      );
+    await Promise.all(
+      this.state.executions
+        .filter(
+          (e) =>
+            e.graphId === id &&
+            activeExecution(e) &&
+            (mode === "hard" ||
+              !this.state.preparations.some(
+                (p) => p.executionId === e.id && inputAccepted(p),
+              )),
+        )
+        .map((e) => this.interrupt(e.sessionId)),
+    );
     this.settlePause(graph);
     return graph;
   }
@@ -841,6 +1114,7 @@ export class HarnessEngine {
       taskId: task.id,
     });
     this.notify(graph, "blocked", `Task ${task.id} 阻塞：${message}`);
+    this.interviewTask(graph, task, "blocked");
   }
   private reportDirectory(graph: Graph, task: Task, unit: Unit) {
     const path = join(task.workspace!.path, ".newharness", "reports", unit.id);
@@ -889,49 +1163,10 @@ export class HarnessEngine {
     }
     this.ensureStopped(session);
     const reports = this.reportDirectory(graph, task, unit);
-    const cli = fileURLToPath(new URL("../../dist/cli.js", import.meta.url));
-    const sourceCli = fileURLToPath(new URL("../cli.ts", import.meta.url));
-    const command = existsSync(cli)
-      ? `node "${cli}"`
-      : `node --import tsx "${sourceCli}"`;
-    const previous = task.submissions.at(-1);
-    const dependencies = task.deps
-      .map((id) => {
-        const dep = this.task(graph, id);
-        return `${dep.title}\n${dep.submissions.at(-1)?.content || ""}`;
-      })
-      .join("\n\n");
-    const skills = unit.skills
-      .map((skill) => {
-        const paths = [
-          resolve(task.workspace!.path, skill),
-          join(homedir(), ".agents", "skills", skill, "SKILL.md"),
-          join(homedir(), ".codex", "skills", skill, "SKILL.md"),
-        ];
-        const path = paths.find((p) => existsSync(p) && statSync(p).isFile());
-        if (!path) throw new Error(`Skill 不存在：${skill}`);
-        return `Skill ${skill}\nSource: ${path}\nResolve this skill's relative references from its containing directory.\n${readFileSync(path, "utf8")}`;
-      })
-      .join("\n\n");
-    const prompt = [
-      `你是 Task ${task.id} 的 ${unit.name}。任务配置版本 ${task.configRevision}。`,
-      unit.prompt,
-      `任务目标\n${task.goal}`,
-      `代码工作区：${task.workspace!.path}`,
-      unit.readOnly
-        ? "代码只读。报告写入下面的独立报告目录。"
-        : "仅修改本任务代码工作区，不操作 Git 提交或合并。",
-      `报告目录：${reports}`,
-      dependencies ? `已交付依赖报告\n${dependencies}` : "",
-      previous ? `上一份结果 (${previous.outcome})\n${previous.content}` : "",
-      skills,
+    const prompt =
       purpose === "report"
         ? "上一轮正常结束但未交卷。不要重复完成工作；检查成果，写报告并汇报。"
-        : "",
-      `完成后必须先把报告写到上述报告目录的文件，再主动运行：\n${command} unit report --outcome <ready|approved|changes_requested|blocked> --report "<报告绝对路径>"\n当前 Unit 可提交的结果：${[...new Set([...task.type.rules.filter((r) => r.from === unit.id).map((r) => r.outcome), "blocked"])].join(", ")}。\nCLI 从环境读取身份，不要读取或输出凭据。汇报成功后正常结束本轮。`,
-    ]
-      .filter(Boolean)
-      .join("\n\n");
+        : "按本次任务目标和新增材料继续工作，完成后交卷。";
     task.nextUnit = unit.id;
     task.status = unit.readOnly ? "reviewing" : "running";
     unit.status = "running";
@@ -941,6 +1176,118 @@ export class HarnessEngine {
       unit,
       reports,
     });
+  }
+  private unitSources(
+    task: Task,
+    unit: Unit,
+    reports: string,
+    session: Session,
+  ): ResolvedContextItem[] {
+    if (unit.kind === "command") return [];
+    const cli = fileURLToPath(new URL("../../dist/cli.js", import.meta.url));
+    const sourceCli = fileURLToPath(new URL("../cli.ts", import.meta.url));
+    const command = existsSync(cli)
+      ? `node "${cli}"`
+      : `node --import tsx "${sourceCli}"`;
+    const sources = [
+      contextItem(
+        "role",
+        "role",
+        [
+          `你是 Task ${task.id} 的 ${unit.name}。`,
+          unit.prompt,
+          `代码工作区：${task.workspace!.path}`,
+          unit.readOnly
+            ? "代码只读，报告写入独立报告目录。"
+            : "仅修改本任务工作区，不操作 Git 提交或合并。",
+          `报告目录：${reports}`,
+          `完成后先写报告，再运行 ${command} unit report --outcome <结果> --report "<报告绝对路径>"。可用结果：${[...new Set([...task.type.rules.filter((r) => r.from === unit.id).map((r) => r.outcome), "blocked"])].join(", ")}。CLI 从环境读取身份，不要读取或输出凭据。汇报成功后结束本轮。`,
+        ].join("\n\n"),
+      ),
+    ];
+    if (unit.context?.goal)
+      sources.push(
+        contextItem(
+          "goal",
+          "goal",
+          `任务目标（版本 ${task.configRevision}）\n${task.goal}`,
+        ),
+      );
+    const graph = this.state.graphs.find((g) => g.tasks.includes(task))!;
+    const submissions = [
+      ...(unit.context?.dependencies
+        ? task.deps.map((id) => this.task(graph, id).submissions.at(-1))
+        : []),
+      ...(unit.context?.previousResult ? [task.submissions.at(-1)] : []),
+    ];
+    for (const report of submissions)
+      if (report)
+        sources.push(
+          contextItem(
+            `report/${report.id}`,
+            "report",
+            `结果 ${report.taskId}/${report.unitId} (${report.outcome})\n${report.content}`,
+            { path: report.reportPath },
+          ),
+        );
+    for (const file of unit.context?.files ?? []) {
+      const bound = this.readBoundFile(file, [task.workspace!.path]);
+      sources.push(
+        contextItem(`file/${bound.path}`, "file", bound.content, {
+          path: bound.path,
+        }),
+      );
+    }
+    for (const skill of unit.skills) {
+      const previous =
+        session.acceptedConfig?.revision === task.configRevision
+          ? this.state.preparations
+              .filter(
+                (p) =>
+                  p.sessionId === session.id && p.receipt.status === "accepted",
+              )
+              .flatMap((p) => p.inputs)
+              .find((i) => i.id === `skill/${skill}`)
+          : undefined;
+      if (previous) {
+        sources.push(structuredClone(previous));
+        continue;
+      }
+      const paths = [
+        resolve(task.workspace!.path, skill),
+        join(homedir(), ".agents", "skills", skill, "SKILL.md"),
+        join(homedir(), ".codex", "skills", skill, "SKILL.md"),
+      ];
+      const path = paths.find((p) => existsSync(p) && statSync(p).isFile());
+      if (!path) throw new Error(`Skill 不存在：${skill}`);
+      sources.push(
+        contextItem(
+          `skill/${skill}`,
+          "skill",
+          `Skill ${skill}\nSource: ${path}\n${readFileSync(path, "utf8")}`,
+          { path },
+        ),
+      );
+    }
+    return sources;
+  }
+  private configFor(
+    session: Session,
+    cwd: string,
+    purpose: Execution["purpose"],
+    context?: { task: Task; unit: Unit },
+  ): ResolvedConfig {
+    return {
+      revision: context?.task.configRevision ?? 1,
+      model: context?.unit.model ?? session.model,
+      reasoning: context?.unit.reasoning ?? session.reasoning,
+      readOnly:
+        purpose === "mail" || !!session.source || !!context?.unit.readOnly,
+      cwd,
+      skills: [
+        ...(context?.unit.skills ?? session.acceptedConfig?.skills ?? []),
+      ],
+    };
   }
   private launch(
     session: Session,
@@ -984,11 +1331,65 @@ export class HarnessEngine {
       purpose === "chat"
         ? `你正在 Loom 的自由会话中工作。需要规划可执行任务图时，可使用本地 CLI：node "${fileURLToPath(new URL("../../dist/cli.js", import.meta.url))}" --help。使用 graph create --file graph.json 创建图，graph run --id ID 运行；state 可查看 TaskTypes 和已有任务。图外会话地址为 session/${session.id}。仅在用户要求执行任务时启动图，不要把普通讨论当作执行请求。`
         : "";
-    const deliveredPrompt = [
-      controllerGuide,
-      prompt,
-      ...pending.map(({ letter }) => this.letterText(letter)),
-    ].join("\n\n");
+    const config = this.configFor(session, cwd, purpose, context);
+    let preparation: Preparation;
+    try {
+      const sources =
+        context && purpose !== "mail"
+          ? this.unitSources(
+              context.task,
+              context.unit,
+              context.reports,
+              session,
+            )
+          : [];
+      if (controllerGuide)
+        sources.push(
+          contextItem("platform-help", "instruction", controllerGuide),
+        );
+      for (const { letter } of pending)
+        sources.push(
+          contextItem(
+            `letter/${letter.id}`,
+            "letter",
+            this.letterText(letter),
+            { letterId: letter.id, path: letter.path },
+          ),
+        );
+      preparation = this.inputs.prepare(
+        session,
+        execution.id,
+        config,
+        sources,
+        prompt,
+      );
+    } catch (error) {
+      preparation = {
+        id: randomUUID(),
+        executionId: execution.id,
+        sessionId: session.id,
+        mode: session.acceptedConfig ? "continue" : "initialize",
+        createdAt: now(),
+        config,
+        inputs: [],
+        prompt,
+        receipt: { status: "rejected", reason: errorText(error) },
+      };
+      this.state.preparations.push(preparation);
+      execution.status = "failed";
+      execution.error = errorText(error);
+      execution.endedAt = now();
+      session.status = "failed";
+      session.error = execution.error;
+      if (context) {
+        context.unit.status = "failed";
+        this.block(context.graph, context.task, execution.error);
+      }
+      this.record("preparation.failed", execution.error, {
+        sessionId: session.id,
+      });
+      return;
+    }
     session.messages.push({
       id: randomUUID(),
       role: purpose === "chat" ? "user" : "system",
@@ -1008,6 +1409,7 @@ export class HarnessEngine {
     });
     const job = (async () => {
       let result: RuntimeResult;
+      let dispatched = false;
       try {
         const onEvent = (event: RuntimeEvent) =>
           this.runtimeEvent(
@@ -1018,6 +1420,10 @@ export class HarnessEngine {
             ) as RuntimeEvent,
             context?.unit,
           );
+        preparation.receipt = { status: "dispatching" };
+        this.record("preparation.dispatching", "输入已组装，等待运行时接收", {
+          sessionId: session.id,
+        });
         const handle =
           context?.unit.kind === "command"
             ? this.command(context.unit.command!, cwd, onEvent)
@@ -1025,31 +1431,58 @@ export class HarnessEngine {
                 {
                   cwd,
                   ...turnInput,
-                  prompt: deliveredPrompt,
+                  prompt: preparation.prompt,
                   threadId: session.threadId,
-                  model: context?.unit.model || session.model,
-                  reasoning: context?.unit.reasoning || session.reasoning,
-                  readOnly: purpose === "mail" || context?.unit.readOnly,
+                  model: config.model,
+                  reasoning: config.reasoning,
+                  readOnly: config.readOnly,
+                  observer: !!session.source,
+                  fork:
+                    session.source && !session.acceptedConfig
+                      ? {
+                          threadId: session.source.threadId,
+                          turnId: session.source.turnId,
+                        }
+                      : undefined,
                   writableRoots:
                     context && purpose !== "mail"
                       ? [context.reports]
                       : undefined,
-                  env: {
-                    HARNESS_URL: this.endpoint,
-                    HARNESS_PROJECT_ID: this.state.project.id ?? "",
-                    ...(execution.tokenHash ? { HARNESS_TOKEN: token } : {}),
-                    HARNESS_ADDRESS: context
-                      ? `${context.graph.id}/${context.task.id}/${context.unit.id}`
-                      : `session/${session.id}`,
-                  },
+                  env: session.source
+                    ? {}
+                    : {
+                        HARNESS_URL: this.endpoint,
+                        HARNESS_PROJECT_ID: this.state.project.id ?? "",
+                        ...(execution.tokenHash
+                          ? { HARNESS_TOKEN: token }
+                          : {}),
+                        HARNESS_ADDRESS: context
+                          ? `${context.graph.id}/${context.task.id}/${context.unit.id}`
+                          : `session/${session.id}`,
+                      },
                 },
                 onEvent,
               );
         this.handles.set(session.id, handle);
+        dispatched = true;
         execution.pid = handle.pid;
         execution.status = "running";
-        for (const item of pending) this.markDelivered(item, session);
-        void this.deliverWaiting(session);
+        const acceptance = handle.accepted.then((receipt) => {
+          const priorConfig = session.acceptedConfig;
+          this.inputs.accept(session, preparation, receipt);
+          if (purpose === "mail" && priorConfig)
+            session.acceptedConfig = priorConfig;
+          if (receipt.status === "accepted") {
+            execution.threadId = receipt.threadId;
+            for (const item of pending) this.markDelivered(item, session);
+          } else if (receipt.status === "uncertain") session.queuePaused = true;
+          this.record(
+            "preparation." + receipt.status,
+            receipt.status === "accepted" ? "运行时已接受输入" : receipt.reason,
+            { sessionId: session.id },
+          );
+          if (receipt.status === "accepted") void this.deliverWaiting(session);
+        });
         this.record("execution.running", "执行已启动", {
           sessionId: session.id,
           graphId: execution.graphId,
@@ -1058,11 +1491,28 @@ export class HarnessEngine {
         });
         if (
           this.closing ||
-          (context?.graph.pauseMode === "hard" &&
-            context.graph.status === "pausing")
+          (context?.graph.status === "pausing" &&
+            (context.graph.pauseMode === "hard" || !inputAccepted(preparation)))
         )
           await handle.interrupt();
-        result = await handle.done;
+        const completion = await Promise.allSettled([acceptance, handle.done]);
+        if (completion[0].status === "rejected")
+          preparation.receipt = {
+            status: "uncertain",
+            reason: errorText(completion[0].reason),
+          };
+        if (completion[1].status === "rejected") throw completion[1].reason;
+        result = completion[1].value;
+        if (result.status !== "interrupted" && !inputAccepted(preparation))
+          result = {
+            ...result,
+            status: "failed",
+            error:
+              preparation.receipt.status === "uncertain" ||
+              preparation.receipt.status === "rejected"
+                ? preparation.receipt.reason
+                : "运行时未确认输入",
+          };
         if (
           context?.unit.kind === "command" &&
           result.status === "completed" &&
@@ -1073,6 +1523,11 @@ export class HarnessEngine {
           this.submit(token, { outcome: "ready", report });
         }
       } catch (error) {
+        if (["prepared", "dispatching"].includes(preparation.receipt.status))
+          preparation.receipt = {
+            status: dispatched ? "uncertain" : "rejected",
+            reason: errorText(error),
+          };
         result = { status: "failed", text: "", error: errorText(error) };
       }
       this.handles.delete(session.id);
@@ -1081,6 +1536,8 @@ export class HarnessEngine {
       execution.error = result.error;
       execution.threadId = result.threadId || session.threadId;
       session.threadId = execution.threadId;
+      if (result.completedTurnId)
+        session.lastCompletedTurnId = result.completedTurnId;
       session.status = result.status === "completed" ? "idle" : result.status;
       session.error = result.error;
       if (result.status !== "completed") session.queuePaused = true;
@@ -1122,6 +1579,7 @@ export class HarnessEngine {
         unitId: execution.unitId,
         detail: { seconds, usage: result.usage },
       });
+      this.finishInterview(session, result);
       if (context && purpose !== "mail")
         await this.advance(
           context.graph,
@@ -1249,6 +1707,18 @@ export class HarnessEngine {
     });
     return {
       pid: proc.pid,
+      accepted: new Promise((resolve) => {
+        proc.once("spawn", () =>
+          resolve({
+            status: "accepted",
+            threadId: `command-${proc.pid}`,
+            turnId: randomUUID(),
+          }),
+        );
+        proc.once("error", (error) =>
+          resolve({ status: "rejected", reason: error.message }),
+        );
+      }),
       done,
       inject: async () => false,
       interrupt: async () => {
@@ -1356,6 +1826,7 @@ export class HarnessEngine {
           "completed",
           `${task.id} 已交付\n${submission.content}`,
         );
+        this.interviewTask(graph, task, "completed");
       } else {
         const targetId = rule.action.unit;
         const target = task.units.find((u) => u.id === targetId)!;
@@ -1597,11 +2068,15 @@ export class HarnessEngine {
     return letter;
   }
   private pendingLetters(session: Session) {
+    if (session.source) return [];
     const address = this.address(session);
     return this.state.letters.flatMap((letter) =>
       letter.deliveries
         .filter(
-          (delivery) => delivery.to === address && delivery.status === "queued",
+          (delivery) =>
+            delivery.to === address &&
+            delivery.status === "queued" &&
+            !this.inputs.occupiedLetter(session.id, letter.id),
         )
         .map((delivery) => ({ letter, delivery })),
     );
@@ -1623,9 +2098,21 @@ export class HarnessEngine {
       at: now(),
     });
   }
+  private acceptLetters(session: Session, preparation: Preparation) {
+    for (const input of preparation.inputs)
+      if (input.letterId) {
+        const letter = this.state.letters.find((l) => l.id === input.letterId);
+        const delivery = letter?.deliveries.find(
+          (d) => d.to === this.address(session),
+        );
+        if (letter && delivery && delivery.status !== "injected")
+          this.markDelivered({ letter, delivery }, session);
+      }
+  }
   private delivering = new Set<string>();
   private async deliverWaiting(session: Session) {
-    if (this.delivering.has(session.id) || this.closing) return;
+    if (session.source || this.delivering.has(session.id) || this.closing)
+      return;
     this.delivering.add(session.id);
     try {
       const pending = this.pendingLetters(session).filter(
@@ -1642,12 +2129,69 @@ export class HarnessEngine {
           (p) => p.letter.mode !== "followup",
         )) {
           if (!this.runtime.capabilities.inject) continue;
-          if (await handle.inject(this.letterText(item.letter))) {
-            this.markDelivered(item, session);
+          const execution = this.state.executions.find(
+            (e) => e.sessionId === session.id && activeExecution(e),
+          );
+          if (!execution || !session.acceptedConfig) continue;
+          if (
+            ["paused", "pausing", "draft"].includes(
+              this.graph(item.letter.graphId).status,
+            )
+          )
+            break;
+          const preparation = this.inputs.prepare(
+            session,
+            execution.id,
+            session.acceptedConfig,
+            [
+              contextItem(
+                `letter/${item.letter.id}`,
+                "letter",
+                this.letterText(item.letter),
+                { letterId: item.letter.id, path: item.letter.path },
+              ),
+            ],
+            "",
+            true,
+          );
+          preparation.receipt = { status: "dispatching" };
+          this.record("letter.dispatching", "正在投递信件", {
+            sessionId: session.id,
+          });
+          let confirmed = false;
+          try {
+            confirmed = await handle.inject(preparation.prompt);
+          } catch (error) {
+            preparation.receipt = {
+              status: "uncertain",
+              reason: errorText(error),
+            };
+          }
+          if (confirmed) {
+            const original = this.state.preparations.find(
+              (p) =>
+                p.executionId === execution.id &&
+                p.mode !== "steer" &&
+                p.receipt.status === "accepted",
+            )?.receipt;
+            preparation.receipt =
+              original?.status === "accepted"
+                ? structuredClone(original)
+                : { status: "uncertain", reason: "接收确认缺少目标轮次" };
+            if (preparation.receipt.status === "accepted")
+              this.acceptLetters(session, preparation);
             this.record("letter.injected", "已并入活动会话", {
               sessionId: session.id,
               graphId: item.letter.graphId,
               detail: { letterId: item.letter.id },
+            });
+          } else {
+            preparation.receipt = {
+              status: "uncertain",
+              reason: "运行时未确认信件接收，请检查目标历史",
+            };
+            this.record("letter.uncertain", preparation.receipt.reason, {
+              sessionId: session.id,
             });
           }
         }

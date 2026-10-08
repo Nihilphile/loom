@@ -47,6 +47,22 @@ export function validateUnit(value: UnitConfig) {
   validateAgent({ ...value, version: 1 });
   if (!["agent", "command"].includes(value.kind))
     throw new Error("无效 Unit 类型");
+  if (value.context !== undefined) {
+    if (
+      !value.context ||
+      typeof value.context !== "object" ||
+      Array.isArray(value.context)
+    )
+      throw new Error("Context 必须是对象");
+    for (const key of ["goal", "dependencies", "previousResult"] as const)
+      if (
+        value.context[key] !== undefined &&
+        typeof value.context[key] !== "boolean"
+      )
+        throw new Error("Context 选择器必须是布尔值");
+    if (value.context.files !== undefined)
+      strings(value.context.files, "Context files");
+  }
   if (value.kind === "command") {
     text(value.command, "命令");
     if (value.readOnly)

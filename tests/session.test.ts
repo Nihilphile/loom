@@ -52,6 +52,11 @@ class Controlled implements Runtime {
     });
     this.turns.push({ input, emit, finish });
     return {
+      accepted: Promise.resolve({
+        status: "accepted" as const,
+        threadId: input.threadId || "thread",
+        turnId: "turn",
+      }),
       done,
       interrupt: async () => {
         finish({ status: "interrupted" });

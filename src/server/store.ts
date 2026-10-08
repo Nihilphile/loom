@@ -8,6 +8,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { basename, join } from "node:path";
+import { defaultInterviews } from "../shared/types.ts";
 import type { HarnessEvent, ProjectState } from "../shared/types.ts";
 import { projectIdentity } from "./project-path.ts";
 
@@ -58,6 +59,9 @@ export class ProjectStore {
       graphs: [],
       letters: [],
       executions: [],
+      preparations: [],
+      interviews: defaultInterviews(),
+      feedback: [],
     };
   }
   save(

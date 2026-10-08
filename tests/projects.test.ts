@@ -35,6 +35,11 @@ class HeldRuntime implements Runtime {
     });
     this.turns.push({ input, finish, emit });
     return {
+      accepted: Promise.resolve({
+        status: "accepted" as const,
+        threadId: input.threadId || "thread",
+        turnId: "turn",
+      }),
       done,
       inject: async () => true,
       interrupt: async () => {

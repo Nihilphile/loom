@@ -1,5 +1,7 @@
 # 架构与接口
 
+2026-10-08 更新：Unit 执行准备的目标架构见 [unit-execution.md](unit-execution.md)。已确认将内部 Scheduler／Preparation 与可见 Unit 分开，由每个 Unit 的 Config／Context 呈现配置和实际输入；首次初始化与原 session 增量输入分别记录。工作流包只通过显式调用启用。侧边对话只读要求已纳入，独立分叉方式仍为建议。以下模块与 HTTP 表描述现有实现，不表示新契约已经落地。
+
 每个项目由独立 HarnessEngine 管理状态。项目注册表保存稳定 ID 与规范路径，HTTP 服务保留已经打开的执行器直到退出。浏览器切换只改变请求地址，不替换后台执行器。HTTP 和 CLI 只请求领域操作，runtime/Git 只执行外部效果并返回事实。TaskType 规则为数据，状态不根据模型自然语言推断。
 
 ## 使用方式
@@ -16,6 +18,8 @@ await engine.pauseGraph(graph.id, 'soft');
 ```
 
 ## 模块与数据所有权
+
+下一次结构调整增加统一会话执行入口，集中准备输入和接收记录。Preparation 在该入口内部完成配置解析与上下文组装；Engine 仍独占 Task 状态及 ProjectStore 写事务，Runtime 只返回外部运行事实。具体边界、类型草案与验收顺序见 [Unit 执行准备](unit-execution.md)。原型接口可直接替换，不增加向后兼容层。
 
 - `src/shared/types.ts`：项目、Session、Task、Graph、Letter、模板与适配器契约。不是 Codex wire 类型。
 - `src/server/store.ts`：SQLite 保存权威 state 和 append-only events，事务提交。协调器独占写入。报告固定副本位于 .newharness/reports，项目下预留 .session 与 taskgraph 目录供按会话/图导出。
@@ -71,4 +75,4 @@ Model the Domain 决定显式区分执行、汇报、任务交付和 graph 汇�
 
 ## 实施核对
 
-本文件与 shared/types.ts 是各切片接口约定。接入发现返回形状或状态不符时，由主控更新本文件及调用方再整合，不用类型断言掩盖。具体 runtime 选择及经验证支持范围将记录在交付报告。
+本文现有接口与 shared/types.ts 描述当前实现；unit-execution.md 描述已决定的后续结构，不能把其中草案当成已经可调用的 API。实现新契约时同步替换类型和调用方，删除旧路径，不用类型断言或兼容别名掩盖差异。具体 runtime 选择及经验证支持范围记录在交付报告。

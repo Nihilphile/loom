@@ -70,6 +70,10 @@ test("report-only tasks snapshot cleanly when runtime metadata is ignored", asyn
     );
     await rm(join(task.path, "shared.txt"));
     await writeFile(join(task.path, "-file name.txt"), "literal path");
+    await writeFile(
+      join(task.path, " leading [literal].txt"),
+      "leading whitespace",
+    );
     const deleted = await adapter.snapshot(
       task,
       "delete tracked file",
@@ -79,6 +83,7 @@ test("report-only tasks snapshot cleanly when runtime metadata is ignored", asyn
       await git(task.path, "ls-tree", "-r", "--name-only", deleted)
     ).split("\n");
     assert(paths.includes("-file name.txt"));
+    assert(paths.includes(" leading [literal].txt"));
     assert(!paths.includes("shared.txt"));
     assert(!paths.some((path) => path.startsWith(".newharness/")));
   } finally {

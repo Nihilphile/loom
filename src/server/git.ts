@@ -36,7 +36,12 @@ async function locked<T>(key: string, action: () => Promise<T>): Promise<T> {
   }
 }
 
-function git(cwd: string, args: string[], input?: string): Promise<string> {
+function git(
+  cwd: string,
+  args: string[],
+  input?: string,
+  rawOutput = false,
+): Promise<string> {
   return new Promise((accept, reject) => {
     const child = execFile(
       "git",
@@ -72,7 +77,7 @@ function git(cwd: string, args: string[], input?: string): Promise<string> {
               `Git ${args[0]} failed in ${cwd}: ${stderr.trim() || stdout.trim() || error.message}`,
             ),
           );
-        else accept(stdout.trim());
+        else accept(rawOutput ? stdout : stdout.trim());
       },
     );
     child.stdin?.end(input);
@@ -396,13 +401,12 @@ export class GitWorkspaces implements GitAdapter {
         ...metadata,
       ]);
       const files = (
-        await git(workspace.path, [
-          "ls-files",
-          "--cached",
-          "--others",
-          "--exclude-standard",
-          "-z",
-        ])
+        await git(
+          workspace.path,
+          ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+          undefined,
+          true,
+        )
       )
         .split("\0")
         .filter(

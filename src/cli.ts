@@ -12,7 +12,7 @@ const help = `New Harness CLI
   graph pause --id <graph-id> [--hard]
   graph add-task --id <graph-id> --file <task.json>
 
-The launcher supplies HARNESS_URL, HARNESS_TOKEN and HARNESS_ADDRESS. Never print credentials.`;
+The launcher supplies HARNESS_URL, HARNESS_PROJECT_ID, HARNESS_TOKEN and HARNESS_ADDRESS. Never print credentials.`;
 async function main() {
   if (!args.length || args.includes("--help")) {
     process.stdout.write(help + "\n");
@@ -76,6 +76,9 @@ async function main() {
   } else if (args[0] === "state") {
     path = "/api/state";
   } else throw new Error(help);
+  const projectId = process.env.HARNESS_PROJECT_ID;
+  if (projectId)
+    path = `/api/projects/${encodeURIComponent(projectId)}` + path.slice(4);
   const response = await fetch(new URL(path, url), {
     method: body ? "POST" : "GET",
     headers: {

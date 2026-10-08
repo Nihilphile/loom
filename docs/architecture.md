@@ -1,6 +1,6 @@
-# 首版架构与接口
+# 架构与接口
 
-采用单一 ProjectCoordinator / HarnessEngine 管理项目状态。HTTP 和 CLI 只请求领域操作，runtime/Git 只执行外部效果并返回事实。TaskType 规则为数据，状态不根据模型自然语言推断。
+每个项目由独立 HarnessEngine 管理状态。项目注册表保存稳定 ID 与规范路径，HTTP 服务保留已经打开的执行器直到退出。浏览器切换只改变请求地址，不替换后台执行器。HTTP 和 CLI 只请求领域操作，runtime/Git 只执行外部效果并返回事实。TaskType 规则为数据，状态不根据模型自然语言推断。
 
 ## 使用方式
 
@@ -30,7 +30,9 @@ await engine.pauseGraph(graph.id, 'soft');
 
 ## HTTP 契约
 
-返回 JSON；错误使用非 2xx 与 `{error: string}`。GET `/api/state` 返回 `AppState`，SSE `/api/stream` 的 `state` 消息同形。服务只管理一个当前打开项目；切换项目时不得遗弃活动执行。
+返回 JSON；错误使用非 2xx 与 `{error: string}`。以下项目路由的 `/api` 前缀在新客户端中均使用 `/api/projects/:projectId`。GET `/state` 返回 `AppState`，SSE `/stream` 的 `state` 消息同形，含 `project.id`。原无项目 ID 路由仅绑定固定启动项目；带凭据的旧回调按凭据查找所属执行器。浏览器选择不改变这些路由。
+
+全局 GET `/api/projects` 返回项目列表，POST `/api/projects` 接收 `{path,name?}` 并返回项目描述。同一规范路径重复注册返回同一 ID。运行时发现、附件、消息队列等第二轮接口见 [iteration-2.md](iteration-2.md)。CLI 通过 HARNESS_PROJECT_ID 给所有命令加项目路由。
 
 | 方法 | 路径 | 输入 / 输出 |
 | --- | --- | --- |

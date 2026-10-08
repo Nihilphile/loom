@@ -22,6 +22,7 @@ class Controlled implements Runtime {
     finish: (result?: Partial<RuntimeResult>) => void;
   }[] = [];
   confirmInjection = true;
+  beforeInjectionReply?: () => Promise<void>;
   injections: {
     text: string;
     input?: Pick<RuntimeInput, "attachments" | "skills">;
@@ -61,6 +62,7 @@ class Controlled implements Runtime {
         input?: Pick<RuntimeInput, "attachments" | "skills">,
       ) => {
         this.injections.push({ text, input });
+        await this.beforeInjectionReply?.();
         return this.confirmInjection;
       },
     };
@@ -290,6 +292,34 @@ test("unconfirmed steering keeps a durable failure receipt and never injects twi
   f.restart();
   await assert.rejects(f.engine.sendMessage(s.id, input), /did not confirm/);
   assert.equal(f.runtime.injections.length, 1);
+});
+
+test("confirmed steering remains delivered when the target completes before acknowledgement reaches the engine", async (t) => {
+  const f = fixture(t);
+  const session = f.engine.createSession({ title: "ack race" });
+  await f.engine.sendMessage(session.id, "start");
+  f.runtime.beforeInjectionReply = async () => {
+    f.runtime.turns[0].finish();
+    await tick();
+  };
+  const input = {
+    text: "accepted correction",
+    mode: "steer" as const,
+    requestId: "ack-race",
+    expectedExecutionId: f.engine.state.executions[0].id,
+  };
+  await f.engine.sendMessage(session.id, input);
+  assert.equal(session.status, "idle");
+  assert.equal(
+    session.messages.filter((m) => m.delivery === "steer").length,
+    1,
+  );
+  await f.engine.sendMessage(session.id, input);
+  assert.equal(f.runtime.injections.length, 1);
+  assert.equal(
+    session.turnRequests?.find((r) => r.requestId === "ack-race")?.error,
+    undefined,
+  );
 });
 test("restart pauses an otherwise runnable persisted queue and retains idempotency", async (t) => {
   const f = fixture(t),

@@ -17,6 +17,7 @@ const app = await createHttpServer({
   projectRoot: flag("project"),
   staticDir: fileURLToPath(new URL("../web", import.meta.url)),
   catalogPath: process.env.HARNESS_CATALOG,
+  registryPath: process.env.HARNESS_REGISTRY,
 });
 app.server.listen(port, "127.0.0.1", () =>
   process.stdout.write(`New Harness · http://127.0.0.1:${port}\n`),

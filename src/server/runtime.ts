@@ -385,6 +385,7 @@ class CodexExecution {
   private stderr = "";
   private readonly secrets: string[];
   private resolveDone!: (result: RuntimeResult) => void;
+  private initialization?: Promise<void>;
 
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
@@ -440,7 +441,7 @@ class CodexExecution {
   }
 
   start(): void {
-    void this.initialize().catch((error) => this.fail(error));
+    this.initialization = this.initialize().catch((error) => this.fail(error));
   }
 
   private async initialize(): Promise<void> {
@@ -833,6 +834,7 @@ class CodexExecution {
     input?: Pick<RuntimeInput, "attachments" | "skills">,
   ): Promise<boolean> {
     const items = nativeInput(text, input);
+    if (this.phase === "starting") await this.initialization;
     if (
       this.phase !== "running" ||
       !this.threadId ||

@@ -1,8 +1,11 @@
 import { createServer, type ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, resolve, sep } from "node:path";
+import { dirname, extname, join, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
 import { HarnessEngine } from "./engine.ts";
 import { Catalog } from "./catalog.ts";
+import { ProjectRegistry } from "./projects.ts";
+import { resolveAttachments, saveAttachment } from "./attachments.ts";
 import type {
   Runtime,
   GitAdapter,
@@ -15,19 +18,30 @@ import type {
   Outcome,
   Graph,
   Session,
+  TurnInput,
 } from "../shared/types.ts";
 
 export async function createHttpServer(options: {
   runtime: Runtime;
   git: GitAdapter;
   catalogPath?: string;
+  registryPath?: string;
   projectRoot?: string;
   staticDir?: string;
 }) {
-  const catalog = new Catalog(options.catalogPath),
-    streams = new Set<ServerResponse>();
-  let engine: HarnessEngine | undefined;
-  const view = (): AppState =>
+  const catalog = new Catalog(options.catalogPath);
+  const registry = new ProjectRegistry(
+    options.registryPath ||
+      (options.catalogPath
+        ? join(dirname(options.catalogPath), "projects.json")
+        : undefined),
+  );
+  const engines = new Map<string, HarnessEngine>();
+  const streams = new Map<string, Set<ServerResponse>>();
+  let defaultProjectId: string | undefined;
+  let endpoint = "";
+  let closing = false;
+  const view = (engine?: HarnessEngine): AppState =>
     engine?.view() || {
       project: null,
       sessions: [],
@@ -40,30 +54,31 @@ export async function createHttpServer(options: {
         capabilities: options.runtime.capabilities,
       },
     };
-  const broadcast = () => {
-    const message = "event: state\ndata: " + JSON.stringify(view()) + "\n\n";
-    for (const stream of streams) stream.write(message);
+  const broadcast = (id: string) => {
+    const message =
+      "event: state\ndata: " + JSON.stringify(view(engines.get(id))) + "\n\n";
+    for (const stream of streams.get(id) || []) stream.write(message);
   };
-  const open = (path: string) => {
-    if (
-      engine?.busy ||
-      engine?.state.graphs.some((g) =>
-        ["running", "pausing", "merging"].includes(g.status),
-      )
-    )
-      throw new Error("请先暂停当前项目并等待执行结束");
-    if (
-      engine &&
-      resolve(path).toLowerCase() === engine.state.project.path.toLowerCase()
-    )
-      return;
-    const next = new HarnessEngine(path, options.runtime, options.git, catalog);
-    engine?.close();
-    engine = next;
-    engine.listeners.add(broadcast);
-    broadcast();
+  const open = (id: string): HarnessEngine => {
+    const existing = engines.get(id);
+    if (existing) return existing;
+    const entry = registry.get(id);
+    const engine = new HarnessEngine(
+      entry.path,
+      options.runtime,
+      options.git,
+      catalog,
+    );
+    engine.state.project.name = entry.name;
+    engine.endpoint = endpoint;
+    engines.set(id, engine);
+    engine.listeners.add(() => broadcast(id));
+    return engine;
   };
-  if (options.projectRoot) open(options.projectRoot);
+  if (options.projectRoot) {
+    defaultProjectId = registry.register(options.projectRoot).id;
+    open(defaultProjectId);
+  }
   const server = createServer(async (req, res) => {
     const json = (status: number, value: unknown) => {
       res.writeHead(status, {
@@ -73,6 +88,10 @@ export async function createHttpServer(options: {
       res.end(JSON.stringify(value));
     };
     try {
+      if (closing) {
+        json(503, { error: "服务正在关闭" });
+        return;
+      }
       const host = req.headers.host || "";
       if (!/^(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/.test(host)) {
         json(403, { error: "只允许本地访问" });
@@ -85,42 +104,108 @@ export async function createHttpServer(options: {
         json(403, { error: "跨站请求被拒绝" });
         return;
       }
-      const url = new URL(req.url || "/", `http://${host}`),
-        path = url.pathname;
-      if (path === "/api/stream") {
+      const url = new URL(req.url || "/", `http://${host}`);
+      const scoped = /^\/api\/projects\/([^/]+)(\/.*)$/.exec(url.pathname);
+      const path = scoped ? "/api" + scoped[2] : url.pathname;
+      const token = (req.headers.authorization || "").replace(/^Bearer /, "");
+      let projectId = scoped ? decodeURIComponent(scoped[1]) : defaultProjectId;
+      if (!scoped && token) {
+        const digest = createHash("sha256").update(token).digest("hex");
+        projectId = [...engines].find(([, e]) =>
+          e.state.executions.some((x) => x.tokenHash === digest),
+        )?.[0];
+        if (!projectId) {
+          json(401, { error: "执行凭据无效" });
+          return;
+        }
+      }
+      const engine = scoped
+        ? open(projectId!)
+        : projectId
+          ? engines.get(projectId)
+          : undefined;
+      if (
+        token &&
+        engine &&
+        !engine.state.executions.some(
+          (x) =>
+            x.tokenHash === createHash("sha256").update(token).digest("hex"),
+        )
+      ) {
+        json(403, { error: "执行凭据不属于此项目" });
+        return;
+      }
+      if (req.method === "GET" && path === "/api/projects") {
+        json(200, {
+          projects: registry.projects.map((p) => ({
+            ...p,
+            activeSessions:
+              engines
+                .get(p.id)
+                ?.state.sessions.filter((s) => s.status === "running").length ||
+              0,
+            activeGraphs:
+              engines
+                .get(p.id)
+                ?.state.graphs.filter((g) =>
+                  ["running", "pausing", "merging"].includes(g.status),
+                ).length || 0,
+          })),
+        });
+        return;
+      }
+      if (req.method === "GET" && path === "/api/stream") {
+        if (!engine || !projectId) {
+          json(409, { error: "请先打开项目" });
+          return;
+        }
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
         });
-        res.write("event: state\ndata: " + JSON.stringify(view()) + "\n\n");
-        streams.add(res);
-        req.on("close", () => streams.delete(res));
+        res.write(
+          "event: state\ndata: " + JSON.stringify(view(engine)) + "\n\n",
+        );
+        const subscribers = streams.get(projectId) || new Set<ServerResponse>();
+        streams.set(projectId, subscribers);
+        subscribers.add(res);
+        req.on("close", () => subscribers.delete(res));
         return;
       }
       if (req.method === "GET" && path === "/api/state") {
-        json(200, view());
+        json(200, view(engine));
         return;
       }
       let body: Record<string, unknown> = {};
       if (["POST", "PATCH"].includes(req.method || "")) {
         let raw = "";
+        req.setEncoding("utf8");
         for await (const chunk of req) {
           raw += chunk;
-          if (raw.length > 1_000_000) throw new Error("请求过大");
+          if (
+            raw.length > (path === "/api/attachments" ? 14_100_000 : 1_000_000)
+          )
+            throw new Error("请求过大");
         }
         const parsed: unknown = raw ? JSON.parse(raw) : {};
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
           throw new Error("请求必须是 JSON 对象");
         body = parsed as Record<string, unknown>;
       }
-      if (req.method === "POST" && path === "/api/project") {
+      if (
+        req.method === "POST" &&
+        (path === "/api/project" || path === "/api/projects")
+      ) {
         if (typeof body.path !== "string") throw new Error("缺少项目路径");
-        open(body.path);
-        const address = server.address();
-        if (engine && address && typeof address !== "string")
-          engine.endpoint = `http://127.0.0.1:${address.port}`;
-        json(200, view());
+        const entry = registry.register(
+          body.path,
+          body.name as string | undefined,
+        );
+        if (path === "/api/project") {
+          defaultProjectId ??= entry.id;
+          json(200, view(open(entry.id)));
+        } else json(201, entry);
         return;
       }
       if (path.startsWith("/api/")) {
@@ -130,7 +215,40 @@ export async function createHttpServer(options: {
         }
         const parts = path.split("/").filter(Boolean).map(decodeURIComponent),
           method = req.method;
-        const token = (req.headers.authorization || "").replace(/^Bearer /, "");
+        if (method === "GET" && path === "/api/runtime/options") {
+          if (!options.runtime.discoverOptions)
+            throw new Error("当前 Runtime 不支持模型与 Skill 查询");
+          json(
+            200,
+            await options.runtime.discoverOptions(engine.state.project.path),
+          );
+          return;
+        }
+        if (method === "POST" && path === "/api/attachments") {
+          json(
+            201,
+            saveAttachment(
+              engine.state.project.path,
+              body as { name: string; mediaType: string; base64: string },
+            ),
+          );
+          return;
+        }
+        if (method === "GET" && parts[1] === "attachments" && parts[2]) {
+          const attachment = resolveAttachments(engine.state.project.path, [
+            parts[2],
+          ])[0];
+          const bytes = await readFile(attachment.path);
+          res.writeHead(200, {
+            "Content-Type": attachment.mediaType,
+            "Content-Length": bytes.length,
+            "Content-Disposition": `${attachment.kind === "image" ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(attachment.name).replace(/'/g, "%27")}`,
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, max-age=31536000, immutable",
+          });
+          res.end(bytes);
+          return;
+        }
         if (method === "POST" && path === "/api/sessions") {
           json(
             201,
@@ -149,7 +267,27 @@ export async function createHttpServer(options: {
           parts[1] === "sessions" &&
           parts[3] === "turn"
         ) {
-          json(202, engine.sendMessage(parts[2], body.text as string));
+          json(
+            202,
+            await engine.sendMessage(parts[2], body as unknown as TurnInput),
+          );
+          return;
+        }
+        if (
+          method === "DELETE" &&
+          parts[1] === "sessions" &&
+          parts[3] === "queue" &&
+          parts[4]
+        ) {
+          json(200, engine.cancelQueued(parts[2], parts[4]));
+          return;
+        }
+        if (
+          method === "POST" &&
+          parts[1] === "sessions" &&
+          parts[3] === "continue"
+        ) {
+          json(200, await engine.continueQueue(parts[2]));
           return;
         }
         if (
@@ -157,7 +295,13 @@ export async function createHttpServer(options: {
           parts[1] === "sessions" &&
           parts[3] === "interrupt"
         ) {
-          json(200, await engine.interrupt(parts[2]));
+          json(
+            200,
+            await engine.interrupt(
+              parts[2],
+              body.expectedExecutionId as string | undefined,
+            ),
+          );
           return;
         }
         if (method === "GET" && path === "/api/events") {
@@ -258,10 +402,12 @@ export async function createHttpServer(options: {
         }
         if (method === "POST" && path === "/api/catalog/agents") {
           json(200, engine.saveAgent(body as unknown as AgentTemplate));
+          for (const id of engines.keys()) broadcast(id);
           return;
         }
         if (method === "POST" && path === "/api/catalog/task-types") {
           json(200, engine.saveType(body as unknown as TaskType));
+          for (const id of engines.keys()) broadcast(id);
           return;
         }
         json(404, { error: "接口不存在" });
@@ -303,21 +449,26 @@ export async function createHttpServer(options: {
   });
   server.on("listening", () => {
     const address = server.address();
-    if (engine && address && typeof address !== "string")
-      engine.endpoint = `http://127.0.0.1:${address.port}`;
+    if (address && typeof address !== "string") {
+      endpoint = `http://127.0.0.1:${address.port}`;
+      for (const engine of engines.values()) engine.endpoint = endpoint;
+    }
   });
   return {
     server,
     get engine() {
-      return engine;
+      return defaultProjectId ? engines.get(defaultProjectId) : undefined;
     },
+    engines,
     close: async () => {
-      await engine?.shutdown();
-      for (const s of streams) s.end();
+      closing = true;
+      await Promise.all([...engines.values()].map((e) => e.shutdown()));
+      for (const subscribers of streams.values())
+        for (const s of subscribers) s.end();
       await new Promise<void>((resolve, reject) =>
         server.close((e) => (e ? reject(e) : resolve())),
       );
-      engine?.close();
+      for (const engine of engines.values()) engine.close();
       await options.runtime.close?.();
     },
   };

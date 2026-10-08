@@ -11,7 +11,7 @@ npm ci
 npm run dev
 ```
 
-打开 http://127.0.0.1:4317 ，输入本地项目目录。自由会话可用于一般目录；Task Graph 要求目录是有初始提交的 Git 仓库根目录。图从运行时的 HEAD 开始，不包含原目录未提交的修改。
+打开 http://127.0.0.1:4317 ，通过项目选择器输入本地文件夹的绝对路径。不存在的目录会新建并初始化 Git；已有目录保留原文件。加入过的项目保存在列表中，切换页面后原项目的会话和任务图继续执行。自由会话可用于一般目录；Task Graph 要求目录是有初始提交的 Git 仓库根目录。图从运行时的 HEAD 开始，不包含原目录未提交的修改。
 
 也可以先构建，再指定项目启动：
 
@@ -26,8 +26,12 @@ npm start -- --project F:/your/project --port 4317
 2. 新建 Graph，添加任务、依赖与 TaskType。内置“直接交付”和“实现与审查”。点击 Run graph 后，独立任务可以并行。
 3. Worker 生成报告并调用配套 CLI。只有正常结束且报告有效，才进入 Reviewer 或完成。Reviewer 通过后，下游使用已固定成果。返修复用各自原会话。
 4. 软暂停阻止新派发，等待当前 Unit 收尾。硬暂停中断执行并等待进程退出。完全暂停后可改任务目标；已创建工作区的依赖和已交付任务不能原地改写。
-5. 每个 Unit 可查看会话、时间、Tool Calls、Token 和收发件箱。没有可信价格表，费用显示“未知”。报告和 Letter 保存固定内容，修改源文件不会改变已发送内容。
+5. 每个 Unit 可查看会话、时间、Tool Calls、Input / Cached Input / Output Token 和收发件箱。Cached Input 是 Input 的子集，总量只相加 Input 与 Output。统计页提供会话、图、任务、成员和单次执行明细；旧执行缺少的数据标成未知。报告和 Letter 保存固定内容，修改源文件不会改变已发送内容。
 6. Graph 完成只汇总到它自己的基线工作树。项目原分支不会自动合并或推送。Debug 可查看成果路径与提交。
+
+自由会话支持模型和推理强度选择、`/` 命令菜单、`$skill` 检索与引用。模型和 Skill 从本机 Codex 查询。图片支持 PNG、JPEG、WebP，按原生图片输入发送；普通文件保存为可读文件引用。每个附件最大 10 MB，每条消息最多 12 个附件。
+
+执行中可选择 steer 插入当前轮，或排队到后续轮。steer 的目标已经结束时会报错，不会自动改成排队。中断、失败或重启会暂停剩余队列，需要显式继续。上下文显示使用 Codex 返回的最近上下文量与窗口大小，缺少数据时显示未知。
 
 ## Agent CLI
 
@@ -50,7 +54,7 @@ TaskType 的 units 可以包含 kind=command 和 command 字段。命令由本�
 
 ## 数据与权限
 
-项目数据位于 `.newharness/state.sqlite`，状态和事件事务保存；报告位于 `.newharness/reports`，托管 Git 工作树位于 `.newharness/worktrees`。不删除这个目录来“重试”。全局 AgentTemplate 和 TaskType 位于 `~/.newharness/catalog.json`。服务可通过 HARNESS_CATALOG 指定另一份库。
+项目数据位于 `.newharness/state.sqlite`，状态和事件事务保存；报告位于 `.newharness/reports`，附件位于 `.newharness/attachments`，托管 Git 工作树位于 `.newharness/worktrees`。不删除这个目录来“重试”。全局 AgentTemplate 和 TaskType 位于 `~/.newharness/catalog.json`，项目列表位于 `~/.newharness/projects.json`。服务可通过 HARNESS_CATALOG 和 HARNESS_REGISTRY 指定其他文件。
 
 运行适配器使用官方 Codex App Server，以支持运行中 steer 和中断。业务代码仅依赖 Runtime 接口。Windows 本机已验证 Codex 0.160.0；采用进程级 unelevated sandbox，不修改 Codex 全局配置。Reviewer 在独立报告目录执行，只读代码目录；本地汇报需要网络访问，因此不宣称网络隔离。CODEX_WINDOWS_SANDBOX 可显式指定 elevated，但此机器的 elevated helper 曾出现 ACL 错误。非 Windows 的细粒度权限尚未实机验收。
 
@@ -62,7 +66,7 @@ TaskType 的 units 可以包含 kind=command 和 command 字段。命令由本�
 - Reviewer 可写报告，尚未开放“只新增测试文件”的细粒度权限。
 - TaskType 首版一个入口、按结果激活下一成员；多个 Task 可并行，同一 Task 不同时运行多个成员。规则编辑使用 JSON。
 - Graph 引用节点、已交付任务重开及其下游失效、完整取消流程留待后续实现。
-- 未配置价格表，费用未知；不会把 Token 数换成猜测费用。
+- 消耗统计只展示 Token，不计算模型费用。旧记录没有单次执行数据时，保留会话累计量并标明明细覆盖范围。
 
 ## 验证
 

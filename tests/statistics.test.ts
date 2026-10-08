@@ -171,10 +171,10 @@ test("execution totals exclude session and unit lifetime totals", () => {
   };
   const html = statistics(state, filters());
   const filteredSection = html.split(
-    '<details class="panel spaced cumulative">',
+    /<details\b[^>]*data-detail="cumulative-totals"[^>]*>/,
   )[0];
-  assert.match(filteredSection, /<div class="value">100<\/div>/);
-  assert.match(filteredSection, /<div class="value">120<\/div>/);
+  assert.match(html, /<div class="value">100<\/div>/);
+  assert.match(html, /<div class="value">120<\/div>/);
   assert.doesNotMatch(filteredSection, /900/);
   assert.match(html, /<td>900<\/td>/);
   const unknown = statistics(

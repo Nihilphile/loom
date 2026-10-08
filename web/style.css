@@ -201,6 +201,9 @@ code {
   grid-template-columns: 210px minmax(0, 1fr);
   min-height: 100vh;
 }
+.app > main {
+  min-width: 0;
+}
 .sidebar {
   background: var(--dark);
   color: #c2cfbc;
@@ -1375,7 +1378,7 @@ dialog::backdrop {
 }
 @media (max-width: 650px) {
   .app {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .sidebar {
     height: auto;

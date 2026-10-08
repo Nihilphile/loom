@@ -30,3 +30,5 @@ Frozen implementation API:
 - Supported slash actions are /new, /model, /skills, /status, /help, /stop. They invoke local UI/API actions. Unknown slash commands show feedback. No decorative /compact.
 
 Ownership: coordinator owns shared types, project registry/path, attachments, store, HTTP/CLI, integration tests/docs. Runtime worker owns engine/runtime/validation and session/native tests. UI worker owns web files and UI verification. All workers use isolated worktrees from the frozen contract commit.
+
+Review decisions: confirmed native steering is recorded as delivered even if the execution settles before the acknowledgement reaches the engine. A regression test covers this boundary. Native Skill mentions in this iteration belong to the free-session composer; existing TaskType skill strings keep their document-injection behavior, now including the source path for relative resources. Migrating graph skill configuration to catalog references is outside this iteration.

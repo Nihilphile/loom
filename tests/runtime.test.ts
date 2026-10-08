@@ -29,6 +29,28 @@ function fake(body: string) {
   });
 }
 
+test("steering submitted during startup waits for its own native turn", async () => {
+  const runtime = fake(`
+    if(r.method === 'initialize') {setTimeout(()=>reply(r,{}),50);return;}
+    if(r.method === 'turn/start') return reply(r,{turn:{id:'early-turn'}});
+    if(r.method === 'turn/steer') {
+      if(r.params.expectedTurnId !== 'early-turn') process.exit(9);
+      reply(r,{turnId:'early-turn'});
+      notify('turn/completed',{threadId:'thread-one',turn:{id:'early-turn',status:'completed'}});
+    }
+  `);
+  try {
+    const handle = await runtime.start(
+      { cwd: process.cwd(), prompt: "start" },
+      () => {},
+    );
+    assert.equal(await handle.inject("early correction"), true);
+    assert.equal((await handle.done).status, "completed");
+  } finally {
+    await runtime.close();
+  }
+});
+
 test("discovers paginated native models and enabled skills with visible load warnings", async () => {
   const runtime = fake(`
     if(r.method === 'model/list') {

@@ -1,4 +1,5 @@
-export type Reasoning = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type Reasoning =
+  "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export interface ProjectEntry {
   id: string;
   path: string;
@@ -14,7 +15,10 @@ export interface Attachment {
   size: number;
   kind: "image" | "file";
 }
-export interface SkillReference { name: string; path: string }
+export interface SkillReference {
+  name: string;
+  path: string;
+}
 export interface TurnInput {
   text: string;
   requestId?: string;
@@ -36,7 +40,14 @@ export interface ContextUsage {
   window: number | null;
 }
 export interface RuntimeOptions {
-  models: { id: string; name: string; reasoning: Reasoning[]; defaultReasoning?: Reasoning; isDefault?: boolean; inputModalities?: string[] }[];
+  models: {
+    id: string;
+    name: string;
+    reasoning: Reasoning[];
+    defaultReasoning?: Reasoning;
+    isDefault?: boolean;
+    inputModalities?: string[];
+  }[];
   skills: (SkillReference & { description: string })[];
   warnings: string[];
 }
@@ -116,6 +127,7 @@ export interface Session {
   error?: string;
   queue?: QueuedTurn[];
   queuePaused?: boolean;
+  turnRequests?: { requestId: string; fingerprint: string; error?: string }[];
   contextUsage?: ContextUsage;
 }
 export interface Unit extends UnitConfig {
@@ -315,7 +327,10 @@ export interface RuntimeHandle {
   done: Promise<RuntimeResult>;
   pid?: number;
   interrupt(): Promise<void>;
-  inject(text: string, input?: Pick<RuntimeInput, "attachments" | "skills">): Promise<boolean>;
+  inject(
+    text: string,
+    input?: Pick<RuntimeInput, "attachments" | "skills">,
+  ): Promise<boolean>;
 }
 export interface Runtime {
   name: string;

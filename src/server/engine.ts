@@ -259,8 +259,6 @@ export class HarnessEngine {
             this.record("session.steer_unconfirmed", error, { sessionId: id });
             throw new Error(error);
           }
-          if (!activeExecution(target) || this.handles.get(id) !== handle)
-            throw new Error("Target execution ended");
           if (receipt) delete receipt.error;
           session.messages.push({
             id: randomUUID(),
@@ -912,7 +910,7 @@ export class HarnessEngine {
         ];
         const path = paths.find((p) => existsSync(p) && statSync(p).isFile());
         if (!path) throw new Error(`Skill 不存在：${skill}`);
-        return `Skill ${skill}\n${readFileSync(path, "utf8")}`;
+        return `Skill ${skill}\nSource: ${path}\nResolve this skill's relative references from its containing directory.\n${readFileSync(path, "utf8")}`;
       })
       .join("\n\n");
     const prompt = [

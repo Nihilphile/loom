@@ -716,13 +716,13 @@ function projectModal() {
     .catch(showError);
 }
 function modelOptions(selected = "") {
-  return `<option value="">运行时默认</option>${options.models.map((m) => `<option value="${esc(m.id)}" ${m.id === selected ? "selected" : ""}>${esc(m.name)}</option>`).join("")}${selected && !options.models.some((m) => m.id === selected) ? `<option value="${esc(selected)}" selected>${esc(selected)}（当前配置）</option>` : ""}`;
+  return `<option value="">${options.models.some((m) => m.isDefault) ? "运行时默认" : "沿用会话模型"}</option>${options.models.map((m) => `<option value="${esc(m.id)}" ${m.id === selected ? "selected" : ""}>${esc(m.name)}</option>`).join("")}${selected && !options.models.some((m) => m.id === selected) ? `<option value="${esc(selected)}" selected>${esc(selected)}（当前配置）</option>` : ""}`;
 }
 function nativeReasonOptions(model = "", selected = "") {
   const catalog =
     options.models.find((m) => m.id === model) ??
     options.models.find((m) => m.isDefault);
-  return `<option value="">默认推理强度</option>${(catalog?.reasoning ?? []).map((r) => `<option value="${esc(r)}" ${r === selected ? "selected" : ""}>${esc(r)}</option>`).join("")}`;
+  return `<option value="">${catalog?.defaultReasoning ? "默认推理强度" : "沿用会话推理强度"}</option>${(catalog?.reasoning ?? []).map((r) => `<option value="${esc(r)}" ${r === selected ? "selected" : ""}>${esc(r)}</option>`).join("")}`;
 }
 function sessionModal() {
   modal(
@@ -911,8 +911,9 @@ document.addEventListener("submit", (event) => {
   const form = event.target;
   if (!(form instanceof HTMLFormElement) || !form.dataset.form) return;
   event.preventDefault();
-  if (submitPending || requestPending) return;
-  submitPending = true;
+  const chat = form.dataset.form === "chat";
+  if (!chat && (submitPending || requestPending)) return;
+  if (!chat) submitPending = true;
   const buttons = [
     ...form.querySelectorAll<HTMLButtonElement>('button[type="submit"]'),
   ];
@@ -920,13 +921,13 @@ document.addEventListener("submit", (event) => {
   void submit(form)
     .catch(showError)
     .finally(() => {
-      submitPending = false;
+      if (!chat) submitPending = false;
       buttons.forEach((button) => (button.disabled = false));
     });
 });
 async function submit(form: HTMLFormElement) {
-  if (requestPending) return;
   const kind = form.dataset.form;
+  if (requestPending && kind !== "chat") return;
   if (kind === "project") {
     const entry = await api<ProjectEntry>("/api/projects", "POST", {
       path: value(form, "path"),
@@ -986,12 +987,18 @@ async function submit(form: HTMLFormElement) {
       s.status === "running" ? d.mode : s.queuePaused ? "queue" : "send";
     if (mode === "steer" && !active)
       throw new Error("当前执行已结束，请重新选择发送方式。");
+    const selectedModel = d.model
+      ? options.models.find((model) => model.id === d.model)
+      : options.models.find((model) => model.isDefault);
     const input: TurnInput = {
       text: prompt,
       mode,
       requestId: crypto.randomUUID(),
-      model: d.model || undefined,
-      reasoning: (d.reasoning || undefined) as Reasoning | undefined,
+      model: mode === "steer" ? undefined : d.model || selectedModel?.id,
+      reasoning: (mode === "steer"
+        ? undefined
+        : d.reasoning || selectedModel?.defaultReasoning) as
+        Reasoning | undefined,
       expectedExecutionId: mode === "steer" ? active?.id : undefined,
       attachmentIds: d.attachments.map((a) => a.id),
       skills: [...d.skills],
@@ -1622,6 +1629,20 @@ async function loadOptions(owner: string) {
   } finally {
     if (owner === projectId && generation === projectGeneration) {
       optionsLoading = false;
+      const modelSelect =
+        dialog.querySelector<HTMLSelectElement>("#new-session-model");
+      const reasoningSelect = dialog.querySelector<HTMLSelectElement>(
+        "#new-session-reasoning",
+      );
+      if (dialog.open && modelSelect && reasoningSelect) {
+        const selectedModel = modelSelect.value;
+        const selectedReasoning = reasoningSelect.value;
+        modelSelect.innerHTML = modelOptions(selectedModel);
+        reasoningSelect.innerHTML = nativeReasonOptions(
+          selectedModel,
+          selectedReasoning,
+        );
+      }
       render();
     }
   }
@@ -1654,7 +1675,7 @@ async function selectProject(id: string) {
   optionsLoading = true;
   dialog.close();
   render(false);
-  const optionsRequest = loadOptions(id);
+  void loadOptions(id);
   await refresh();
   if (projectId !== id) return;
   const source = new EventSource(projectUrl("/api/stream", id));
@@ -1680,7 +1701,6 @@ async function selectProject(id: string) {
     }
   });
   scheduleEvents();
-  await optionsRequest;
 }
 async function start() {
   try {

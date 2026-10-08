@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { basename, join } from "node:path";
 import type { HarnessEvent, ProjectState } from "../shared/types.ts";
+import { projectIdentity } from "./project-path.ts";
 
 export class ProjectStore {
   readonly root: string;
@@ -45,10 +46,14 @@ export class ProjectStore {
   }
   load(): ProjectState {
     const row = this.db.prepare("SELECT value FROM state WHERE id=1").get();
-    if (row) return JSON.parse(String(row.value)) as ProjectState;
+    if (row) {
+      const state = JSON.parse(String(row.value)) as ProjectState;
+      state.project = { ...state.project, ...projectIdentity(this.root) };
+      return state;
+    }
     return {
       version: 1,
-      project: { path: this.root, name: basename(this.root) },
+      project: { ...projectIdentity(this.root), name: basename(this.root) },
       sessions: [],
       graphs: [],
       letters: [],

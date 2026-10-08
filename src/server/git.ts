@@ -395,7 +395,35 @@ export class GitWorkspaces implements GitAdapter {
         "--",
         ...metadata,
       ]);
-      await git(workspace.path, ["add", "--all", "--", ...codePaths]);
+      const files = (
+        await git(workspace.path, [
+          "ls-files",
+          "--cached",
+          "--others",
+          "--exclude-standard",
+          "-z",
+        ])
+      )
+        .split("\0")
+        .filter(
+          (path) =>
+            path &&
+            !metadata.some(
+              (root) => path === root || path.startsWith(root + "/"),
+            ),
+        );
+      if (files.length)
+        await git(
+          workspace.path,
+          [
+            "--literal-pathspecs",
+            "add",
+            "--all",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+          ],
+          [...new Set(files)].join("\0") + "\0",
+        );
       const tree = await git(workspace.path, ["write-tree"]);
       const parentTree = await git(workspace.path, [
         "rev-parse",

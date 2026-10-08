@@ -43,6 +43,49 @@ async function cleanup(root: string) {
   });
 }
 
+test("report-only tasks snapshot cleanly when runtime metadata is ignored", async () => {
+  const root = await repository();
+  try {
+    await writeFile(join(root, ".gitignore"), ".newharness/\n");
+    await git(root, "add", ".gitignore");
+    await git(root, "commit", "-m", "ignore runtime state");
+    const adapter = new GitWorkspaces();
+    const graph = await adapter.createGraph(root, "ignored", "run");
+    const task = await adapter.createTask(graph, "reports", []);
+    await mkdir(join(task.path, ".newharness", "reports"), { recursive: true });
+    await writeFile(
+      join(task.path, ".newharness", "reports", "done.md"),
+      "report only",
+    );
+    const original = await git(task.path, "rev-parse", "HEAD");
+    const sha = await adapter.snapshot(task, "report-only", "report-only");
+    assert.equal(sha, original);
+    assert.equal(await git(task.path, "ls-files", ".newharness"), "");
+    await writeFile(join(task.path, "new-code.txt"), "code");
+    const changed = await adapter.snapshot(task, "code", "code");
+    assert.notEqual(changed, original);
+    assert.equal(
+      await git(task.path, "ls-tree", "-r", "--name-only", changed),
+      ".gitignore\nnew-code.txt\nshared.txt",
+    );
+    await rm(join(task.path, "shared.txt"));
+    await writeFile(join(task.path, "-file name.txt"), "literal path");
+    const deleted = await adapter.snapshot(
+      task,
+      "delete tracked file",
+      "delete",
+    );
+    const paths = (
+      await git(task.path, "ls-tree", "-r", "--name-only", deleted)
+    ).split("\n");
+    assert(paths.includes("-file name.txt"));
+    assert(!paths.includes("shared.txt"));
+    assert(!paths.some((path) => path.startsWith(".newharness/")));
+  } finally {
+    await cleanup(root);
+  }
+});
+
 test("fixed graph baseline, parallel tasks, snapshots and final merge preserve the original branch", async () => {
   const root = await repository();
   try {

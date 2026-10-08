@@ -1259,7 +1259,7 @@ export class HarnessEngine {
                   p.sessionId === session.id && p.receipt.status === "accepted",
               )
               .flatMap((p) => p.inputs)
-              .find((i) => i.id === `skill/${skill}`)
+              .findLast((i) => i.id === `skill/${skill}`)
           : undefined;
       if (previous) {
         sources.push(structuredClone(previous));

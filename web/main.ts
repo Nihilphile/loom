@@ -648,14 +648,16 @@ function composer(s: Session) {
   const active = state?.executions?.find(
     (e) => e.sessionId === s.id && ["running", "starting"].includes(e.status),
   );
-  const canSteer = !!active && !!state?.runtime.capabilities.inject;
+  const canSteer =
+    !s.source && !!active && !!state?.runtime.capabilities.inject;
+  const mode = s.source ? "queue" : d.mode;
   const paused = !!s.queuePaused;
   return `<form class="composer" data-form="chat" data-session-owner="${esc(s.id)}" data-project-owner="${esc(projectId)}">
     <div id="composer-suggestions" class="suggestions" role="listbox" aria-label="命令和技能">${suggestions()}</div>
     <div class="draft-references">${d.attachments.map((a) => `<span class="reference-chip">${attachmentView(a)}<button type="button" data-remove-attachment="${esc(a.id)}" aria-label="移除 ${esc(a.name)}">×</button></span>`).join("")}${d.skills.map((skill) => `<span class="reference-chip">$${esc(skill.name)}<button type="button" data-remove-skill="${esc(skill.path)}" aria-label="移除技能 ${esc(skill.name)}">×</button></span>`).join("")}${d.uploading ? `<span class="tiny muted">正在上传 ${d.uploading} 个附件…</span>` : ""}</div>
     <textarea id="chat-prompt-${esc(s.id)}" name="text" aria-label="消息" placeholder="发送消息，/ 查看命令，$ 选择技能。可粘贴或拖入文件。">${esc(d.text)}</textarea>
     <div class="composer-controls"><div class="row wrap"><button class="btn small" type="button" data-action="attach" aria-label="添加图片或文件">＋ 附件</button><select id="chat-model" aria-label="模型">${modelOptions(d.model)}</select><select id="chat-reasoning" aria-label="推理强度">${nativeReasonOptions(d.model, d.reasoning)}</select><button type="button" class="btn small" data-command="skills">$ Skills</button></div>
-    <div class="row">${s.status === "running" ? `<select id="chat-mode" aria-label="发送方式"><option value="queue" ${d.mode === "queue" ? "selected" : ""}>排队下一轮</option><option value="steer" ${d.mode === "steer" ? "selected" : ""} ${canSteer ? "" : "disabled"}>立即引导当前执行</option></select>${btn("interrupt", "停止", "danger small", !state?.runtime.capabilities.interrupt)}` : ""}<button class="btn primary" type="submit" ${d.uploading || d.sending ? "disabled" : ""}>${d.sending ? "发送中…" : s.status === "running" ? (d.mode === "steer" ? "引导 ↑" : "排队 ↑") : paused ? "加入队列 ↑" : "发送 ↑"}</button></div></div>
+    <div class="row">${s.status === "running" ? `<select id="chat-mode" aria-label="发送方式"><option value="queue" ${mode === "queue" ? "selected" : ""}>排队下一轮</option>${s.source ? "" : `<option value="steer" ${mode === "steer" ? "selected" : ""} ${canSteer ? "" : "disabled"}>立即引导当前执行</option>`}</select>${btn("interrupt", "停止", "danger small", !state?.runtime.capabilities.interrupt)}` : ""}<button class="btn primary" type="submit" ${d.uploading || d.sending ? "disabled" : ""}>${d.sending ? "发送中…" : s.status === "running" ? (mode === "steer" ? "引导 ↑" : "排队 ↑") : paused ? "加入队列 ↑" : "发送 ↑"}</button></div></div>
     <div class="row between tiny muted"><span>Ctrl / ⌘ + Enter · 每个附件最多 10 MB</span><span>${esc(contextLabel(s))}</span></div>${optionsLoading ? '<div class="tiny muted">正在读取模型与技能目录…</div>' : ""}${options.warnings.map((w) => `<div class="tiny dangertext">${esc(w)}</div>`).join("")}
   </form>`;
 }
@@ -1143,7 +1145,13 @@ async function submit(form: HTMLFormElement) {
       (e) => e.sessionId === s.id && ["running", "starting"].includes(e.status),
     );
     const mode =
-      s.status === "running" ? d.mode : s.queuePaused ? "queue" : "send";
+      s.status === "running"
+        ? s.source
+          ? "queue"
+          : d.mode
+        : s.queuePaused
+          ? "queue"
+          : "send";
     if (mode === "steer" && !active)
       throw new Error("当前执行已结束，请重新选择发送方式。");
     const selectedModel = d.model

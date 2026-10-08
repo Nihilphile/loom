@@ -226,8 +226,8 @@ export class HarnessEngine {
         : `${kind === "interview" ? "访谈" : "侧聊"} · ${source.title}`,
       kind,
       status: "idle",
-      model: source.model,
-      reasoning: source.reasoning,
+      model: source.model ?? source.acceptedConfig?.model,
+      reasoning: source.reasoning ?? source.acceptedConfig?.reasoning,
       source: {
         cwd: source.acceptedConfig?.cwd ?? this.state.project.path,
         sessionId: source.id,

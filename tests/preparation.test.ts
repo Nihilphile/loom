@@ -417,6 +417,15 @@ test("accepted runtime model is reapplied on continuation and template reference
   await f.engine.sendMessage(source.id, "second");
   await flush();
   assert.equal(f.runtime.turns[1].input.model, "resolved-default");
+  source.acceptedConfig!.reasoning = "low";
+  const sidechat = f.engine.createSidechat(source.id);
+  await f.engine.sendMessage(sidechat.id, "independent question");
+  await f.engine.interview(source.id);
+  await flush();
+  assert.equal(f.runtime.turns[2].input.model, "resolved-default");
+  assert.equal(f.runtime.turns[2].input.reasoning, "low");
+  assert.equal(f.runtime.turns[3].input.model, "resolved-default");
+  assert.equal(f.runtime.turns[3].input.reasoning, "low");
   const template = f.catalog.agents.find((a) => a.id === "worker")!;
   template.skills = ["original-skill"];
   const graph = f.engine.createGraph({

@@ -1,6 +1,6 @@
 # 架构与接口
 
-2026-10-08 更新：Unit Config／Context、输入接收记录、独立只读侧聊和开发者自动访谈已进入实现。调度与 Preparation 保持内部能力。具体执行契约见 [unit-execution.md](unit-execution.md)。
+2026-10-08 更新：Unit Config／Context、输入接收记录、独立只读侧聊和开发者自动访谈已实现。调度与 Preparation 保持内部能力。具体执行契约见 [unit-execution.md](unit-execution.md)，验证结果见 [Iteration 3 验收](reports/iteration-3-acceptance.md)。
 
 每个项目由独立 HarnessEngine 管理状态。项目注册表保存稳定 ID 与规范路径，HTTP 服务保留已经打开的执行器直到退出。浏览器切换只改变请求地址，不替换后台执行器。HTTP 和 CLI 只请求领域操作，runtime/Git 只执行外部效果并返回事实。TaskType 规则为数据，状态不根据模型自然语言推断。
 

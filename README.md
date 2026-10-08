@@ -1,4 +1,4 @@
-# New Harness
+# Loom
 
 本地 Codex 工作台。自由会话和 Task 会话分区显示；DAG 按依赖调度，任务通过 CLI 交卷，程序执行审查、返修与 Git 快照。原型保留在 prototype/，正式界面由 web/ 提供。
 
@@ -35,7 +35,7 @@ npm start -- --project F:/your/project --port 4317
 
 ## Agent CLI
 
-正式构建后使用 `node <harness目录>/dist/cli.js --help`。启动器向 Agent 注入命令和凭据，无须让 Agent 自填身份。
+正式构建后使用 `node <Loom目录>/dist/cli.js --help`。在仓库内也可运行 `npm exec -- loom --help`，包提供 `loom` 命令。启动器向 Agent 注入命令和凭据，无须让 Agent 自填身份。
 
 ```text
 unit report --outcome ready --report <报告文件>
@@ -53,6 +53,8 @@ state
 TaskType 的 units 可以包含 kind=command 和 command 字段。命令由本地程序执行，成功后自动绑定输出报告并汇报 ready；失败会阻塞。命令属于用户配置的本地脚本，具有当前操作系统账户的权限。
 
 ## 数据与权限
+
+项目原名 New Harness，现在统一称为 Loom。本次只更改产品名称与 CLI 入口，保留 `.newharness` 数据目录、`HARNESS_*` 环境变量、Git 内部引用和浏览器项目选择键。已有会话、项目列表与工作区直接沿用，无须迁移。代码仓库所在文件夹也无须改名。
 
 项目数据位于 `.newharness/state.sqlite`，状态和事件事务保存；报告位于 `.newharness/reports`，附件位于 `.newharness/attachments`，托管 Git 工作树位于 `.newharness/worktrees`。不删除这个目录来“重试”。全局 AgentTemplate 和 TaskType 位于 `~/.newharness/catalog.json`，项目列表位于 `~/.newharness/projects.json`。服务可通过 HARNESS_CATALOG 和 HARNESS_REGISTRY 指定其他文件。
 

@@ -982,7 +982,7 @@ export class HarnessEngine {
     );
     const controllerGuide =
       purpose === "chat"
-        ? `你正在 New Harness 的自由会话中工作。需要规划可执行任务图时，可使用本地 CLI：node "${fileURLToPath(new URL("../../dist/cli.js", import.meta.url))}" --help。使用 graph create --file graph.json 创建图，graph run --id ID 运行；state 可查看 TaskTypes 和已有任务。图外会话地址为 session/${session.id}。仅在用户要求执行任务时启动图，不要把普通讨论当作执行请求。`
+        ? `你正在 Loom 的自由会话中工作。需要规划可执行任务图时，可使用本地 CLI：node "${fileURLToPath(new URL("../../dist/cli.js", import.meta.url))}" --help。使用 graph create --file graph.json 创建图，graph run --id ID 运行；state 可查看 TaskTypes 和已有任务。图外会话地址为 session/${session.id}。仅在用户要求执行任务时启动图，不要把普通讨论当作执行请求。`
         : "";
     const deliveredPrompt = [
       controllerGuide,

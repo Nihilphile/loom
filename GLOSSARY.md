@@ -1,4 +1,4 @@
-# New Harness
+# Loom
 
 供用户个人在本地使用的 Codex agent 工作台。用户可直接与 agent 对话，也可创建任务图并启动按依赖执行的任务。
 

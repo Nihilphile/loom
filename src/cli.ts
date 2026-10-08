@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { readFileSync } from "node:fs";
 
 const args = process.argv.slice(2);
-const help = `New Harness CLI
+const help = `Loom CLI
   unit report --outcome ready|approved|changes_requested|blocked --report <file> [--key <id>]
   letter send --graph <id> --to <graph/task/unit[,address]> --title <20 chars> --file <path> [--steer|--followup]
   state
@@ -34,7 +34,7 @@ async function main() {
   let path: string, body: unknown;
   if (args[0] === "unit" && args[1] === "report") {
     if (!process.env.HARNESS_TOKEN)
-      throw new Error("This command requires a harness unit execution");
+      throw new Error("This command requires a Loom unit execution");
     path = "/api/unit/report";
     body = {
       outcome: option("outcome"),

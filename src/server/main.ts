@@ -20,7 +20,7 @@ const app = await createHttpServer({
   registryPath: process.env.HARNESS_REGISTRY,
 });
 app.server.listen(port, "127.0.0.1", () =>
-  process.stdout.write(`New Harness · http://127.0.0.1:${port}\n`),
+  process.stdout.write(`Loom · http://127.0.0.1:${port}\n`),
 );
 let stopping = false;
 const stop = () => {

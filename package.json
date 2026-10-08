@@ -1,5 +1,5 @@
 {
-  "name": "new-harness",
+  "name": "loom",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -19,5 +19,8 @@
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "vite": "^8.3.3"
+  },
+  "bin": {
+    "loom": "dist/cli.js"
   }
 }

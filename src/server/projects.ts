@@ -51,9 +51,9 @@ export class ProjectRegistry {
       run(["add", "--", ".gitignore"]);
       run([
         "-c",
-        "user.name=New Harness",
+        "user.name=Loom",
         "-c",
-        "user.email=local@new-harness",
+        "user.email=loom@localhost",
         "-c",
         "commit.gpgSign=false",
         "-c",

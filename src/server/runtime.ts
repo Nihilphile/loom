@@ -207,7 +207,7 @@ export class CodexRuntime implements Runtime {
       });
     try {
       await request("initialize", {
-        clientInfo: { name: "new_harness", version: "0.1.0" },
+        clientInfo: { name: "loom", version: "0.1.0" },
         capabilities: { experimentalApi: true },
       });
       child.stdin.write(`${JSON.stringify({ method: "initialized" })}\n`);
@@ -446,7 +446,7 @@ class CodexExecution {
 
   private async initialize(): Promise<void> {
     await this.request("initialize", {
-      clientInfo: { name: "new_harness", version: "0.1.0" },
+      clientInfo: { name: "loom", version: "0.1.0" },
       capabilities: { experimentalApi: true },
     });
     this.write({ method: "initialized" });

@@ -1,4 +1,4 @@
-# New Harness 设计讨论
+# Loom 设计讨论
 
 本文记录讨论中的约束、已确认决定和待定建议。项目处于共同设计阶段，尚未开始实现。
 
@@ -11,7 +11,7 @@
 - 仅供用户个人使用，只在本地部署，提供 Web UI，基于 Codex SDK。
 - Agent Unit 模板库跨项目共用。用户已确认这一作用范围。
 - 引入跨项目 TaskType，定义 Unit 组成、引用的成员模板、调度方式、完成条件和运行限制。主控选用预设并填写 Task 目标、依赖、工作区及必要覆盖来创建具体 Task。TaskType 引用有版本，运行使用解析后的配置快照，类型修改不自动改变已运行 Task。
-- 区分 workflow 规划 skill 与 new-harness 的通用支持能力。public、to-audit、handoff 的报告结构与分发约定放在 skill 层，不作为 harness 的内置语义或强制完成条件。
+- 区分 workflow 规划 skill 与 Loom 的通用支持能力。public、to-audit、handoff 的报告结构与分发约定放在 skill 层，不作为 harness 的内置语义或强制完成条件。
 - 当前采用可配置的程序调度器协调 Task 内成员，暂不引入 Jev 判断层。每个 Task 有自己的规则和状态，底层复用同一调度实现。
 - Task 未配置 reviewer 时由 worker 自行提交；配置 reviewer 时，必须审查通过才允许完成提交。
 - 返修和再审默认分别沿用 worker、reviewer 各自的原 session。

@@ -42,9 +42,9 @@ function git(cwd: string, args: string[], input?: string): Promise<string> {
       "git",
       [
         "-c",
-        "user.name=New Harness",
+        "user.name=Loom",
         "-c",
-        "user.email=new-harness@localhost",
+        "user.email=loom@localhost",
         "-c",
         "commit.gpgSign=false",
         "-c",

@@ -45,12 +45,10 @@ export class SessionInputs {
     const history = this.state.preparations.filter(
       (p) => p.sessionId === session.id && p.receipt.status === "accepted",
     );
-    const accepted = new Set(
-      history.flatMap((p) => p.inputs.map((i) => i.id + "/" + i.digest)),
+    const accepted = new Map(
+      history.flatMap((p) => p.inputs.map((i) => [i.id, i.digest] as const)),
     );
-    const inputs = candidates.filter(
-      (i) => !accepted.has(i.id + "/" + i.digest),
-    );
+    const inputs = candidates.filter((i) => accepted.get(i.id) !== i.digest);
     const unique = new Set<string>();
     const content = inputs
       .map((i) => {

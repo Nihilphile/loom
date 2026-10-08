@@ -310,10 +310,21 @@ export class HarnessEngine {
       feedback.sessionId = session.id;
       feedback.source = structuredClone(session.source!);
       feedback.status = "running";
+      if (settings.model) {
+        if (!this.runtime.discoverOptions)
+          throw new Error("运行时不能查询访谈模型配置");
+        const options = await this.runtime.discoverOptions(session.source!.cwd);
+        const model = options.models.find((m) => m.id === settings.model);
+        if (!model) throw new Error("访谈模型不在当前运行时目录中");
+        if (settings.reasoning && !model.reasoning.includes(settings.reasoning))
+          throw new Error("访谈模型不支持所选推理强度");
+        session.model = model.id;
+        session.reasoning = settings.reasoning ?? model.defaultReasoning;
+      } else if (settings.reasoning) session.reasoning = settings.reasoning;
       await this.sendMessage(session.id, {
         text: settings.prompt,
-        model: settings.model ?? source.model,
-        reasoning: settings.reasoning ?? source.reasoning,
+        model: session.model,
+        reasoning: session.reasoning,
         skills: settings.skills,
       });
       if (session.status === "failed")
@@ -453,7 +464,8 @@ export class HarnessEngine {
           return receipt;
         };
         if (input.mode === "steer") {
-          if (session.source) throw new Error("只读侧聊支持排队和下一轮追问，不支持执行中 steer");
+          if (session.source)
+            throw new Error("只读侧聊支持排队和下一轮追问，不支持执行中 steer");
           if (
             !target ||
             !activeExecution(target) ||
@@ -584,7 +596,7 @@ export class HarnessEngine {
   }
   continueQueue(id: string): Session {
     const session = this.session(id);
-    if (session.kind !== "free")
+    if (session.kind === "task")
       throw new Error("Task sessions require scheduler control");
     this.ensureStopped(session);
     session.queuePaused = false;
@@ -1318,6 +1330,16 @@ export class HarnessEngine {
       usageKnown: false,
     };
     this.state.executions.push(execution);
+    if (session.kind === "interview") {
+      const feedback = this.state.feedback.find(
+        (f) => f.sessionId === session.id,
+      );
+      if (feedback) {
+        feedback.status = "running";
+        delete feedback.error;
+        delete feedback.completedAt;
+      }
+    }
     session.status = "running";
     session.error = undefined;
     session.turns++;

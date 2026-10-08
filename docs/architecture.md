@@ -1,6 +1,6 @@
 # 架构与接口
 
-2026-10-08 更新：Unit 执行准备的目标架构见 [unit-execution.md](unit-execution.md)。已确认将内部 Scheduler／Preparation 与可见 Unit 分开，由每个 Unit 的 Config／Context 呈现配置和实际输入；首次初始化与原 session 增量输入分别记录。工作流包只通过显式调用启用。侧边对话只读要求已纳入，独立分叉方式仍为建议。以下模块与 HTTP 表描述现有实现，不表示新契约已经落地。
+2026-10-08 更新：Unit Config／Context、输入接收记录、独立只读侧聊和开发者自动访谈已进入实现。调度与 Preparation 保持内部能力。具体执行契约见 [unit-execution.md](unit-execution.md)。
 
 每个项目由独立 HarnessEngine 管理状态。项目注册表保存稳定 ID 与规范路径，HTTP 服务保留已经打开的执行器直到退出。浏览器切换只改变请求地址，不替换后台执行器。HTTP 和 CLI 只请求领域操作，runtime/Git 只执行外部效果并返回事实。TaskType 规则为数据，状态不根据模型自然语言推断。
 
@@ -19,12 +19,14 @@ await engine.pauseGraph(graph.id, 'soft');
 
 ## 模块与数据所有权
 
-下一次结构调整增加统一会话执行入口，集中准备输入和接收记录。Preparation 在该入口内部完成配置解析与上下文组装；Engine 仍独占 Task 状态及 ProjectStore 写事务，Runtime 只返回外部运行事实。具体边界、类型草案与验收顺序见 [Unit 执行准备](unit-execution.md)。原型接口可直接替换，不增加向后兼容层。
+会话输入由 SessionInputs 统一组装和确认。它持有领域规则，不独立写数据库。Engine 仍独占 Task 状态及 ProjectStore 写事务，Runtime 返回接受、拒绝、未知和结束事实。原型接口直接采用新契约。
 
 - `src/shared/types.ts`：项目、Session、Task、Graph、Letter、模板与适配器契约。不是 Codex wire 类型。
 - `src/server/store.ts`：SQLite 保存权威 state 和 append-only events，事务提交。协调器独占写入。报告固定副本位于 .newharness/reports，项目下预留 .session 与 taskgraph 目录供按会话/图导出。
 - `src/server/engine.ts`：唯一状态所有者，运行身份、调度、工作区占用、报告与暂停恢复。外部效果开始前保存 execution/effect 意图，外部执行不占用同步状态事务。
-- `src/server/runtime.ts`：真实 Codex 适配器。`Runtime.start` 返回独立 handle，done 返回 completed/interrupted/failed；inject 明确返回是否接受。事件不等于业务交卷。
+- `src/server/session-inputs.ts`：生成不可变的输入快照，按已接受来源选择增量，集中初始化状态和信件占用判断。
+- `src/server/runtime.ts`：真实 Codex 适配器。handle 的 accepted 与 done 分别返回输入接收和执行结束事实；原生 fork 固定最近已完成轮次，观察会话使用隔离权限。
+- `src/server/observer-tools.ts`：只读 MCP 服务，限定文件根目录、拒绝私有数据和越界文件，不提供写入或网络能力。
 - `src/server/git.ts`：托管 worktree、自动 snapshot 与汇总；shell 参数始终分离。操作 ID 允许检查已产生的 Git 结果。
 - `src/server/http.ts` / `main.ts`：loopback HTTP、请求校验、SSE、静态页面与启动。
 - `src/cli.ts`：配套 CLI，通过 loopback API 汇报与发信，不直接改数据库。
@@ -38,26 +40,30 @@ await engine.pauseGraph(graph.id, 'soft');
 
 全局 GET `/api/projects` 返回项目列表，POST `/api/projects` 接收 `{path,name?}` 并返回项目描述。同一规范路径重复注册返回同一 ID。运行时发现、附件、消息队列等第二轮接口见 [iteration-2.md](iteration-2.md)。CLI 通过 HARNESS_PROJECT_ID 给所有命令加项目路由。
 
-| 方法 | 路径 | 输入 / 输出 |
-| --- | --- | --- |
-| POST | /api/project | `{path}` → AppState |
-| POST | /api/sessions | `{title, model?, reasoning?}` → Session |
-| POST | /api/sessions/:id/turn | `{text}` → Session，异步执行 |
-| POST | /api/sessions/:id/interrupt | `{}` → Session |
-| GET | /api/events?sessionId=&graphId=&after= | HarnessEvent[] |
-| POST | /api/graphs | GraphInput → Graph |
-| POST | /api/graphs/:id/run | `{}` → Graph |
-| POST | /api/graphs/:id/pause | `{mode:"soft"\|"hard"}` → Graph |
-| POST | /api/graphs/:id/resume | `{}` → Graph |
-| POST | /api/graphs/:id/resolve | `{taskId?}` → Graph，重新检查实际阻塞 |
-| PATCH | /api/graphs/:id/tasks/:taskId | `{title?,goal?,deps?,...}` → Task |
-| POST | /api/graphs/:id/tasks | TaskInput → Task |
-| GET | /api/graphs/:id/debug | 含 Git 版本与内部动作的调试数据，不含凭据 |
-| POST | /api/letters | LetterInput → Letter |
-| POST | /api/catalog/agents | AgentTemplate → AgentTemplate |
-| POST | /api/catalog/task-types | TaskType → TaskType |
-| POST | /api/unit/report | Bearer 运行凭据 + `{outcome,report,key?}` → Submission |
-| GET | /api/reports/:id | 固定报告内容 |
+| 方法  | 路径                                                  | 输入 / 输出                                            |
+| ----- | ----------------------------------------------------- | ------------------------------------------------------ |
+| POST  | /api/project                                          | `{path}` → AppState                                    |
+| POST  | /api/sessions                                         | `{title, model?, reasoning?}` → Session                |
+| POST  | /api/sessions/:id/turn                                | `{text}` → Session，异步执行                           |
+| POST  | /api/sessions/:id/interrupt                           | `{}` → Session                                         |
+| POST  | /api/sessions/:id/sidechats                           | `{title?}` → 独立只读 Session                          |
+| POST  | /api/sessions/:id/interviews                          | `{}` → 自动运行的 Feedback                             |
+| PUT   | /api/developer/interviews                             | InterviewSettings → 保存的开发者配置                   |
+| POST  | /api/sessions/:id/preparations/:preparationId/resolve | `{accepted,threadId?,turnId?}` → 人工核对后的输入回执  |
+| GET   | /api/events?sessionId=&graphId=&after=                | HarnessEvent[]                                         |
+| POST  | /api/graphs                                           | GraphInput → Graph                                     |
+| POST  | /api/graphs/:id/run                                   | `{}` → Graph                                           |
+| POST  | /api/graphs/:id/pause                                 | `{mode:"soft"\|"hard"}` → Graph                        |
+| POST  | /api/graphs/:id/resume                                | `{}` → Graph                                           |
+| POST  | /api/graphs/:id/resolve                               | `{taskId?}` → Graph，重新检查实际阻塞                  |
+| PATCH | /api/graphs/:id/tasks/:taskId                         | `{title?,goal?,deps?,...}` → Task                      |
+| POST  | /api/graphs/:id/tasks                                 | TaskInput → Task                                       |
+| GET   | /api/graphs/:id/debug                                 | 含 Git 版本与内部动作的调试数据，不含凭据              |
+| POST  | /api/letters                                          | LetterInput → Letter                                   |
+| POST  | /api/catalog/agents                                   | AgentTemplate → AgentTemplate                          |
+| POST  | /api/catalog/task-types                               | TaskType → TaskType                                    |
+| POST  | /api/unit/report                                      | Bearer 运行凭据 + `{outcome,report,key?}` → Submission |
+| GET   | /api/reports/:id                                      | 固定报告内容                                           |
 
 ## 不变量
 

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HarnessEngine } from "../src/server/engine.ts";
 import { Catalog } from "../src/server/catalog.ts";
+import { SessionInputs, contextItem } from "../src/server/session-inputs.ts";
 import type {
   GitAdapter,
   Runtime,
@@ -17,6 +18,7 @@ import type {
 
 class ManualRuntime implements Runtime {
   name = "manual";
+  discoverOptions?: Runtime["discoverOptions"];
   capabilities = { inject: true, interrupt: true, readOnly: true, fork: true };
   turns: {
     input: RuntimeInput;
@@ -237,6 +239,17 @@ test("sidechat forks the completed boundary while source runs, with independent 
   assert.equal(f.runtime.turns[3].input.threadId, side.threadId);
   assert.equal(f.runtime.turns[3].input.observer, true);
   assert.throws(() => f.engine.createSidechat(side.id), /递归/);
+  await f.engine.sendMessage(side.id, {
+    text: "queued followup",
+    mode: "queue",
+  });
+  await f.engine.interrupt(side.id);
+  assert.equal(side.queuePaused, true);
+  f.engine.continueQueue(side.id);
+  await flush();
+  assert.equal(f.runtime.turns.length, 5);
+  assert.match(f.runtime.turns[4].input.prompt, /queued followup/);
+  assert.equal(f.runtime.turns[4].input.observer, true);
 });
 
 test("developer interviews default off, trigger once, and save independent raw feedback", async (t) => {
@@ -329,4 +342,61 @@ test("blocked interview without a completed source is visible and cannot resume 
   assert.equal(f.engine.state.feedback[0].status, "failed");
   assert.match(f.engine.state.feedback[0].error!, /已完成/);
   assert.equal(f.runtime.turns.length, 1);
+});
+
+test("context returning to an earlier value is injected after the latest accepted version", async (t) => {
+  const f = fixture(t),
+    session = f.engine.createSession({ title: "versions" });
+  const inputs = new SessionInputs(f.engine.state);
+  const config = { revision: 1, readOnly: false, cwd: f.root, skills: [] };
+  for (const [index, content] of ["A", "B", "A"].entries()) {
+    const preparation = inputs.prepare(
+      session,
+      `execution-${index}`,
+      config,
+      [contextItem("file/context", "file", content)],
+      "continue",
+    );
+    assert.equal(preparation.inputs[0]?.content, content);
+    inputs.accept(session, preparation, {
+      status: "accepted",
+      threadId: "same",
+      turnId: `turn-${index}`,
+    });
+  }
+  assert.equal(
+    inputs.prepare(
+      session,
+      "fourth",
+      config,
+      [contextItem("file/context", "file", "A")],
+      "continue",
+    ).inputs.length,
+    0,
+  );
+});
+
+test("explicit interview model uses its own default effort and never inherits incompatible source effort", async (t) => {
+  const f = fixture(t),
+    source = f.engine.createSession({
+      title: "source",
+      model: "model-a",
+      reasoning: "high",
+    });
+  await f.engine.sendMessage(source.id, "first");
+  f.runtime.confirm(0);
+  f.runtime.turns[0].finish();
+  await flush();
+  f.runtime.discoverOptions = async () => ({
+    models: [
+      { id: "model-b", name: "B", reasoning: ["low"], defaultReasoning: "low" },
+    ],
+    skills: [],
+    warnings: [],
+  });
+  f.engine.updateInterviews({ ...f.engine.state.interviews, model: "model-b" });
+  await f.engine.interview(source.id);
+  await flush();
+  assert.equal(f.runtime.turns[1].input.model, "model-b");
+  assert.equal(f.runtime.turns[1].input.reasoning, "low");
 });

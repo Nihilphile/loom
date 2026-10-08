@@ -10,8 +10,21 @@ export interface StatsFilters {
   from: string;
   to: string;
   group: string;
+  purpose: string;
 }
 type Row = Omit<Execution, "tokenHash">;
+const observer = (row: Row) =>
+  row.purpose === "sidechat" || row.purpose === "interview";
+const scope = (row: Row) =>
+  observer(row) ? row.purpose : (row.graphId ?? "free");
+const purposeNames: Record<Row["purpose"], string> = {
+  chat: "自由会话",
+  work: "任务执行",
+  report: "汇报",
+  mail: "信件",
+  sidechat: "只读侧聊",
+  interview: "开发者访谈",
+};
 const esc = (value: unknown) =>
   String(value ?? "").replace(
     /[&<>"']/g,
@@ -27,10 +40,13 @@ export function filterExecutions(rows: Row[], filter: StatsFilters) {
   const to = filter.to ? new Date(filter.to).getTime() : Infinity;
   return rows.filter(
     (row) =>
-      (!filter.graph || (row.graphId ?? "free") === filter.graph) &&
-      (!filter.task || `${row.graphId}/${row.taskId}` === filter.task) &&
+      (!filter.graph || scope(row) === filter.graph) &&
+      (!filter.task ||
+        (!observer(row) && `${row.graphId}/${row.taskId}` === filter.task)) &&
       (!filter.unit ||
-        `${row.graphId}/${row.taskId}/${row.unitId}` === filter.unit) &&
+        (!observer(row) &&
+          `${row.graphId}/${row.taskId}/${row.unitId}` === filter.unit)) &&
+      (!filter.purpose || row.purpose === filter.purpose) &&
       (!filter.session || row.sessionId === filter.session) &&
       (!filter.model || (row.model ?? "unknown") === filter.model) &&
       (!filter.status || row.status === filter.status) &&
@@ -62,6 +78,7 @@ export function statistics(state: AppState, filter: StatsFilters) {
   const all = state.executions ?? [];
   const rows = filterExecutions(all, filter);
   const total = summarize(rows);
+  const observerTotal = summarize(rows.filter(observer));
   const select = (
     key: keyof StatsFilters,
     label: string,
@@ -79,7 +96,12 @@ export function statistics(state: AppState, filter: StatsFilters) {
         state.project?.id ?? "project",
         state.project?.name ?? "当前项目",
       ],
-      graph: [row.graphId ?? "free", g?.name ?? row.graphId ?? "自由会话"],
+      graph: [
+        scope(row),
+        observer(row)
+          ? purposeNames[row.purpose]
+          : (g?.name ?? row.graphId ?? "自由会话"),
+      ],
       task: [
         `${row.graphId}/${row.taskId}`,
         t ? `${g?.name ?? g?.id} / ${t.title}` : (row.taskId ?? "自由会话"),
@@ -92,6 +114,11 @@ export function statistics(state: AppState, filter: StatsFilters) {
       ],
       session: [row.sessionId, s?.title ?? row.sessionId],
     };
+    if (observer(row)) {
+      const label = `${purposeNames[row.purpose]} / ${s?.title ?? row.sessionId}`;
+      keys.task = [row.sessionId, label];
+      keys.unit = [row.sessionId, label];
+    }
     const [key, label] = keys[filter.group] ?? keys.project;
     const group = groups.get(key) ?? { label, rows: [] };
     group.rows.push(row);
@@ -126,7 +153,7 @@ export function statistics(state: AppState, filter: StatsFilters) {
     );
   return `<div class="intro"><div><div class="eyebrow">${esc(state.project?.name)} / TOKENS</div><h1>执行统计</h1><p class="subtitle">筛选执行记录，再按层级汇总。缓存输入已包含在输入中。</p></div></div>
     <section class="panel stats-filters">
-      ${select("graph", "Graph", [{ id: "free", name: "自由会话" }, ...state.graphs.map((g) => ({ id: g.id, name: g.name }))])}
+      ${select("graph", "Graph / 独立会话", [{ id: "free", name: "自由会话" }, { id: "sidechat", name: "只读侧聊" }, { id: "interview", name: "开发者访谈" }, ...state.graphs.map((g) => ({ id: g.id, name: g.name }))])}
       ${select("task", "Task", taskValues)}
       ${select("unit", "Unit", unitValues)}
       ${select(
@@ -135,6 +162,11 @@ export function statistics(state: AppState, filter: StatsFilters) {
         state.sessions.map((s) => ({ id: s.id, name: s.title })),
       )}
       ${select("model", "模型", modelValues)}
+      ${select(
+        "purpose",
+        "执行用途",
+        Object.entries(purposeNames).map(([id, name]) => ({ id, name })),
+      )}
       ${select(
         "status",
         "执行状态",
@@ -182,6 +214,7 @@ export function statistics(state: AppState, filter: StatsFilters) {
       )
       .join("")}</div>
     <p class="notice spaced">用量已知 ${total.known} / ${total.count} 次执行。${total.count - total.known ? `${total.count - total.known} 次执行的用量未知，未按 0 计入。显示的总量仅含已知记录。` : "全部筛选记录均有用量数据。"} 时间和工具调用覆盖 ${total.measured} / ${total.count} 次执行。并行执行时间相加，不等于经过时间。</p>
+    <p class="notice spaced">侧聊与访谈开销已包含在项目总量中，不计入来源 Unit。当前筛选内 ${observerTotal.count} 次独立执行，${observerTotal.known ? `${fmt(observerTotal.usage.inputTokens + observerTotal.usage.outputTokens)} 个已知 tokens` : "token 用量未知"}，${observerTotal.known} / ${observerTotal.count} 次有用量记录。</p>
     <section class="panel scroller spaced"><div class="panelhead"><strong>分组汇总</strong></div><table class="table"><thead><tr><th>分组</th>${tokenHeaders}</tr></thead><tbody>${[...groups.values()].map((group) => `<tr><td>${esc(group.label)}</td>${summaryCells(summarize(group.rows))}</tr>`).join("") || '<tr><td colspan="8">没有符合筛选条件的执行记录。</td></tr>'}</tbody></table></section>
     <section class="panel scroller spaced"><div class="panelhead"><strong>每次执行 · ${rows.length}</strong></div><table class="table"><thead><tr><th>执行 / Session</th><th>Graph / Task / Unit</th><th>模型 / 推理</th><th>状态 / 用途</th><th>开始 / 结束</th>${tokenHeaders}</tr></thead><tbody>${
       rows
@@ -189,7 +222,7 @@ export function statistics(state: AppState, filter: StatsFilters) {
         .reverse()
         .map(
           (row) =>
-            `<tr><td><details data-detail="execution-${esc(row.id)}"><summary><code>${esc(row.id)}</code></summary><pre>${esc(JSON.stringify(row, null, 2))}</pre></details><button data-session="${esc(row.sessionId)}">${esc(state.sessions.find((s) => s.id === row.sessionId)?.title ?? row.sessionId)}</button></td><td>${esc([row.graphId, row.taskId, row.unitId].filter(Boolean).join(" / ") || "自由会话")}</td><td>${esc(row.model ?? "未知")} / ${esc(row.reasoning ?? "未知")}</td><td>${esc(row.status)} / ${esc(row.purpose)}</td><td>${esc(new Date(row.startedAt).toLocaleString())}<br>${row.endedAt ? esc(new Date(row.endedAt).toLocaleString()) : "尚未结束"}</td>${summaryCells(summarize([row]))}</tr>`,
+            `<tr><td><details data-detail="execution-${esc(row.id)}"><summary><code>${esc(row.id)}</code></summary><pre>${esc(JSON.stringify(row, null, 2))}</pre></details><button data-session="${esc(row.sessionId)}">${esc(state.sessions.find((s) => s.id === row.sessionId)?.title ?? row.sessionId)}</button></td><td>${esc(observer(row) ? purposeNames[row.purpose] : [row.graphId, row.taskId, row.unitId].filter(Boolean).join(" / ") || "自由会话")}</td><td>${esc(row.model ?? "未知")} / ${esc(row.reasoning ?? "未知")}</td><td>${esc(row.status)} / ${esc(purposeNames[row.purpose])}</td><td>${esc(new Date(row.startedAt).toLocaleString())}<br>${row.endedAt ? esc(new Date(row.endedAt).toLocaleString()) : "尚未结束"}</td>${summaryCells(summarize([row]))}</tr>`,
         )
         .join("") || '<tr><td colspan="12">暂无执行记录。</td></tr>'
     }</tbody></table></section>

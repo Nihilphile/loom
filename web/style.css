@@ -181,13 +181,17 @@ code {
   color: #557ca4;
 }
 .badge.done,
-.badge.approved {
+.badge.approved,
+.badge.completed,
+.badge.accepted {
   background: #e7f3e5;
   color: #3b7b51;
 }
 .badge.blocked,
 .badge.failed,
-.badge.interrupted {
+.badge.interrupted,
+.badge.rejected,
+.badge.uncertain {
   background: #fff0d9;
   color: #a4742c;
 }
@@ -506,18 +510,6 @@ code {
   color: var(--green);
   border-color: var(--green);
 }
-.prep {
-  background: #f3f6ee;
-  border: 1px dashed #d7e1cf;
-  border-radius: 6px;
-  padding: 11px;
-  margin-bottom: 14px;
-  font-size: 10px;
-  color: #8b9881;
-}
-.prep strong {
-  color: #65795d;
-}
 .unit {
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -687,6 +679,104 @@ code {
   align-items: center;
   font-size: 12px;
   margin: 12px 0;
+}
+.observer-actions {
+  margin: 12px 0;
+}
+.observer-actions p {
+  margin-top: 7px;
+}
+.observer-source {
+  background: #f1f5ec;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.observer-source p {
+  margin-top: 8px;
+  color: var(--muted);
+  line-height: 1.65;
+}
+.config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin: 14px 0;
+}
+.config-grid > section {
+  padding: 14px;
+  background: #f7f9f4;
+  border-radius: 7px;
+}
+.context-history {
+  margin-top: 12px;
+}
+.context-record {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 12px;
+  margin: 10px 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.context-record > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.context-input {
+  margin: 12px 0;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.context-input summary,
+.session-context > summary {
+  cursor: pointer;
+}
+.context-input pre {
+  margin-top: 12px;
+}
+.session-context {
+  padding: 16px 24px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+}
+.developer-settings {
+  max-width: 920px;
+}
+.interview-skills {
+  border: 1px solid var(--line);
+  padding: 14px;
+  border-radius: 7px;
+  max-height: 350px;
+  overflow-y: auto;
+}
+.interview-skills legend {
+  padding: 0 6px;
+  font-size: 12px;
+}
+.interview-skills .checkrow {
+  align-items: flex-start;
+}
+.interview-skills small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.feedback-card h2 {
+  font-size: 15px;
+  margin-bottom: 6px;
+  overflow-wrap: anywhere;
+}
+.feedback-card .report {
+  max-height: 420px;
 }
 .scroller {
   overflow: auto;
@@ -1440,7 +1530,8 @@ dialog::backdrop {
     font-size: 23px;
   }
   .grid2,
-  .grid3 {
+  .grid3,
+  .config-grid {
     grid-template-columns: 1fr;
   }
   .welcome {

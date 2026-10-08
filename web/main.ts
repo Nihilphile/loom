@@ -13,7 +13,11 @@ import type {
   SkillReference,
   Reasoning,
   TurnInput,
+  Preparation,
+  Feedback,
+  InterviewSettings,
 } from "../src/shared/types.ts";
+import { defaultInterviews } from "../src/shared/types.ts";
 import { statistics, type StatsFilters } from "./statistics.ts";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -47,6 +51,7 @@ const statsFilters: StatsFilters = {
   from: "",
   to: "",
   group: "project",
+  purpose: "",
 };
 class StaleProjectResponse extends Error {}
 const projectUrl = (path: string, owner = projectId) =>
@@ -107,6 +112,14 @@ const statusNames: Record<string, string> = {
   approved: "通过",
   changes_requested: "需返修",
   injected: "已投递",
+  completed: "已完成",
+  pending: "待执行",
+  cancelled: "已取消",
+  prepared: "已组装",
+  dispatching: "发送中",
+  accepted: "运行时已接收",
+  rejected: "已拒绝",
+  uncertain: "接收结果未知",
 };
 const esc = (value: unknown): string =>
   String(value ?? "").replace(
@@ -358,6 +371,8 @@ function sidebar() {
     ["mailbox", "✉", "Mailbox", state.letters.length],
     ["logs", "≋", "运行记录", ""],
     ["stats", "▤", "统计", ""],
+    ["feedback", "▣", "意见箱", state.feedback?.length ?? 0],
+    ["developer", "⚙", "开发者选项", ""],
     ["types", "◈", "Task types", state.taskTypes.length],
     ["templates", "⊞", "Agent templates", state.agentTemplates.length],
   ];
@@ -376,6 +391,10 @@ function content() {
       return `${intro("运行记录", "原始事件与工具输入输出。点击记录查看完整内容。")}${trace(true)}`;
     case "stats":
       return statsPage();
+    case "feedback":
+      return feedbackPage();
+    case "developer":
+      return developerPage();
     case "templates":
       return templatesPage();
     case "types":
@@ -495,7 +514,7 @@ function inspector() {
   if (!t || !g) return empty("任务详情", "选择一个任务节点查看配置和交付。");
   let body = "";
   if (inspectTab === "members")
-    body = `<div class="prep"><div class="row between"><strong>⑂ Preparation</strong><span>程序执行 · 无模型 tokens</span></div><div>${t.workspace ? "工作区已准备" : "等待依赖交付后准备工作区"}</div></div>${t.units
+    body = `${t.units
       .map((u) => {
         const address = `${g.id}/${t.id}/${u.id}`;
         return `<div class="unit"><button class="unitmain" data-unit="${esc(u.id)}"><div class="row"><span class="avatar">${u.kind === "command" ? "›_" : esc(u.name.slice(0, 1))}</span><div class="grow"><h3>${esc(u.name)}</h3><div class="tiny muted">${u.kind === "command" ? "命令执行" : `${esc(u.model || "运行时默认")} · ${esc(u.reasoning || "默认")}`}</div></div>${badge(u.status)}</div><div class="unitfoot"><span>${u.sessionId ? esc(u.sessionId) : "尚未启动"}</span><span>详情 ↗</span></div></button><div class="unitmetrics"><span>${fmt(u.metrics.seconds)}s<small>累计执行</small></span><span>${u.metrics.toolCalls}<small>tool calls</small></span><span>${u.kind === "command" ? "无模型 tokens" : tokenSummary(u.metrics)}<small>输入 / 缓存 / 输出</small></span></div><div class="unitmail"><button data-mail-address="${esc(address)}" data-direction="inbox">↓ 收件箱 ${state?.letters.filter((l) => l.to.includes(address)).length}</button><button data-mail-address="${esc(address)}" data-direction="sent">↑ 发件箱 ${state?.letters.filter((l) => l.from === address).length}</button></div></div>`;
@@ -640,9 +659,94 @@ function composer(s: Session) {
     <div class="row between tiny muted"><span>Ctrl / ⌘ + Enter · 每个附件最多 10 MB</span><span>${esc(contextLabel(s))}</span></div>${optionsLoading ? '<div class="tiny muted">正在读取模型与技能目录…</div>' : ""}${options.warnings.map((w) => `<div class="tiny dangertext">${esc(w)}</div>`).join("")}
   </form>`;
 }
+const observer = (s: Session) =>
+  s.kind === "sidechat" || s.kind === "interview";
+function observerActions(s?: Session) {
+  if (!s || observer(s)) return "";
+  const available =
+    !!s.lastCompletedTurnId && !!state?.runtime.capabilities.fork;
+  const reason = !state?.runtime.capabilities.fork
+    ? "当前运行时不支持独立分叉"
+    : !s.lastCompletedTurnId
+      ? "首个完整轮次结束后可开启"
+      : "从最近已完成轮次创建独立只读会话";
+  return `<div class="observer-actions"><div class="row wrap"><button class="btn small" data-sidechat="${esc(s.id)}" ${available ? "" : "disabled"} title="${esc(reason)}">打开只读侧聊</button><button class="btn small" data-interview="${esc(s.id)}" ${available ? "" : "disabled"} title="${esc(reason)}">访谈这个 Agent</button></div><p class="tiny muted">${esc(reason)}。原会话继续运行。</p></div>`;
+}
+function observerSource(s: Session) {
+  const source = s.source;
+  if (!source) return "";
+  const title =
+    state?.sessions.find((x) => x.id === source.sessionId)?.title ??
+    source.sessionId;
+  return `<div class="observer-source"><div class="row wrap"><strong>${s.kind === "interview" ? "独立访谈 · 开发开销" : "独立只读侧聊"}</strong><button class="btn small" data-open-session="${esc(source.sessionId)}">来源 ${esc(title)} ↗</button></div><p>上下文截至已完成轮次 <code>${esc(source.turnId)}</code> · ${esc(new Date(source.createdAt).toLocaleString())}</p><p>原 Agent 的后续消息不会同步到这里；这里的消息也不会回注。读取的是实时项目文件，并非分叉时的代码快照。</p><p>可以读取代码和报告，不能修改文件、交卷、发信或操作任务图。</p></div>`;
+}
+function preparationHistory(sid: string) {
+  const records = (state?.preparations ?? []).filter(
+    (p) => p.sessionId === sid,
+  );
+  if (!records.length)
+    return '<p class="hint">尚无上下文准备记录。配置预览不代表已注入。</p>';
+  const modes = {
+    initialize: "首次初始化",
+    continue: "继续会话",
+    steer: "执行中引导",
+  };
+  const kinds = {
+    role: "角色说明",
+    goal: "任务目标",
+    report: "报告",
+    skill: "Skill",
+    file: "文件",
+    letter: "信件",
+    instruction: "指令",
+  };
+  return `<div class="context-history">${records
+    .slice()
+    .reverse()
+    .map(
+      (p) =>
+        `<details class="context-record" data-detail="preparation-${esc(p.id)}"><summary><span>${modes[p.mode]} · ${esc(time(p.createdAt))}</span>${badge(p.receipt.status)}<span class="tiny muted">${p.inputs.length} 项输入</span></summary>${"reason" in p.receipt ? `<p class="notice amber">${esc(p.receipt.reason)}</p>` : ""}${p.receipt.status === "uncertain" ? `<p class="hint">不会自动重发。请核对运行历史后处理。</p><button class="btn small" data-resolve-preparation="${esc(p.id)}">核对接收结果</button>` : ""}<div class="rule">执行 <code>${esc(p.executionId)}</code></div><details class="context-input" data-detail="preparation-config-${esc(p.id)}"><summary>本次配置 · v${p.config.revision}</summary><pre class="jsondetail">${json(p.config)}</pre></details>${p.inputs.map((input) => `<details class="context-input" data-detail="preparation-input-${esc(p.id)}-${esc(input.id)}"><summary>${kinds[input.kind]} · ${esc(input.path ?? input.letterId ?? input.id)}</summary><p class="tiny muted wordwrap">内容指纹 ${esc(input.digest)}</p><pre class="report">${esc(input.content)}</pre></details>`).join("")}<details class="context-input" data-detail="preparation-prompt-${esc(p.id)}"><summary>查看完整输入</summary><pre class="report">${esc(p.prompt)}</pre></details>${p.receipt.status === "accepted" ? `<p class="tiny muted wordwrap">已接收轮次 ${esc(p.receipt.turnId)}。接收回执不代表模型已理解或遵从内容。</p>` : ""}</details>`,
+    )
+    .join("")}</div>`;
+}
+function feedbackPage() {
+  const feedback = state?.feedback ?? [];
+  const trigger = {
+    manual: "手动访谈",
+    completed: "任务完成",
+    blocked: "任务阻塞",
+  };
+  return `${intro("意见箱", "保留访谈原文与来源。反馈仅进入独立访谈会话，不影响原任务。", '<button class="btn" data-page="developer">访谈设置</button>')}<div class="stack">${
+    feedback
+      .map((item) => {
+        const source = state?.sessions.find(
+          (s) => s.id === item.source.sessionId,
+        );
+        return `<article class="panel feedback-card"><div class="panelhead"><div><h2>${esc(source?.title ?? item.source.sessionId)}</h2><p class="tiny muted">${trigger[item.trigger]} · ${esc(new Date(item.createdAt).toLocaleString())}</p></div>${badge(item.status)}</div><div class="panelbody"><p class="tiny muted wordwrap">${esc([item.source.graphId, item.source.taskId, item.source.unitId].filter(Boolean).join(" / ") || "自由会话")} · 来源轮次 ${esc(item.source.turnId)}</p><div class="row wrap spaced"><button class="btn small" data-open-session="${esc(item.source.sessionId)}">查看源会话</button>${item.sessionId ? `<button class="btn small" data-open-session="${esc(item.sessionId)}">打开访谈 ↗</button>` : ""}</div>${item.error ? `<div class="notice amber spaced">${esc(item.error)}</div>` : ""}<pre class="report spaced">${esc(item.content || (item.status === "pending" || item.status === "running" ? "正在收集回答…" : "没有收集到回答。"))}</pre><details class="context-input" data-detail="feedback-prompt-${esc(item.id)}"><summary>本次访谈问题</summary><pre class="report">${esc(item.prompt)}</pre></details></div></article>`;
+      })
+      .join("") ||
+    empty(
+      "暂无反馈",
+      "从任意已有完整轮次的 Agent 发起访谈，或在开发者选项中启用自动访谈。",
+    )
+  }</div>`;
+}
+function developerPage() {
+  const settings = state?.interviews ?? defaultInterviews();
+  const skillCatalog = [
+    ...options.skills,
+    ...settings.skills
+      .filter((skill) => !options.skills.some((s) => s.path === skill.path))
+      .map((skill) => ({
+        ...skill,
+        description: "已配置；当前目录未返回此技能",
+      })),
+  ];
+  return `${intro("开发者选项", "自动访谈使用独立只读会话。原 Agent 的上下文、信件和调度状态保持独立。", '<button class="btn" data-page="feedback">打开意见箱</button>')}<section class="panel developer-settings"><div class="panelhead"><strong>自动访谈</strong>${badge(settings.enabled ? "running" : "idle", settings.enabled ? "已启用" : "已关闭")}</div><form class="panelbody" data-form="interviews"><label class="checkrow"><input type="checkbox" name="interview-enabled" ${settings.enabled ? "checked" : ""}>启用自动访谈</label><p class="hint">默认关闭。关闭后仍可手动访谈；不会中断已经发起的访谈。</p><div class="grid2"><label class="checkrow"><input type="checkbox" name="interview-completed" ${settings.onCompleted ? "checked" : ""}>Task 完工后访谈</label><label class="checkrow"><input type="checkbox" name="interview-blocked" ${settings.onBlocked ? "checked" : ""}>Task 阻塞后访谈</label></div>${area("interview-prompt", "访谈提示词", settings.prompt, "required rows=7")}<div class="grid2"><label class="field"><span>访谈模型</span><select name="interview-model" id="interview-model">${modelOptions(settings.model)}</select></label><label class="field"><span>推理强度</span><select name="interview-reasoning" id="interview-reasoning">${nativeReasonOptions(settings.model, settings.reasoning)}</select></label></div><fieldset class="interview-skills"><legend>访谈 Skills</legend><p class="hint">仅加载到访谈会话，不会加载到源 Agent。</p>${skillCatalog.map((skill) => `<label class="checkrow"><input type="checkbox" name="interview-skill-${enc(skill.path)}" data-interview-skill="${esc(skill.path)}" data-skill-name="${esc(skill.name)}" ${settings.skills.some((s) => s.path === skill.path) ? "checked" : ""}><span><strong>$${esc(skill.name)}</strong><small>${esc(skill.description)}</small></span></label>`).join("") || `<p class="hint">${optionsLoading ? "正在加载可用 Skills…" : "未发现可用 Skills。"}</p>`}</fieldset><p class="notice spaced">只访谈已有完整轮次的 Agent。访谈失败不会阻塞或恢复源任务；访谈的耗时和 tokens 单独计为开发开销。</p>${options.warnings.map((warning) => `<p class="notice amber spaced">${esc(warning)}</p>`).join("")}<button type="submit" class="btn primary spaced">保存访谈设置</button></form></section>`;
+}
 function sessionsPage() {
   const s = session();
-  const list = (kind: "free" | "task") =>
+  const list = (kind: Session["kind"]) =>
     state?.sessions
       .filter((x) => x.kind === kind)
       .map(
@@ -651,7 +755,7 @@ function sessionsPage() {
       )
       .join("") || '<div class="empty">暂无会话</div>';
   const queue = s?.queue ?? [];
-  return `${intro("Sessions", "对话、工具记录和待发送消息。切换项目后执行继续运行。", btn("new-session", "＋ 自由会话", "primary"))}<div class="sessionlayout"><section class="panel sessionlist" data-scroll="sessions"><div class="sessionsection">自由会话</div>${list("free")}<div class="sessionsection">TASK 会话</div>${list("task")}</section><div class="stack">${s ? `<section class="panel chat-panel"><div class="chathead"><div class="row between"><h2>${esc(s.title)}</h2>${badge(s.status)}</div><div class="tiny muted">${esc(s.model || "运行时默认模型")} · ${esc(s.reasoning || "默认推理")} · ${s.turns} turns</div><div class="chat-usage">输入 ${fmt(s.metrics.usage.inputTokens)} <span>缓存 ${fmt(s.metrics.usage.cachedInputTokens)}</span> 输出 ${fmt(s.metrics.usage.outputTokens)} <span>${esc(contextLabel(s))}</span></div></div><div class="messages" data-scroll="messages-${esc(s.id)}">${s.messages.length ? s.messages.map((m) => `<article class="message ${esc(m.role)}"><div class="messageheader">${esc(m.role === "user" ? "你" : m.role === "assistant" ? "Codex" : m.role === "mailbox" ? "Mailbox" : "系统")} · ${esc(time(m.at))}${m.delivery ? ` · ${m.delivery === "steer" ? "已引导" : "来自队列"}` : ""}</div><p>${esc(m.text)}</p><div class="message-attachments">${(m.attachments ?? []).map(attachmentView).join("")}</div>${(m.skills ?? []).map((skill) => `<span class="badge">$${esc(skill.name)}</span>`).join("")}</article>`).join("") : empty("开始对话", "输入目标或问题，或用 / 查看命令。")}${s.status === "running" ? '<div class="stream-indicator"><span></span> Codex 正在工作…</div>' : ""}</div><div id="chat-tools" class="chat-tools">${chatTools()}</div>${s.error ? `<div class="notice amber">${esc(s.error)}</div>` : ""}${queue.length || s.queuePaused ? `<section class="queued-messages"><div class="row between"><strong>待发送 ${queue.length}${s.queuePaused ? " · 已暂停" : ""}</strong>${s.queuePaused ? btn("continue-queue", "继续队列", "small", s.status === "running" || !queue.length) : ""}</div>${queue.map((q, i) => `<div class="queued-message"><span class="muted">${i + 1}</span><div class="grow"><p>${esc(q.input.text || "附件消息")}</p><small>${q.attachments.map((a) => esc(a.name)).join(" · ")}${q.input.skills?.map((skill) => ` $${esc(skill.name)}`).join("") ?? ""}</small></div><button class="btn small" data-cancel-queue="${esc(q.id)}">取消</button></div>`).join("")}</section>` : ""}${s.kind === "free" ? composer(s) : '<div class="notice">Task 会话由调度器管理。请通过成员收发件箱发送报告文件，或在 Graph 中暂停和编辑任务。</div>'}</section>` : empty("创建一个自由会话", "自由会话不属于任务图，适合调查、讨论与临时工作。", btn("new-session", "＋ 创建自由会话", "primary"))}${trace()}</div></div>`;
+  return `${intro("Sessions", "对话、工具记录和待发送消息。切换项目后执行继续运行。", btn("new-session", "＋ 自由会话", "primary"))}<div class="sessionlayout"><section class="panel sessionlist" data-scroll="sessions"><div class="sessionsection">自由会话</div>${list("free")}<div class="sessionsection">TASK 会话</div>${list("task")}<div class="sessionsection">只读侧聊</div>${list("sidechat")}<div class="sessionsection">开发者访谈</div>${list("interview")}</section><div class="stack">${s ? `<section class="panel chat-panel"><div class="chathead"><div class="row between"><h2>${esc(s.title)}</h2>${badge(s.status)}</div>${observerActions(s)}<div class="tiny muted">${esc(s.model || "运行时默认模型")} · ${esc(s.reasoning || "默认推理")} · ${s.turns} turns</div><div class="chat-usage">输入 ${fmt(s.metrics.usage.inputTokens)} <span>缓存 ${fmt(s.metrics.usage.cachedInputTokens)}</span> 输出 ${fmt(s.metrics.usage.outputTokens)} <span>${esc(contextLabel(s))}</span></div></div>${observerSource(s)}<div class="messages" data-scroll="messages-${esc(s.id)}">${s.messages.length ? s.messages.map((m) => `<article class="message ${esc(m.role)}"><div class="messageheader">${esc(m.role === "user" ? "你" : m.role === "assistant" ? "Codex" : m.role === "mailbox" ? "Mailbox" : "系统")} · ${esc(time(m.at))}${m.delivery ? ` · ${m.delivery === "steer" ? "已引导" : "来自队列"}` : ""}</div><p>${esc(m.text)}</p><div class="message-attachments">${(m.attachments ?? []).map(attachmentView).join("")}</div>${(m.skills ?? []).map((skill) => `<span class="badge">$${esc(skill.name)}</span>`).join("")}</article>`).join("") : empty("开始对话", "输入目标或问题，或用 / 查看命令。")}${s.status === "running" ? '<div class="stream-indicator"><span></span> Codex 正在工作…</div>' : ""}</div><div id="chat-tools" class="chat-tools">${chatTools()}</div>${s.error ? `<div class="notice amber">${esc(s.error)}</div>` : ""}${queue.length || s.queuePaused ? `<section class="queued-messages"><div class="row between"><strong>待发送 ${queue.length}${s.queuePaused ? " · 已暂停" : ""}</strong>${s.queuePaused ? btn("continue-queue", "继续队列", "small", s.status === "running" || !queue.length) : ""}</div>${queue.map((q, i) => `<div class="queued-message"><span class="muted">${i + 1}</span><div class="grow"><p>${esc(q.input.text || "附件消息")}</p><small>${q.attachments.map((a) => esc(a.name)).join(" · ")}${q.input.skills?.map((skill) => ` $${esc(skill.name)}`).join("") ?? ""}</small></div><button class="btn small" data-cancel-queue="${esc(q.id)}">取消</button></div>`).join("")}</section>` : ""}${s.kind !== "task" ? composer(s) : '<div class="notice">Task 会话由调度器管理。请通过成员收发件箱发送报告文件，或在 Graph 中暂停和编辑任务。</div>'}<details class="session-context" data-detail="session-context-${esc(s.id)}"><summary>Context · 本次会话输入记录</summary>${preparationHistory(s.id)}</details></section>` : empty("创建一个自由会话", "自由会话不属于任务图，适合调查、讨论与临时工作。", btn("new-session", "＋ 创建自由会话", "primary"))}${trace()}</div></div>`;
 }
 function mailboxPage() {
   const letters =
@@ -722,7 +826,7 @@ function nativeReasonOptions(model = "", selected = "") {
   const catalog =
     options.models.find((m) => m.id === model) ??
     options.models.find((m) => m.isDefault);
-  return `<option value="">${catalog?.defaultReasoning ? "默认推理强度" : "沿用会话推理强度"}</option>${(catalog?.reasoning ?? []).map((r) => `<option value="${esc(r)}" ${r === selected ? "selected" : ""}>${esc(r)}</option>`).join("")}`;
+  return `<option value="">${catalog?.defaultReasoning ? "默认推理强度" : "沿用会话推理强度"}</option>${(catalog?.reasoning ?? []).map((r) => `<option value="${esc(r)}" ${r === selected ? "selected" : ""}>${esc(r)}</option>`).join("")}${selected && !catalog?.reasoning.includes(selected as Reasoning) ? `<option value="${esc(selected)}" selected>${esc(selected)}（当前配置）</option>` : ""}`;
 }
 function sessionModal() {
   modal(
@@ -790,9 +894,20 @@ function unitModal(id: string) {
     g = graph(),
     u = t?.units.find((x) => x.id === id);
   if (!u || !g || !t) return;
+  const s = state?.sessions.find((session) => session.id === u.sessionId);
+  const accepted = s?.acceptedConfig;
+  const pending = !!accepted && accepted.revision < t.configRevision;
   modal(
     u.name,
-    `<div class="row between">${badge(u.status)}<span class="tiny muted">${u.kind === "command" ? "Command Unit" : u.readOnly ? "只读 Agent" : "工作区可写 Agent"}</span></div><div class="rule">模型：${esc(u.model || "运行时默认")} · 推理：${esc(u.reasoning || "默认")}</div><div class="rule">Skills：${u.skills.map(esc).join("、") || "未指定"}</div><div class="rule">地址：<code>${esc(`${g.id}/${t.id}/${u.id}`)}</code></div><h3 class="spaced">初始 prompt</h3><pre class="report spaced">${esc(u.prompt || "未指定额外 prompt")}</pre>${u.command ? `<h3 class="spaced">命令</h3><pre class="report spaced">${esc(u.command)}</pre>` : ""}<div class="spaced">${u.sessionId ? `<button class="btn primary" data-open-session="${esc(u.sessionId)}">查看真实会话 ↗</button>` : '<span class="muted">成员尚未创建会话</span>'}</div>`,
+    `<div class="row between">${badge(u.status)}<span class="tiny muted">${u.kind === "command" ? "命令执行" : u.readOnly ? "只读 Agent" : "工作区可写 Agent"}</span><button class="btn small" data-unit="${esc(u.id)}">刷新详情</button></div><div class="rule">地址 <code>${esc(`${g.id}/${t.id}/${u.id}`)}</code></div><h3 class="spaced">Config</h3><div class="config-grid"><section><h4>声明配置 · v${t.configRevision}</h4><div class="rule">模型 ${esc(u.model || "运行时默认")} · 推理 ${esc(u.reasoning || "默认")}</div><div class="rule">Skills ${u.skills.map(esc).join("、") || "未指定"}</div><div class="rule">权限 ${u.readOnly ? "只读" : "工作区可写"}</div><div class="rule">工作目录 ${esc(t.workspace?.path ?? "依赖交付后准备")}</div><p class="hint">返修、再审默认沿用原 session。</p>${u.command ? `<pre class="report">${esc(u.command)}</pre>` : ""}</section><section><h4>已接受配置${accepted ? ` · v${accepted.revision}` : ""}</h4>${accepted ? `<div class="rule">模型 ${esc(accepted.model || "运行时默认")} · 推理 ${esc(accepted.reasoning || "默认")}</div><div class="rule">Skills ${accepted.skills.map(esc).join("、") || "未指定"}</div><div class="rule">权限 ${accepted.readOnly ? "只读" : "工作区可写"}</div><div class="rule">工作目录 ${esc(accepted.cwd)}</div>` : `<p class="hint">${u.kind === "command" ? "命令 Unit 不做模型会话初始化。" : "尚未收到运行时接收回执。"}</p>`}${pending ? '<p class="notice amber">声明配置已更新，等待下一次执行接受。当前 session 尚未应用此版本。</p>' : ""}</section></div><h3 class="spaced">Context</h3><details class="context-input"><summary>配置来源预览 · 尚不代表已注入</summary><h4 class="spaced">初始 prompt</h4><pre class="report">${esc(u.prompt || "未指定额外 prompt")}</pre><h4 class="spaced">上下文选择</h4><pre class="jsondetail">${json(u.context ?? {})}</pre></details>${u.sessionId ? preparationHistory(u.sessionId) : '<p class="hint">首次运行前会根据配置组装上下文。</p>'}${s?.error ? `<p class="notice amber">${esc(s.error)}</p>` : ""}<div class="spaced">${u.sessionId ? `<button class="btn primary" data-open-session="${esc(u.sessionId)}">查看会话 ↗</button>` : '<span class="muted">成员尚未创建会话</span>'}</div>${observerActions(s)}`,
+  );
+}
+function resolvePreparationModal(p: Preparation) {
+  modal(
+    "核对上下文接收结果",
+    `<p class="notice amber">仅凭界面超时无法确定是否已接收。请先核对原生运行历史，再记录核对结果。此操作不重新发送内容。</p><div class="rule">执行 <code>${esc(p.executionId)}</code></div><label class="field spaced"><span>核对结果</span><select name="accepted"><option value="true">确认运行时已接收</option><option value="false">确认运行时未接收</option></select></label>${field("threadId", "已接收时填写 Thread ID")}${field("turnId", "已接收时填写 Turn ID")}<label class="checkrow"><input type="checkbox" name="verified" required>我已核对运行历史。确认未接收后，才能安全地重新发送。</label><input type="hidden" name="sessionId" value="${esc(p.sessionId)}"><input type="hidden" name="preparationId" value="${esc(p.id)}">`,
+    "resolve-preparation",
+    "保存核对结果",
   );
 }
 function composeModal() {
@@ -928,6 +1043,50 @@ document.addEventListener("submit", (event) => {
 async function submit(form: HTMLFormElement) {
   const kind = form.dataset.form;
   if (requestPending && kind !== "chat") return;
+  if (kind === "interviews") {
+    const checked = (name: string) =>
+      !!form.querySelector<HTMLInputElement>(`[name="${name}"]`)?.checked;
+    const settings: InterviewSettings = {
+      enabled: checked("interview-enabled"),
+      onCompleted: checked("interview-completed"),
+      onBlocked: checked("interview-blocked"),
+      prompt: value(form, "interview-prompt"),
+      model: value(form, "interview-model") || undefined,
+      reasoning: (value(form, "interview-reasoning") || undefined) as
+        Reasoning | undefined,
+      skills: [
+        ...form.querySelectorAll<HTMLInputElement>(
+          "[data-interview-skill]:checked",
+        ),
+      ].map((el) => ({
+        name: el.dataset.skillName!,
+        path: el.dataset.interviewSkill!,
+      })),
+    };
+    await mutate("/api/developer/interviews", settings, "PUT");
+    toast("访谈设置已保存");
+    return;
+  }
+  if (kind === "resolve-preparation") {
+    const accepted = value(form, "accepted") === "true";
+    const threadId = value(form, "threadId");
+    const turnId = value(form, "turnId");
+    if (!form.querySelector<HTMLInputElement>('[name="verified"]')?.checked)
+      throw new Error("请先核对运行历史。");
+    if (accepted && (!threadId || !turnId))
+      throw new Error("确认已接收需要填写 Thread ID 和 Turn ID。");
+    await mutate(
+      `/api/sessions/${enc(value(form, "sessionId"))}/preparations/${enc(value(form, "preparationId"))}/resolve`,
+      {
+        accepted,
+        threadId: threadId || undefined,
+        turnId: turnId || undefined,
+      },
+    );
+    dialog.close();
+    toast("接收结果已更新");
+    return;
+  }
   if (kind === "project") {
     const entry = await api<ProjectEntry>("/api/projects", "POST", {
       path: value(form, "path"),
@@ -1158,6 +1317,50 @@ document.addEventListener("click", (event) => {
   void click(el).catch(showError);
 });
 async function click(el: HTMLElement) {
+  if (el.dataset.sidechat || el.dataset.interview) {
+    if (requestPending) return;
+    const source = el.dataset.sidechat ?? el.dataset.interview!;
+    const owner = projectId;
+    requestPending = true;
+    el.setAttribute("disabled", "");
+    try {
+      let createdId: string | undefined;
+      if (el.dataset.sidechat) {
+        const created = await api<Session>(
+          `/api/sessions/${enc(source)}/sidechats`,
+          "POST",
+          {},
+        );
+        createdId = created.id;
+      } else {
+        const feedback = await api<Feedback>(
+          `/api/sessions/${enc(source)}/interviews`,
+          "POST",
+          {},
+        );
+        createdId = feedback.sessionId;
+      }
+      dialog.close();
+      if (createdId) {
+        sessionId = createdId;
+        page = "sessions";
+      } else page = "feedback";
+      await refresh();
+      render(false);
+      scheduleEvents();
+    } finally {
+      requestPending = false;
+      if (owner === projectId) el.removeAttribute("disabled");
+    }
+    return;
+  }
+  if (el.dataset.resolvePreparation) {
+    const record = state?.preparations?.find(
+      (p) => p.id === el.dataset.resolvePreparation,
+    );
+    if (record) resolvePreparationModal(record);
+    return;
+  }
   if (el.dataset.project) {
     await selectProject(el.dataset.project);
     return;
@@ -1304,6 +1507,7 @@ async function click(el: HTMLElement) {
         from: "",
         to: "",
         group: "project",
+        purpose: "",
       });
       render(false);
       break;
@@ -1463,7 +1667,7 @@ async function runCommand(text: string) {
   render(false);
 }
 async function uploadFiles(files: File[], s = session(), owner = projectId) {
-  if (!s || s.kind !== "free") return;
+  if (!s || s.kind === "task") return;
   const d = drafts.get(draftKey(s.id, owner));
   if (!d) return;
   for (const file of files) {
@@ -1527,6 +1731,11 @@ document.addEventListener("change", (event) => {
     const reason = dialog.querySelector<HTMLSelectElement>(
       "#new-session-reasoning",
     );
+    if (reason) reason.innerHTML = nativeReasonOptions(el.value);
+    return;
+  }
+  if (el instanceof HTMLSelectElement && el.id === "interview-model") {
+    const reason = app.querySelector<HTMLSelectElement>("#interview-reasoning");
     if (reason) reason.innerHTML = nativeReasonOptions(el.value);
     return;
   }
@@ -1663,6 +1872,7 @@ async function selectProject(id: string) {
     from: "",
     to: "",
     group: "project",
+    purpose: "",
   });
   composing = false;
   events = [];

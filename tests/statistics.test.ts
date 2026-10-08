@@ -22,6 +22,7 @@ const filters = (changes: Partial<StatsFilters> = {}): StatsFilters => ({
   from: "",
   to: "",
   group: "project",
+  purpose: "",
   ...changes,
 });
 const execution = (changes: Partial<Execution> = {}): Execution => ({
@@ -183,4 +184,63 @@ test("execution totals exclude session and unit lifetime totals", () => {
   );
   assert.match(unknown, /用量已知 0 \/ 1 次执行/);
   assert.match(unknown, /用量未知，未按 0 计入/);
+});
+
+test("sidechat and interview usage belongs to the project, never the source task or unit", () => {
+  const rows = [
+    execution(),
+    execution({
+      id: "sidechat",
+      sessionId: "side-session",
+      purpose: "sidechat",
+    }),
+    execution({
+      id: "interview",
+      sessionId: "interview-session",
+      purpose: "interview",
+    }),
+  ];
+  assert.equal(
+    summarize(filterExecutions(rows, filters())).usage.inputTokens,
+    300,
+  );
+  for (const selection of [
+    { graph: "graph-1" },
+    { task: "graph-1/task-1" },
+    { unit: "graph-1/task-1/unit-1" },
+  ]) {
+    assert.deepEqual(
+      filterExecutions(rows, filters(selection)).map((row) => row.id),
+      ["execution-1"],
+    );
+  }
+  assert.deepEqual(
+    filterExecutions(rows, filters({ graph: "sidechat" })).map((row) => row.id),
+    ["sidechat"],
+  );
+  assert.deepEqual(
+    filterExecutions(rows, filters({ purpose: "interview" })).map(
+      (row) => row.id,
+    ),
+    ["interview"],
+  );
+  const html = statistics(
+    {
+      project: { id: "project", name: "Project", path: "/project" },
+      sessions: [],
+      graphs: [],
+      letters: [],
+      taskTypes: [],
+      agentTemplates: [],
+      executions: rows,
+      runtime: {
+        name: "test",
+        capabilities: { inject: true, interrupt: true, readOnly: true },
+      },
+    },
+    filters({ group: "unit" }),
+  );
+  assert.match(html, /只读侧聊 \/ side-session/);
+  assert.match(html, /开发者访谈 \/ interview-session/);
+  assert.match(html, /2 次独立执行，240 个已知 tokens/);
 });

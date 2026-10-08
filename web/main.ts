@@ -328,7 +328,17 @@ function render(preserve = true) {
     return;
   }
   app.innerHTML = `<div class="app">${sidebar()}<main><header class="topbar"><div class="crumb">WORKSPACE &nbsp; / &nbsp; <strong>${esc(state.project?.name ?? "打开项目")}</strong></div><div class="row"><span class="connection ${connected ? "" : "offline"}">${connected ? "● 已连接" : "○ 正在重连"}</span><span class="runtime">${esc(state.runtime.name)} · 本地运行</span></div></header><div class="page">${!state.project && !["templates", "types"].includes(page) ? welcome() : content()}</div></main></div>`;
-  if (preserve)
+  if (preserve) {
+    const interviewModel = controls.get("interview-model");
+    const interviewReasoning = app.querySelector<HTMLSelectElement>(
+      "#interview-reasoning",
+    );
+    if (interviewModel && interviewReasoning)
+      interviewReasoning.innerHTML = nativeReasonOptions(
+        interviewModel.value,
+        controls.get("interview-reasoning")?.value,
+        interviewModel.value ? "模型默认强度" : "沿用来源 Agent",
+      );
     app
       .querySelectorAll<
         HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
@@ -346,6 +356,7 @@ function render(preserve = true) {
             el.setSelectionRange(selectionStart, selectionEnd);
         }
       });
+  }
   app
     .querySelectorAll<HTMLDetailsElement>("details[data-detail]")
     .forEach((el) => {
@@ -744,7 +755,7 @@ function developerPage() {
         description: "已配置；当前目录未返回此技能",
       })),
   ];
-  return `${intro("开发者选项", "自动访谈使用独立只读会话。原 Agent 的上下文、信件和调度状态保持独立。", '<button class="btn" data-page="feedback">打开意见箱</button>')}<section class="panel developer-settings"><div class="panelhead"><strong>自动访谈</strong>${badge(settings.enabled ? "running" : "idle", settings.enabled ? "已启用" : "已关闭")}</div><form class="panelbody" data-form="interviews"><label class="checkrow"><input type="checkbox" name="interview-enabled" ${settings.enabled ? "checked" : ""}>启用自动访谈</label><p class="hint">默认关闭。关闭后仍可手动访谈；不会中断已经发起的访谈。</p><div class="grid2"><label class="checkrow"><input type="checkbox" name="interview-completed" ${settings.onCompleted ? "checked" : ""}>Task 完工后访谈</label><label class="checkrow"><input type="checkbox" name="interview-blocked" ${settings.onBlocked ? "checked" : ""}>Task 阻塞后访谈</label></div>${area("interview-prompt", "访谈提示词", settings.prompt, "required rows=7")}<div class="grid2"><label class="field"><span>访谈模型</span><select name="interview-model" id="interview-model">${modelOptions(settings.model)}</select></label><label class="field"><span>推理强度</span><select name="interview-reasoning" id="interview-reasoning">${nativeReasonOptions(settings.model, settings.reasoning)}</select></label></div><fieldset class="interview-skills"><legend>访谈 Skills</legend><p class="hint">仅加载到访谈会话，不会加载到源 Agent。</p>${skillCatalog.map((skill) => `<label class="checkrow"><input type="checkbox" name="interview-skill-${enc(skill.path)}" data-interview-skill="${esc(skill.path)}" data-skill-name="${esc(skill.name)}" ${settings.skills.some((s) => s.path === skill.path) ? "checked" : ""}><span><strong>$${esc(skill.name)}</strong><small>${esc(skill.description)}</small></span></label>`).join("") || `<p class="hint">${optionsLoading ? "正在加载可用 Skills…" : "未发现可用 Skills。"}</p>`}</fieldset><p class="notice spaced">只访谈已有完整轮次的 Agent。访谈失败不会阻塞或恢复源任务；访谈的耗时和 tokens 单独计为开发开销。</p>${options.warnings.map((warning) => `<p class="notice amber spaced">${esc(warning)}</p>`).join("")}<button type="submit" class="btn primary spaced">保存访谈设置</button></form></section>`;
+  return `${intro("开发者选项", "自动访谈使用独立只读会话。原 Agent 的上下文、信件和调度状态保持独立。", '<button class="btn" data-page="feedback">打开意见箱</button>')}<section class="panel developer-settings"><div class="panelhead"><strong>自动访谈</strong>${badge(settings.enabled ? "running" : "idle", settings.enabled ? "已启用" : "已关闭")}</div><form class="panelbody" data-form="interviews"><label class="checkrow"><input type="checkbox" name="interview-enabled" ${settings.enabled ? "checked" : ""}>启用自动访谈</label><p class="hint">默认关闭。关闭后仍可手动访谈；不会中断已经发起的访谈。</p><div class="grid2"><label class="checkrow"><input type="checkbox" name="interview-completed" ${settings.onCompleted ? "checked" : ""}>Task 完工后访谈</label><label class="checkrow"><input type="checkbox" name="interview-blocked" ${settings.onBlocked ? "checked" : ""}>Task 阻塞后访谈</label></div>${area("interview-prompt", "访谈提示词", settings.prompt, "required rows=7")}<div class="grid2"><label class="field"><span>访谈模型</span><select name="interview-model" id="interview-model">${modelOptions(settings.model, "沿用来源 Agent")}</select></label><label class="field"><span>推理强度</span><select name="interview-reasoning" id="interview-reasoning">${nativeReasonOptions(settings.model, settings.reasoning, settings.model ? "模型默认强度" : "沿用来源 Agent")}</select></label></div><fieldset class="interview-skills"><legend>访谈 Skills</legend><p class="hint">仅加载到访谈会话，不会加载到源 Agent。</p>${skillCatalog.map((skill) => `<label class="checkrow"><input type="checkbox" name="interview-skill-${enc(skill.path)}" data-interview-skill="${esc(skill.path)}" data-skill-name="${esc(skill.name)}" ${settings.skills.some((s) => s.path === skill.path) ? "checked" : ""}><span><strong>$${esc(skill.name)}</strong><small>${esc(skill.description)}</small></span></label>`).join("") || `<p class="hint">${optionsLoading ? "正在加载可用 Skills…" : "未发现可用 Skills。"}</p>`}</fieldset><p class="notice spaced">只访谈已有完整轮次的 Agent。访谈失败不会阻塞或恢复源任务；访谈的耗时和 tokens 单独计为开发开销。</p>${options.warnings.map((warning) => `<p class="notice amber spaced">${esc(warning)}</p>`).join("")}<button type="submit" class="btn primary spaced">保存访谈设置</button></form></section>`;
 }
 function sessionsPage() {
   const s = session();
@@ -821,14 +832,14 @@ function projectModal() {
     })
     .catch(showError);
 }
-function modelOptions(selected = "") {
-  return `<option value="">${options.models.some((m) => m.isDefault) ? "运行时默认" : "沿用会话模型"}</option>${options.models.map((m) => `<option value="${esc(m.id)}" ${m.id === selected ? "selected" : ""}>${esc(m.name)}</option>`).join("")}${selected && !options.models.some((m) => m.id === selected) ? `<option value="${esc(selected)}" selected>${esc(selected)}（当前配置）</option>` : ""}`;
+function modelOptions(selected = "", defaultLabel?: string) {
+  return `<option value="">${esc(defaultLabel ?? (options.models.some((m) => m.isDefault) ? "运行时默认" : "沿用会话模型"))}</option>${options.models.map((m) => `<option value="${esc(m.id)}" ${m.id === selected ? "selected" : ""}>${esc(m.name)}</option>`).join("")}${selected && !options.models.some((m) => m.id === selected) ? `<option value="${esc(selected)}" selected>${esc(selected)}（当前配置）</option>` : ""}`;
 }
-function nativeReasonOptions(model = "", selected = "") {
+function nativeReasonOptions(model = "", selected = "", defaultLabel?: string) {
   const catalog =
     options.models.find((m) => m.id === model) ??
     options.models.find((m) => m.isDefault);
-  return `<option value="">${catalog?.defaultReasoning ? "默认推理强度" : "沿用会话推理强度"}</option>${(catalog?.reasoning ?? []).map((r) => `<option value="${esc(r)}" ${r === selected ? "selected" : ""}>${esc(r)}</option>`).join("")}${selected && !catalog?.reasoning.includes(selected as Reasoning) ? `<option value="${esc(selected)}" selected>${esc(selected)}（当前配置）</option>` : ""}`;
+  return `<option value="">${esc(defaultLabel ?? (catalog?.defaultReasoning ? "默认推理强度" : "沿用会话推理强度"))}</option>${(catalog?.reasoning ?? []).map((r) => `<option value="${esc(r)}" ${r === selected ? "selected" : ""}>${esc(r)}</option>`).join("")}${selected && !catalog?.reasoning.includes(selected as Reasoning) ? `<option value="${esc(selected)}" selected>${esc(selected)}（当前配置）</option>` : ""}`;
 }
 function sessionModal() {
   modal(
@@ -1744,7 +1755,12 @@ document.addEventListener("change", (event) => {
   }
   if (el instanceof HTMLSelectElement && el.id === "interview-model") {
     const reason = app.querySelector<HTMLSelectElement>("#interview-reasoning");
-    if (reason) reason.innerHTML = nativeReasonOptions(el.value);
+    if (reason)
+      reason.innerHTML = nativeReasonOptions(
+        el.value,
+        "",
+        el.value ? "模型默认强度" : "沿用来源 Agent",
+      );
     return;
   }
   if (

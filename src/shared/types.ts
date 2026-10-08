@@ -84,6 +84,7 @@ export interface UnitConfig {
   prompt: string;
   readOnly: boolean;
   command?: string;
+  context?: ContextSelection;
 }
 export interface TaskRule {
   from: string;
@@ -113,7 +114,10 @@ export interface ChatMessage {
 export interface Session {
   id: string;
   title: string;
-  kind: "free" | "task";
+  kind: "free" | "task" | "sidechat" | "interview";
+  source?: ObserverSource;
+  acceptedConfig?: ResolvedConfig;
+  lastCompletedTurnId?: string;
   graphId?: string;
   taskId?: string;
   unitId?: string;
@@ -255,7 +259,7 @@ export interface Execution {
   graphId?: string;
   taskId?: string;
   unitId?: string;
-  purpose: "chat" | "work" | "report" | "mail";
+  purpose: "chat" | "work" | "report" | "mail" | "sidechat" | "interview";
   originUnit?: string;
   tokenHash?: string;
   status: "starting" | "running" | "completed" | "failed" | "interrupted";
@@ -278,6 +282,9 @@ export interface ProjectState {
   graphs: Graph[];
   letters: Letter[];
   executions: Execution[];
+  preparations: Preparation[];
+  interviews: InterviewSettings;
+  feedback: Feedback[];
 }
 export interface AppState {
   project: ProjectState["project"] | null;
@@ -287,12 +294,16 @@ export interface AppState {
   executions?: Omit<Execution, "tokenHash">[];
   agentTemplates: AgentTemplate[];
   taskTypes: TaskType[];
+  preparations?: Preparation[];
+  interviews?: InterviewSettings;
+  feedback?: Feedback[];
   runtime: { name: string; capabilities: RuntimeCapabilities };
 }
 export interface RuntimeCapabilities {
   inject: boolean;
   interrupt: boolean;
   readOnly: boolean;
+  fork?: boolean;
 }
 export interface RuntimeInput {
   cwd: string;
@@ -302,6 +313,8 @@ export interface RuntimeInput {
   reasoning?: Reasoning;
   readOnly?: boolean;
   writableRoots?: string[];
+  observer?: boolean;
+  fork?: { threadId: string; turnId: string };
   env?: Record<string, string>;
   attachments?: (Attachment & { path: string })[];
   skills?: SkillReference[];
@@ -316,7 +329,11 @@ export interface RuntimeEvent {
   contextUsage?: ContextUsage;
   model?: string;
 }
+export type RuntimeAcceptance =
+  | { status: "accepted"; threadId: string; turnId: string }
+  | { status: "rejected" | "uncertain"; reason: string };
 export interface RuntimeResult {
+  completedTurnId?: string;
   status: "completed" | "interrupted" | "failed";
   threadId?: string;
   text: string;
@@ -324,6 +341,7 @@ export interface RuntimeResult {
   error?: string;
 }
 export interface RuntimeHandle {
+  accepted: Promise<RuntimeAcceptance>;
   done: Promise<RuntimeResult>;
   pid?: number;
   interrupt(): Promise<void>;
@@ -369,4 +387,76 @@ export const emptyMetrics = (): Metrics => ({
   toolCalls: 0,
   usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
   costUsd: null,
+});
+
+export interface ContextSelection {
+  goal?: boolean;
+  dependencies?: boolean;
+  previousResult?: boolean;
+  files?: string[];
+}
+export interface ResolvedConfig {
+  revision: number;
+  model?: string;
+  reasoning?: Reasoning;
+  readOnly: boolean;
+  cwd: string;
+  skills: string[];
+}
+export interface ResolvedContextItem {
+  id: string;
+  kind: "role" | "goal" | "report" | "skill" | "file" | "letter" | "instruction";
+  digest: string;
+  content: string;
+  path?: string;
+  letterId?: string;
+}
+export interface Preparation {
+  id: string;
+  executionId: string;
+  sessionId: string;
+  mode: "initialize" | "continue" | "steer";
+  createdAt: string;
+  config: ResolvedConfig;
+  inputs: ResolvedContextItem[];
+  prompt: string;
+  receipt: RuntimeAcceptance | { status: "prepared" | "dispatching" };
+}
+export interface ObserverSource {
+  sessionId: string;
+  threadId: string;
+  turnId: string;
+  createdAt: string;
+  graphId?: string;
+  taskId?: string;
+  unitId?: string;
+}
+export interface InterviewSettings {
+  enabled: boolean;
+  onCompleted: boolean;
+  onBlocked: boolean;
+  prompt: string;
+  model?: string;
+  reasoning?: Reasoning;
+  skills: SkillReference[];
+}
+export interface Feedback {
+  id: string;
+  eventKey: string;
+  source: ObserverSource;
+  sessionId?: string;
+  trigger: "manual" | "completed" | "blocked";
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  prompt: string;
+  content: string;
+  error?: string;
+  createdAt: string;
+  completedAt?: string;
+}
+export const defaultInterviews = (): InterviewSettings => ({
+  enabled: false,
+  onCompleted: true,
+  onBlocked: true,
+  prompt: "回顾本次任务中实际遇到的工程、工具或工作流摩擦。说明当时目标、具体障碍、相关操作或错误、采用的绕行办法，以及最有价值的改进。没有遇到的问题不要编造。只在此独立访谈回答，不执行源任务，不修改文件。",
+  skills: [],
 });

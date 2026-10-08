@@ -80,8 +80,10 @@ test("report-only tasks snapshot cleanly when runtime metadata is ignored", asyn
       "delete",
     );
     const paths = (
-      await git(task.path, "ls-tree", "-r", "--name-only", deleted)
-    ).split("\n");
+      await execute("git", ["ls-tree", "-r", "-z", "--name-only", deleted], {
+        cwd: task.path,
+      })
+    ).stdout.split("\0");
     assert(paths.includes("-file name.txt"));
     assert(paths.includes(" leading [literal].txt"));
     assert(!paths.includes("shared.txt"));

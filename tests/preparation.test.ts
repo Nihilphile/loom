@@ -400,3 +400,29 @@ test("explicit interview model uses its own default effort and never inherits in
   assert.equal(f.runtime.turns[1].input.model, "model-b");
   assert.equal(f.runtime.turns[1].input.reasoning, "low");
 });
+
+test("accepted runtime model is reapplied on continuation and template references are frozen", async (t) => {
+  const f = fixture(t),
+    source = f.engine.createSession({ title: "default model" });
+  await f.engine.sendMessage(source.id, "first");
+  f.runtime.turns[0].emit({
+    type: "thread.started",
+    threadId: "thread-0",
+    model: "resolved-default",
+  });
+  f.runtime.confirm(0);
+  f.runtime.turns[0].finish();
+  await flush();
+  assert.equal(source.acceptedConfig?.model, "resolved-default");
+  await f.engine.sendMessage(source.id, "second");
+  await flush();
+  assert.equal(f.runtime.turns[1].input.model, "resolved-default");
+  const template = f.catalog.agents.find((a) => a.id === "worker")!;
+  template.skills = ["original-skill"];
+  const graph = f.engine.createGraph({
+    name: "frozen",
+    tasks: [{ title: "task", goal: "goal", deps: [], taskTypeId: "direct" }],
+  });
+  template.skills.push("later-skill");
+  assert.deepEqual(graph.tasks[0].units[0].skills, ["original-skill"]);
+});

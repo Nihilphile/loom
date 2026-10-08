@@ -687,7 +687,7 @@ export class HarnessEngine {
         ...u,
         model: u.model || template?.model,
         reasoning: u.reasoning || template?.reasoning,
-        skills: u.skills.length ? u.skills : template?.skills || [],
+        skills: [...(u.skills.length ? u.skills : template?.skills || [])],
         prompt: [...new Set([template?.prompt, u.prompt].filter(Boolean))].join(
           "\n",
         ),
@@ -1291,8 +1291,12 @@ export class HarnessEngine {
   ): ResolvedConfig {
     return {
       revision: context?.task.configRevision ?? 1,
-      model: context?.unit.model ?? session.model,
-      reasoning: context?.unit.reasoning ?? session.reasoning,
+      model:
+        context?.unit.model ?? session.model ?? session.acceptedConfig?.model,
+      reasoning:
+        context?.unit.reasoning ??
+        session.reasoning ??
+        session.acceptedConfig?.reasoning,
       readOnly:
         purpose === "mail" || !!session.source || !!context?.unit.readOnly,
       cwd,
@@ -1492,6 +1496,12 @@ export class HarnessEngine {
         const acceptance = handle.accepted.then((receipt) => {
           const priorConfig = session.acceptedConfig;
           this.inputs.accept(session, preparation, receipt);
+          if (
+            receipt.status === "accepted" &&
+            session.acceptedConfig &&
+            !session.acceptedConfig.model
+          )
+            session.acceptedConfig.model = execution.model;
           if (purpose === "mail" && priorConfig)
             session.acceptedConfig = priorConfig;
           if (receipt.status === "accepted") {

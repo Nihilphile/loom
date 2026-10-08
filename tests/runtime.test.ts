@@ -1,10 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+  symlink,
+  link,
+} from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CodexRuntime } from "../src/server/runtime.ts";
+import { observerRead } from "../src/server/observer-tools.ts";
 import type { RuntimeEvent } from "../src/shared/types.ts";
 
 const server = (body: string) => `
@@ -28,6 +37,160 @@ function fake(body: string) {
     requestTimeoutMs: 1000,
   });
 }
+
+test("acceptance receipts distinguish native rejection, lost acknowledgement, and confirmed start", async () => {
+  for (const [action, expected] of [
+    ["send({id:r.id,error:{message:'refused'}})", "rejected"],
+    ["process.exit(7)", "uncertain"],
+    [
+      "reply(r,{turn:{id:'accepted-turn'}});notify('turn/completed',{threadId:'thread-one',turn:{id:'accepted-turn',status:'completed'}})",
+      "accepted",
+    ],
+    [
+      "notify('turn/started',{threadId:'thread-one',turn:{id:'accepted-turn'}});process.exit(7)",
+      "accepted",
+    ],
+    [
+      "notify('turn/completed',{threadId:'thread-one',turn:{id:'accepted-turn',status:'completed'}})",
+      "accepted",
+    ],
+  ]) {
+    const runtime = fake(`if(r.method === 'turn/start') {${action};}`);
+    const handle = await runtime.start(
+      { cwd: process.cwd(), prompt: "go" },
+      () => {},
+    );
+    assert.equal((await handle.accepted).status, expected);
+    const result = await handle.done;
+    assert.equal(
+      result.completedTurnId,
+      result.status === "completed" ? "accepted-turn" : undefined,
+    );
+    await runtime.close();
+  }
+  const runtime = fake(
+    `if(r.method === 'initialize')return send({id:r.id,error:{message:'unsupported'}});`,
+  );
+  const handle = await runtime.start(
+    { cwd: process.cwd(), prompt: "go" },
+    () => {},
+  );
+  assert.equal((await handle.accepted).status, "rejected");
+  await handle.done;
+});
+
+test("observer reads are bounded to ordinary project files and hide runtime storage", async (t) => {
+  const parent = await mkdtemp(join(tmpdir(), "loom-observer-tools-"));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const root = join(parent, "project");
+  await mkdir(root);
+  await mkdir(join(root, ".loom"));
+  await writeFile(join(root, "code.txt"), "one\ntwo\nthree");
+  await writeFile(join(parent, "outside.txt"), "private");
+  await writeFile(join(root, ".loom", "state.json"), "token");
+  await writeFile(join(root, ".env"), "secret");
+  await mkdir(join(parent, "outside"));
+  await writeFile(join(parent, "outside", "data.txt"), "private");
+  await symlink(join(parent, "outside"), join(root, "escaped"), "junction");
+  await link(join(parent, "outside.txt"), join(root, "linked.txt"));
+  assert.equal(
+    await observerRead(root, "read_file", {
+      path: "code.txt",
+      startLine: 2,
+      lineCount: 1,
+    }),
+    "2: two",
+  );
+  for (const path of [
+    "../outside.txt",
+    ".loom/state.json",
+    ".env",
+    "escaped/data.txt",
+    "linked.txt",
+  ])
+    await assert.rejects(observerRead(root, "read_file", { path }));
+  const list = await observerRead(root, "list_files", {});
+  assert.match(list, /code.txt/);
+  assert.doesNotMatch(list, /\.loom|\.env|escaped/);
+  await assert.rejects(
+    observerRead(root, "write_file", { path: "code.txt" }),
+    /Unsupported/,
+  );
+  assert.equal(
+    await readFile(join(root, "code.txt"), "utf8"),
+    "one\ntwo\nthree",
+  );
+});
+
+test("observer forks a checkpoint into a separate native thread and resumes only its own identity", async () => {
+  const runtime = fake(`
+    if(r.method === 'config/read') return reply(r,{config:{mcp_servers:{remote:{},local:{}}}});
+    if(r.method === 'mcpServerStatus/list') return reply(r,{data:[{name:'remote',runtimeStatus:'disabled'},{name:'loom_observer',runtimeStatus:'connected'}]});
+    if(r.method === 'thread/fork' || r.method === 'thread/resume') {
+      const p=r.params;
+      if(r.method === 'thread/fork' && (p.threadId!=='source' || p.lastTurnId!=='checkpoint' || p.deferGoalContinuation!==true)) process.exit(9);
+      if(r.method === 'thread/resume' && p.threadId!=='side-thread') process.exit(10);
+      if(p.sandbox!=='read-only' || p.config['mcp_servers.remote.enabled']!==false || p.config['mcp_servers.local.enabled']!==false || !p.config['mcp_servers.loom_observer'].enabled || p.config['features.shell_tool']!==false) process.exit(11);
+      if(process.env.HARNESS_TEST_TOKEN || process.env.LOOM_CALLBACK_TOKEN) process.exit(12);
+      return reply(r,{thread:{id:'side-thread',turns:[{id:'checkpoint'}]},sandbox:{type:'readOnly',networkAccess:false}});
+    }
+    if(r.method === 'turn/start') {
+      if(r.params.threadId!=='side-thread' || r.params.sandboxPolicy.type!=='readOnly' || r.params.sandboxPolicy.networkAccess!==false) process.exit(13);
+      reply(r,{turn:{id:'side-turn'}});
+      notify('turn/completed',{threadId:'side-thread',turn:{id:'side-turn',status:'completed'}});
+    }
+  `);
+  for (const identity of [
+    { fork: { threadId: "source", turnId: "checkpoint" } },
+    { threadId: "side-thread" },
+  ]) {
+    const handle = await runtime.start(
+      {
+        cwd: process.cwd(),
+        prompt: "observe",
+        observer: true,
+        ...identity,
+        env: { HARNESS_TEST_TOKEN: "no", LOOM_CALLBACK_TOKEN: "no" },
+      },
+      () => {},
+    );
+    assert.deepEqual(await handle.accepted, {
+      status: "accepted",
+      threadId: "side-thread",
+      turnId: "side-turn",
+    });
+    const result = await handle.done;
+    assert.equal(result.status, "completed", result.error);
+    assert.equal(result.threadId, "side-thread");
+    assert.equal(result.completedTurnId, "side-turn");
+  }
+  await runtime.close();
+});
+
+test("observer refuses a changed checkpoint, writable sandbox, or inherited tool server before dispatch", async () => {
+  for (const failure of ["checkpoint", "sandbox", "server"]) {
+    const runtime = fake(`
+      if(r.method === 'config/read') return reply(r,{config:{mcp_servers:{}}});
+      if(r.method === 'thread/fork') return reply(r,{thread:{id:'side',turns:[{id:${JSON.stringify(failure === "checkpoint" ? "wrong" : "checkpoint")}}]},sandbox:{type:${JSON.stringify(failure === "sandbox" ? "workspaceWrite" : "readOnly")},networkAccess:false}});
+      if(r.method === 'mcpServerStatus/list') return reply(r,{data:[{name:'remote',runtimeStatus:'connected'}]});
+      if(r.method === 'turn/start') process.exit(99);
+    `);
+    const handle = await runtime.start(
+      {
+        cwd: process.cwd(),
+        prompt: "observe",
+        observer: true,
+        fork: { threadId: "source", turnId: "checkpoint" },
+      },
+      () => {},
+    );
+    assert.equal((await handle.accepted).status, "rejected");
+    const result = await handle.done;
+    assert.equal(result.status, "failed");
+    assert.match(result.error!, /checkpoint|sandbox|enabled tool server/);
+    await runtime.close();
+  }
+});
 
 test("steering submitted during startup waits for its own native turn", async () => {
   const runtime = fake(`

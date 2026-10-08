@@ -1,5 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type {
@@ -11,6 +13,7 @@ import type {
   RuntimeOptions,
   Reasoning,
   Usage,
+  RuntimeAcceptance,
 } from "../shared/types.ts";
 
 interface CodexRuntimeOptions {
@@ -30,6 +33,24 @@ const string = (value: unknown): string =>
   typeof value === "string" ? value : "";
 const message = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+class RpcRejection extends Error {}
+
+const observerConfig: JsonObject = {
+  "features.shell_tool": false,
+  "features.unified_exec": false,
+  "features.apps": false,
+  "features.plugins": false,
+  "features.hooks": false,
+  "features.multi_agent": false,
+  "agents.enabled": false,
+  "features.browser_use": false,
+  "features.computer_use": false,
+  "features.image_generation": false,
+  web_search: "disabled",
+  notify: [],
+  "shell_environment_policy.inherit": "none",
+};
 
 function nativeInput(
   text: string,
@@ -133,7 +154,12 @@ function executable(): string {
 
 export class CodexRuntime implements Runtime {
   readonly name = "Codex App Server";
-  readonly capabilities = { inject: true, interrupt: true, readOnly: true };
+  readonly capabilities = {
+    inject: true,
+    interrupt: true,
+    readOnly: true,
+    fork: true,
+  };
   private readonly active = new Set<RuntimeHandle>();
   private closed = false;
 
@@ -298,6 +324,26 @@ export class CodexRuntime implements Runtime {
     onEvent: (event: RuntimeEvent) => void,
   ): Promise<RuntimeHandle> {
     if (this.closed) throw new Error("Runtime is closed");
+    if (input.fork && (!input.observer || input.threadId))
+      throw new Error("A fork requires a new observer session");
+    if (input.observer) {
+      const skills = await Promise.all(
+        (input.skills ?? []).map(async (skill) => {
+          const path = realpathSync.native(skill.path);
+          if (!statSync(path).isFile() || statSync(path).size > 1_048_576)
+            throw new Error("Observer skill must be a text file below 1 MiB");
+          return `Explicit skill ${JSON.stringify(skill.name)} (${JSON.stringify(path)}):\n${await readFile(path, "utf8")}`;
+        }),
+      );
+      input = {
+        ...input,
+        readOnly: true,
+        writableRoots: [],
+        env: {},
+        skills: [],
+        prompt: [...skills, input.prompt].join("\n\n"),
+      };
+    }
     input = {
       ...input,
       cwd: realpathSync.native(input.cwd),
@@ -329,6 +375,9 @@ export class CodexRuntime implements Runtime {
         prompt: `The project to review is ${input.cwd}. The execution directory is ${reportCwd}. Only the report directories are writable. Inspect the project using its absolute path.\n\n${input.prompt}`,
       };
     const args = ["app-server", "--listen", "stdio://"];
+    if (input.observer)
+      for (const [key, value] of Object.entries(observerConfig))
+        args.push("-c", `${key}=${JSON.stringify(value)}`);
     if (process.platform === "win32")
       args.push(
         "-c",
@@ -339,7 +388,13 @@ export class CodexRuntime implements Runtime {
       this.options.args ?? args,
       {
         cwd: input.cwd,
-        env: { ...process.env, ...input.env },
+        env: input.observer
+          ? Object.fromEntries(
+              Object.entries(process.env).filter(
+                ([key]) => !/^(HARNESS|LOOM)_/i.test(key),
+              ),
+            )
+          : { ...process.env, ...input.env },
         windowsHide: true,
         detached: process.platform !== "win32",
         stdio: ["pipe", "pipe", "pipe"],
@@ -385,6 +440,9 @@ class CodexExecution {
   private stderr = "";
   private readonly secrets: string[];
   private resolveDone!: (result: RuntimeResult) => void;
+  private resolveAccepted!: (result: RuntimeAcceptance) => void;
+  private acceptance?: RuntimeAcceptance;
+  private completedTurnId?: string;
   private initialization?: Promise<void>;
 
   constructor(
@@ -403,7 +461,11 @@ class CodexExecution {
     const done = new Promise<RuntimeResult>((resolve) => {
       this.resolveDone = resolve;
     });
+    const accepted = new Promise<RuntimeAcceptance>((resolve) => {
+      this.resolveAccepted = resolve;
+    });
     this.handle = {
+      accepted,
       done,
       pid: child.pid,
       interrupt: () => this.interrupt(),
@@ -423,6 +485,10 @@ class CodexExecution {
       this.phase = "closed";
       clearTimeout(this.shutdownTimer);
       this.rejectPending(new Error("Codex process exited"));
+      this.setAcceptance({
+        status: this.turnRequested ? "uncertain" : "rejected",
+        reason: "Codex process exited before turn acceptance",
+      });
       if (this.result?.status === "completed" && code !== 0)
         this.result = this.snapshot(
           "failed",
@@ -459,6 +525,34 @@ class CodexExecution {
       "shell_environment_policy.inherit": "all",
       "shell_environment_policy.set": this.input.env ?? {},
     };
+    if (this.input.observer) {
+      Object.assign(config, observerConfig, {
+        "shell_environment_policy.set": {},
+      });
+      const effective = object(
+        await this.request("config/read", {
+          cwd: this.input.cwd,
+          includeLayers: false,
+        }),
+      );
+      for (const name of Object.keys(
+        object(object(effective.config).mcp_servers),
+      ))
+        config[`mcp_servers.${name}.enabled`] = false;
+      const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
+      config["mcp_servers.loom_observer"] = {
+        command: process.execPath,
+        args: [
+          fileURLToPath(
+            new URL(`./observer-tools.${extension}`, import.meta.url),
+          ),
+          "--serve",
+          this.input.cwd,
+        ],
+        enabled: true,
+        required: true,
+      };
+    }
     if (reportProfile)
       config[`permissions.${reportProfile}`] = {
         filesystem: {
@@ -470,24 +564,81 @@ class CodexExecution {
         network: { enabled: true },
       };
     const response = object(
-      await this.request(this.threadId ? "thread/resume" : "thread/start", {
-        ...(this.threadId ? { threadId: this.threadId } : {}),
-        cwd: resolve(this.input.cwd),
-        model: this.input.model,
-        approvalPolicy: "never",
-        ...(reportProfile
-          ? { permissions: reportProfile }
-          : { sandbox: this.input.readOnly ? "read-only" : "workspace-write" }),
-        config,
-      }),
+      await this.request(
+        this.input.fork
+          ? "thread/fork"
+          : this.threadId
+            ? "thread/resume"
+            : "thread/start",
+        {
+          ...(this.input.fork
+            ? {
+                threadId: this.input.fork.threadId,
+                lastTurnId: this.input.fork.turnId,
+                deferGoalContinuation: true,
+              }
+            : this.threadId
+              ? { threadId: this.threadId }
+              : {}),
+          cwd: resolve(this.input.cwd),
+          model: this.input.model,
+          approvalPolicy: "never",
+          ...(reportProfile
+            ? { permissions: reportProfile }
+            : {
+                sandbox: this.input.readOnly ? "read-only" : "workspace-write",
+              }),
+          config,
+        },
+      ),
     );
     this.threadId = string(object(response.thread).id);
+    if (this.input.fork && this.threadId === this.input.fork.threadId)
+      throw new Error("Codex did not create an independent fork");
     const turns = object(response.thread).turns;
+    if (
+      this.input.fork &&
+      (!Array.isArray(turns) ||
+        string(object(turns.at(-1)).id) !== this.input.fork.turnId)
+    )
+      throw new Error("Codex fork did not preserve the requested checkpoint");
     if (Array.isArray(turns)) {
       for (const turn of turns) this.previousTurns.add(string(object(turn).id));
       this.lastPreviousTurn = string(object(turns.at(-1)).id) || undefined;
     }
     if (!this.threadId) throw new Error("Codex did not return a thread ID");
+    if (this.input.observer) {
+      const sandbox = object(response.sandbox);
+      if (sandbox.type !== "readOnly" || sandbox.networkAccess !== false)
+        throw new Error("Codex did not enforce the observer sandbox");
+      let cursor: string | undefined;
+      const cursors = new Set<string>();
+      do {
+        const page = object(
+          await this.request("mcpServerStatus/list", {
+            threadId: this.threadId,
+            limit: 100,
+            ...(cursor ? { cursor } : {}),
+          }),
+        );
+        if (!Array.isArray(page.data))
+          throw new Error("Codex did not report observer tool isolation");
+        for (const value of page.data) {
+          const server = object(value);
+          if (
+            server.name !== "loom_observer" &&
+            server.runtimeStatus !== "disabled"
+          )
+            throw new Error(
+              `Observer inherited an enabled tool server: ${string(server.name)}`,
+            );
+        }
+        cursor = string(page.nextCursor) || undefined;
+        if (cursor && cursors.has(cursor))
+          throw new Error("Codex repeated its tool catalog cursor");
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+    }
     this.emit({
       type: "thread.started",
       threadId: this.threadId,
@@ -495,7 +646,7 @@ class CodexExecution {
     });
     if (this.phase !== "starting") return;
     const sandboxPolicy = this.input.readOnly
-      ? { type: "readOnly", networkAccess: true }
+      ? { type: "readOnly", networkAccess: !this.input.observer }
       : {
           type: "workspaceWrite",
           writableRoots: (this.input.writableRoots ?? []).map((root) =>
@@ -506,22 +657,44 @@ class CodexExecution {
           excludeSlashTmp: true,
         };
     this.turnRequested = true;
-    const turn = object(
-      await this.request("turn/start", {
-        threadId: this.threadId,
-        cwd: resolve(this.input.cwd),
-        input: nativeInput(this.input.prompt, this.input),
-        model: this.input.model,
-        effort: this.input.reasoning,
-        approvalPolicy: "never",
-        ...(reportProfile ? { permissions: reportProfile } : { sandboxPolicy }),
-      }),
-    );
-    if (this.phase !== "starting") return;
+    let turn: JsonObject;
+    try {
+      turn = object(
+        await this.request("turn/start", {
+          threadId: this.threadId,
+          cwd: resolve(this.input.cwd),
+          input: nativeInput(this.input.prompt, this.input),
+          model: this.input.model,
+          effort: this.input.reasoning,
+          approvalPolicy: "never",
+          ...(reportProfile
+            ? { permissions: reportProfile }
+            : { sandboxPolicy }),
+        }),
+      );
+    } catch (error) {
+      this.setAcceptance({
+        status: error instanceof RpcRejection ? "rejected" : "uncertain",
+        reason: message(error),
+      });
+      throw error;
+    }
     this.turnId = string(object(turn.turn).id);
     if (!this.turnId) throw new Error("Codex did not return a turn ID");
+    this.setAcceptance({
+      status: "accepted",
+      threadId: this.threadId,
+      turnId: this.turnId,
+    });
+    if (this.phase !== "starting") return;
     this.phase = "running";
     this.emit({ type: "turn.started", detail: { turnId: this.turnId } });
+  }
+
+  private setAcceptance(result: RuntimeAcceptance): void {
+    if (this.acceptance) return;
+    this.acceptance = result;
+    this.resolveAccepted(result);
   }
 
   private emit(event: RuntimeEvent): void {
@@ -581,7 +754,7 @@ class CodexExecution {
       this.pending.delete(Number(packet.id));
       if (packet.error)
         pending.reject(
-          new Error(
+          new RpcRejection(
             string(object(packet.error).message) || "Codex request failed",
           ),
         );
@@ -626,8 +799,17 @@ class CodexExecution {
     if (method === "model/rerouted" && string(params.toModel))
       this.emit({ type: "model.resolved", model: string(params.toModel) });
     const item = object(params.item);
-    if (method === "turn/started")
-      this.turnId = string(object(params.turn).id) || this.turnId;
+    if (method === "turn/started") {
+      const startedId = string(object(params.turn).id);
+      if (this.previousTurns.has(startedId)) return;
+      this.turnId = startedId || this.turnId;
+      if (this.turnRequested && this.threadId && this.turnId)
+        this.setAcceptance({
+          status: "accepted",
+          threadId: this.threadId,
+          turnId: this.turnId,
+        });
+    }
     if (method === "item/agentMessage/delta") {
       const id = string(params.itemId);
       const delta = string(params.delta);
@@ -699,7 +881,10 @@ class CodexExecution {
           (previous && params.turnId === this.lastPreviousTurn && !this.usage)
         )
           this.baseline = current;
-        else if (!previous && (!this.input.threadId || this.baseline)) {
+        else if (
+          !previous &&
+          ((!this.input.threadId && !this.input.fork) || this.baseline)
+        ) {
           this.usage = {
             inputTokens:
               current.inputTokens - (this.baseline?.inputTokens ?? 0),
@@ -717,12 +902,27 @@ class CodexExecution {
     }
     if (method === "turn/completed") {
       const turn = object(params.turn);
+      const completedId = string(turn.id);
+      if (
+        !this.turnRequested ||
+        this.previousTurns.has(completedId) ||
+        (this.turnId && completedId !== this.turnId)
+      )
+        return;
+      if (completedId && this.threadId)
+        this.setAcceptance({
+          status: "accepted",
+          threadId: this.threadId,
+          turnId: completedId,
+        });
       const status = turn.status;
       if (
         status === "completed" ||
         status === "interrupted" ||
         status === "failed"
       ) {
+        if (status === "completed")
+          this.completedTurnId = string(turn.id) || undefined;
         this.stop(
           this.snapshot(
             status,
@@ -740,6 +940,9 @@ class CodexExecution {
     return {
       status,
       threadId: this.threadId,
+      ...(this.completedTurnId
+        ? { completedTurnId: this.completedTurnId }
+        : {}),
       text: string(
         redact([...this.messages.values()].join("\n"), this.secrets),
       ),
@@ -758,6 +961,13 @@ class CodexExecution {
 
   private fail(error: unknown): void {
     if (this.phase === "stopping" || this.phase === "closed") return;
+    this.setAcceptance({
+      status:
+        this.turnRequested && !(error instanceof RpcRejection)
+          ? "uncertain"
+          : "rejected",
+      reason: message(error),
+    });
     this.stop(
       this.snapshot(
         this.interrupted ? "interrupted" : "failed",
@@ -770,6 +980,10 @@ class CodexExecution {
     if (this.phase === "stopping" || this.phase === "closed") return;
     this.phase = "stopping";
     this.result = result;
+    this.setAcceptance({
+      status: this.turnRequested ? "uncertain" : "rejected",
+      reason: "Execution stopped before turn acceptance",
+    });
     clearTimeout(this.shutdownTimer);
     this.rejectPending(new Error("Codex execution stopped"));
     this.child.stdin.end();
@@ -833,6 +1047,7 @@ class CodexExecution {
     text: string,
     input?: Pick<RuntimeInput, "attachments" | "skills">,
   ): Promise<boolean> {
+    if (this.input.observer) return false;
     const items = nativeInput(text, input);
     if (this.phase === "starting") await this.initialization;
     if (

@@ -63,10 +63,40 @@ export interface Metrics {
   usage: Usage;
   costUsd: number | null;
 }
+export type DelegationPolicy = { enabled: false } | { enabled: true; maxDepth: number; maxConcurrent: number; models?: string[] };
+export type AgentCommand =
+  | { op: "spawn"; requestId: string; title: string; prompt: string; access?: "read" | "write"; model?: string; reasoning?: Reasoning }
+  | { op: "send"; requestId: string; sessionId: string; prompt: string }
+  | { op: "list" | "wait"; sessionIds?: string[] }
+  | { op: "integrate" | "discard"; requestId: string; sessionId: string; executionId: string }
+  | { op: "cancel"; sessionId: string };
+export interface ChildSession {
+  parentSessionId: string;
+  depth: number;
+  state: "preparing" | "active" | "waiting" | "finished" | "interrupted" | "failed" | "cancelled";
+  access: "read" | "write";
+  workspace: Workspace;
+  resultExecutionId?: string;
+  output: "none" | "pending" | "integrated" | "discarded" | "conflict";
+  outputSha?: string;
+  error?: string;
+}
+export interface AgentReceipt {
+  requestId: string;
+  fingerprint: string;
+  op: string;
+  sessionId?: string;
+  executionId?: string;
+  status: "pending" | "completed" | "failed";
+  result?: unknown;
+  error?: string;
+}
+export interface ChildNotice { sessionId: string; executionId: string; consumed?: boolean }
 export interface AgentTemplate {
   id: string;
   name: string;
   version: number;
+  delegation?: DelegationPolicy;
   model?: string;
   reasoning?: Reasoning;
   skills: string[];
@@ -78,6 +108,7 @@ export interface UnitConfig {
   name: string;
   kind: "agent" | "command";
   templateId?: string;
+  delegation?: DelegationPolicy;
   model?: string;
   reasoning?: Reasoning;
   skills: string[];
@@ -116,6 +147,9 @@ export interface Session {
   title: string;
   kind: "free" | "task" | "sidechat" | "interview";
   source?: ObserverSource;
+  child?: ChildSession;
+  agentReceipts?: AgentReceipt[];
+  childNotices?: ChildNotice[];
   acceptedConfig?: ResolvedConfig;
   lastCompletedTurnId?: string;
   graphId?: string;
@@ -314,6 +348,9 @@ export interface RuntimeInput {
   readOnly?: boolean;
   writableRoots?: string[];
   observer?: boolean;
+  delegation?: "disabled" | "managed";
+  child?: boolean;
+  agentTool?: (command: AgentCommand) => Promise<unknown>;
   fork?: { threadId: string; turnId: string };
   env?: Record<string, string>;
   attachments?: (Attachment & { path: string })[];
@@ -361,6 +398,8 @@ export interface Runtime {
   discoverOptions?(cwd: string): Promise<RuntimeOptions>;
 }
 export interface GitAdapter {
+  createChild?(parent: Workspace, sessionId: string): Promise<Workspace>;
+  integrateChild?(parent: Workspace, child: Workspace, sha: string, operationId: string): Promise<string>;
   createGraph(
     projectRoot: string,
     graphId: string,
@@ -396,6 +435,7 @@ export interface ContextSelection {
   files?: string[];
 }
 export interface ResolvedConfig {
+  delegation?: DelegationPolicy;
   revision: number;
   model?: string;
   reasoning?: Reasoning;

@@ -111,6 +111,10 @@ export class HarnessEngine {
       const session = this.session(execution.sessionId);
       session.status = "interrupted";
       session.error = execution.error;
+      for (const notice of session.childNotices ?? []) if (notice.observedExecutionId === execution.id) {
+        notice.consumed = false;
+        delete notice.observedExecutionId;
+      }
       if (session.child) {
         session.child.state = "interrupted";
         session.child.error = execution.error;
@@ -1355,7 +1359,7 @@ export class HarnessEngine {
       sessionId: session.id, title: session.title, threadId: session.threadId,
       ...session.child, config: session.acceptedConfig ?? session.child?.config,
       executionId: execution?.id,
-      result: execution ? session.messages.filter((m) => m.role === "assistant" && m.at >= execution.startedAt).map((m) => m.text).join("\n") : undefined,
+      result: execution?.result,
       metrics: execution?.metrics, usageKnown: execution?.usageKnown,
     };
   }
@@ -1403,7 +1407,7 @@ export class HarnessEngine {
     if (graph.status !== "running") return;
     const task = this.task(graph, session.taskId!);
     const unit = task.units.find((u) => u.id === session.unitId)!;
-    if (session.child?.state === "cancelled" || task.status === "done") return;
+    if ((session.child && ["cancelled", "failed", "interrupted"].includes(session.child.state)) || ["done", "blocked"].includes(task.status)) return;
     if (this.state.preparations.some((p) => p.sessionId === session.id && p.receipt.status === "uncertain")) return;
     if (session.child) session.child.state = "active";
     else { task.status = unit.readOnly ? "reviewing" : "running"; unit.status = "running"; }
@@ -1441,7 +1445,10 @@ export class HarnessEngine {
         throw new Error("Only direct children may be inspected");
       const selected = children.filter((s) => !command.sessionIds || command.sessionIds.includes(s.id));
       for (const child of selected) for (const notice of parent.childNotices ?? [])
-        if (notice.sessionId === child.id && notice.executionId === child.child!.resultExecutionId) notice.consumed = true;
+        if (!notice.consumed && notice.sessionId === child.id && notice.executionId === child.child!.resultExecutionId) {
+          notice.consumed = true;
+          notice.observedExecutionId = execution.id;
+        }
       this.record("agent.observed", "读取子会话结果", { sessionId: parent.id });
       return { children: selected.map((s) => this.childResult(s)), guidance: "This is a snapshot, not a blocking wait. If children are still working, end this turn. Loom will resume this same session when results arrive; do not repeatedly poll." };
     }
@@ -1858,6 +1865,12 @@ export class HarnessEngine {
         session.lastCompletedTurnId = result.completedTurnId;
       session.status = result.status === "completed" ? "idle" : result.status;
       session.error = result.error;
+      if (result.status !== "completed") {
+        for (const notice of session.childNotices ?? []) if (notice.observedExecutionId === execution.id) {
+          notice.consumed = false;
+          delete notice.observedExecutionId;
+        }
+      }
       if (result.status !== "completed") session.queuePaused = true;
       const seconds = (Date.now() - Date.parse(execution.startedAt)) / 1000;
       session.metrics.seconds += seconds;
@@ -1878,6 +1891,7 @@ export class HarnessEngine {
         context.unit.metrics = structuredClone(session.metrics);
       }
       result.text = result.text.replaceAll(token, "[execution credential]");
+      execution.result = result.text;
       if (result.error)
         result.error = result.error.replaceAll(token, "[execution credential]");
       if (

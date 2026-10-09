@@ -297,3 +297,29 @@ test("shutdown drains a child workspace operation after the native parent turn i
   assert.equal(stopped, true);
   assert.equal(f.runtime.turns.length, 1);
 });
+
+test("a continued child returns only the exact execution result even when message timestamps overlap", async (t) => {
+  const f = fixture(t); await begin(f);
+  const child = await call(f, 0, { op: "spawn", requestId: "child", title: "reader", prompt: "read", access: "read" });
+  f.runtime.turns[1].finish({ text: "old result" }); await flush();
+  await call(f, 0, { op: "send", requestId: "continue", sessionId: child.sessionId, prompt: "again" });
+  const session = f.engine.session(child.sessionId);
+  const current = f.engine.state.executions.findLast((e) => e.sessionId === child.sessionId)!;
+  session.messages.find((m) => m.text === "old result")!.at = current.startedAt;
+  f.runtime.turns[2].finish({ text: "new result" }); await flush();
+  const result = await f.runtime.turns[0].input.agentTool!({ op: "wait", sessionIds: [child.sessionId] }) as { children: { result: string }[] };
+  assert.equal(result.children[0].result, "new result");
+});
+
+test("a lost result observation is redelivered after an interrupted parent resumes", async (t) => {
+  const f = fixture(t), graph = await begin(f);
+  await call(f, 0, { op: "spawn", requestId: "reader", title: "reader", prompt: "read", access: "read" });
+  f.runtime.turns[1].finish({ text: "durable child result" }); await flush();
+  await call(f, 0, { op: "wait" });
+  await f.engine.pauseGraph(graph.id, "hard"); await flush();
+  const parent = f.engine.session(graph.tasks[0].units[0].sessionId!);
+  assert.equal(parent.childNotices!.filter((n) => !n.consumed).length, 1);
+  f.engine.resumeGraph(graph.id); await flush();
+  assert.match(f.runtime.turns[2].input.prompt, /durable child result/);
+  assert.equal(parent.childNotices!.filter((n) => !n.consumed).length, 0);
+});

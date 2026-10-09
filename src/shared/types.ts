@@ -94,7 +94,7 @@ export interface AgentReceipt {
   result?: unknown;
   error?: string;
 }
-export interface ChildNotice { sessionId: string; executionId: string; consumed?: boolean }
+export interface ChildNotice { sessionId: string; executionId: string; consumed?: boolean; observedExecutionId?: string }
 export interface AgentTemplate {
   id: string;
   name: string;
@@ -311,6 +311,7 @@ export interface Execution {
   reasoning?: Reasoning;
   metrics?: Metrics;
   usageKnown?: boolean;
+  result?: string;
 }
 export interface ProjectState {
   version: 1;

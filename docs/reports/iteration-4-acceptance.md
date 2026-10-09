@@ -30,7 +30,7 @@ Local logs and independent reports are under `output/agentic/`: `owner-full-test
 
 The first live attempt failed because nested Git branch names exceeded Windows path limits. It remains recorded in `output/agentic/live-1791570584687`. Child workspace paths, branch names and operation refs were bounded, and the unchanged project path passed on the next attempt.
 
-`output/agentic/pause-acceptance.mjs` separately waited for confirmed native input acceptance before pausing. `output/agentic/pause-1791571224910/hard.json` shows the child interrupted and no later launches. `soft.json` shows both accepted turns completed, with the parent continuation and outer reviewer held until resume. The final pause checks ran on the result-observation fix.
+`output/agentic/pause-acceptance.mjs` separately waited for confirmed native input acceptance before pausing. `output/agentic/pause-1791571224910/hard.json` shows the child interrupted and no later launches. That child retains `no active turn to interrupt` and unknown token usage; this verifies a settled stop, not a clean native interruption acknowledgement or complete usage for that attempt. `soft.json` shows both accepted turns completed, with no parent continuation or outer review launched while paused. Resuming after soft pause is covered by the lifecycle tests, not that live pause driver. The final pause checks ran on the result-observation fix.
 
 ## Browser
 

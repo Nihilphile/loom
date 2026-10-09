@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type {
+  AgentCommand,
   Runtime,
   RuntimeEvent,
   RuntimeHandle,
@@ -92,6 +93,98 @@ const reasoningValues: Reasoning[] = [
 ];
 const reasoning = (value: unknown): value is Reasoning =>
   reasoningValues.includes(value as Reasoning);
+
+const agentFields = {
+  requestId: { type: "string", minLength: 1 },
+  title: { type: "string", minLength: 1 },
+  prompt: { type: "string", minLength: 1 },
+  access: { type: "string", enum: ["read", "write"] },
+  model: { type: "string", minLength: 1 },
+  reasoning: { type: "string", enum: reasoningValues },
+  sessionId: { type: "string", minLength: 1 },
+  executionId: { type: "string", minLength: 1 },
+  sessionIds: { type: "array", items: { type: "string", minLength: 1 } },
+};
+type AgentField = keyof typeof agentFields;
+const agentOperations: Record<
+  AgentCommand["op"],
+  { required: AgentField[]; optional: AgentField[] }
+> = {
+  spawn: {
+    required: ["requestId", "title", "prompt"],
+    optional: ["access", "model", "reasoning"],
+  },
+  send: { required: ["requestId", "sessionId", "prompt"], optional: [] },
+  list: { required: [], optional: ["sessionIds"] },
+  wait: { required: [], optional: ["sessionIds"] },
+  integrate: {
+    required: ["requestId", "sessionId", "executionId"],
+    optional: [],
+  },
+  discard: {
+    required: ["requestId", "sessionId", "executionId"],
+    optional: [],
+  },
+  cancel: { required: ["sessionId"], optional: [] },
+};
+const agentToolDefinition = {
+  type: "function",
+  name: "loom_agent",
+  description:
+    "Manage Loom child sessions. Reuse requestId when retrying a mutation. Use list or wait to inspect children; integrate or discard a specific completed execution.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      op: { type: "string", enum: Object.keys(agentOperations) },
+      ...agentFields,
+    },
+    required: ["op"],
+    additionalProperties: false,
+    oneOf: Object.entries(agentOperations).map(([op, fields]) => ({
+      properties: { op: { const: op } },
+      required: fields.required,
+    })),
+  },
+};
+
+function agentCommand(value: unknown): AgentCommand {
+  const command = object(value);
+  const op = string(command.op);
+  if (!Object.hasOwn(agentOperations, op))
+    throw new Error("Invalid agent operation");
+  const fields = agentOperations[op as AgentCommand["op"]];
+  if (fields.required.some((key) => !(key in command)))
+    throw new Error("Missing agent command field");
+  for (const [key, value] of Object.entries(command)) {
+    if (key === "op") continue;
+    if (![...fields.required, ...fields.optional].includes(key as AgentField))
+      throw new Error("Unexpected agent command field");
+    if (key === "sessionIds") {
+      if (
+        !Array.isArray(value) ||
+        value.some((id) => typeof id !== "string" || !id.trim())
+      )
+        throw new Error("Invalid sessionIds");
+    } else if (
+      typeof value !== "string" ||
+      !value.trim() ||
+      (key === "access" && value !== "read" && value !== "write") ||
+      (key === "reasoning" && !reasoning(value))
+    )
+      throw new Error("Invalid agent command field");
+  }
+  return command as unknown as AgentCommand;
+}
+
+function childEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(env).filter(
+      ([key]) =>
+        !/^(HARNESS|LOOM)/i.test(key) &&
+        !/^UNIT_.*(REPORT|TOKEN|SECRET|KEY|PASSWORD|URL|ADDRESS)/i.test(key),
+    ),
+  );
+}
 
 function redact(value: unknown, secrets: string[]): unknown {
   if (typeof value === "string")
@@ -378,6 +471,8 @@ export class CodexRuntime implements Runtime {
     if (input.observer)
       for (const [key, value] of Object.entries(observerConfig))
         args.push("-c", `${key}=${JSON.stringify(value)}`);
+    if (input.delegation || input.child)
+      args.push("-c", "agents.enabled=false");
     if (process.platform === "win32")
       args.push(
         "-c",
@@ -388,13 +483,10 @@ export class CodexRuntime implements Runtime {
       this.options.args ?? args,
       {
         cwd: input.cwd,
-        env: input.observer
-          ? Object.fromEntries(
-              Object.entries(process.env).filter(
-                ([key]) => !/^(HARNESS|LOOM)_/i.test(key),
-              ),
-            )
-          : { ...process.env, ...input.env },
+        env:
+          input.observer || input.child
+            ? childEnvironment({ ...process.env, ...input.env })
+            : { ...process.env, ...input.env },
         windowsHide: true,
         detached: process.platform !== "win32",
         stdio: ["pipe", "pipe", "pipe"],
@@ -444,6 +536,7 @@ class CodexExecution {
   private acceptance?: RuntimeAcceptance;
   private completedTurnId?: string;
   private initialization?: Promise<void>;
+  private readonly toolReplies = new Map<unknown, () => void>();
 
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
@@ -483,6 +576,7 @@ class CodexExecution {
     child.on("error", (error) => this.fail(error));
     child.on("close", (code, signal) => {
       this.phase = "closed";
+      this.cancelToolReplies();
       clearTimeout(this.shutdownTimer);
       this.rejectPending(new Error("Codex process exited"));
       this.setAcceptance({
@@ -525,6 +619,15 @@ class CodexExecution {
       "shell_environment_policy.inherit": "all",
       "shell_environment_policy.set": this.input.env ?? {},
     };
+    if (this.input.delegation || this.input.child)
+      config["agents.enabled"] = false;
+    if (this.input.child) {
+      config["shell_environment_policy.inherit"] = "none";
+      config["shell_environment_policy.set"] = childEnvironment({
+        ...process.env,
+        ...this.input.env,
+      });
+    }
     if (this.input.observer) {
       Object.assign(config, observerConfig, {
         "shell_environment_policy.set": {},
@@ -603,6 +706,12 @@ class CodexExecution {
                 sandbox: this.input.readOnly ? "read-only" : "workspace-write",
               }),
           config,
+          ...(!this.threadId &&
+          !this.input.fork &&
+          this.input.delegation === "managed" &&
+          !this.input.observer
+            ? { dynamicTools: [agentToolDefinition] }
+            : {}),
         },
       ),
     );
@@ -778,6 +887,10 @@ class CodexExecution {
     const method = string(packet.method);
     const params = object(packet.params);
     if (packet.id !== undefined) {
+      if (method === "item/tool/call") {
+        this.callAgentTool(packet.id, params);
+        return;
+      }
       this.emit({
         type: "log",
         text: `Declined unsupported server request: ${method}`,
@@ -947,6 +1060,76 @@ class CodexExecution {
     }
   }
 
+  private cancelToolReplies(): void {
+    for (const cancel of this.toolReplies.values()) cancel();
+    this.toolReplies.clear();
+  }
+
+  private callAgentTool(id: unknown, params: JsonObject): void {
+    if (this.toolReplies.has(id)) return;
+    let settled = false;
+    const reply = (success: boolean, value: unknown) => {
+      if (settled) return;
+      settled = true;
+      this.toolReplies.delete(id);
+      if (
+        this.phase === "closed" ||
+        this.child.stdin.destroyed ||
+        this.child.stdin.writableEnded
+      )
+        return;
+      try {
+        this.write({
+          id,
+          result: {
+            contentItems: [
+              {
+                type: "inputText",
+                text: JSON.stringify(redact(value, this.secrets)) ?? "null",
+              },
+            ],
+            success,
+          },
+        });
+      } catch (error) {
+        this.fail(error);
+      }
+    };
+    if (
+      this.input.delegation !== "managed" ||
+      this.input.observer ||
+      !this.input.agentTool ||
+      params.tool !== "loom_agent" ||
+      params.threadId !== this.threadId ||
+      params.turnId !== this.turnId ||
+      !this.turnRequested ||
+      this.interrupted ||
+      this.phase === "stopping"
+    ) {
+      reply(false, { error: "Agent tool is unavailable for this execution" });
+      return;
+    }
+    let command: AgentCommand;
+    try {
+      command = agentCommand(params.arguments);
+    } catch (error) {
+      reply(false, { error: message(error) });
+      return;
+    }
+    this.toolReplies.set(id, () =>
+      reply(false, { error: "Execution stopped" }),
+    );
+    void Promise.resolve()
+      .then(() => {
+        if (settled) return;
+        return this.input.agentTool!(command);
+      })
+      .then(
+        (result) => reply(true, result),
+        () => reply(false, { error: "Agent command failed" }),
+      );
+  }
+
   private snapshot(
     status: RuntimeResult["status"],
     error?: string,
@@ -992,6 +1175,7 @@ class CodexExecution {
 
   private stop(result: RuntimeResult): void {
     if (this.phase === "stopping" || this.phase === "closed") return;
+    this.cancelToolReplies();
     this.phase = "stopping";
     this.result = result;
     this.setAcceptance({
@@ -1040,6 +1224,7 @@ class CodexExecution {
       return;
     }
     this.interrupted = true;
+    this.cancelToolReplies();
     if (this.threadId && this.turnId) {
       this.shutdownTimer ??= setTimeout(() => {
         this.stop(this.snapshot("interrupted"));

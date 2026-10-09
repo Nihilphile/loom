@@ -819,3 +819,195 @@ test(
     }
   },
 );
+
+test("managed agent commands use the native dynamic tool wire and execution callback", async () => {
+  const runtime = fake(`
+    if (r.method === 'thread/start') {
+      const tool = r.params.dynamicTools?.[0];
+      if (tool?.name !== 'loom_agent' || tool.type !== 'function' || !tool.inputSchema.properties.op.enum.includes('integrate') || r.params.config['agents.enabled'] !== false) process.exit(8);
+    }
+    if (r.method === 'turn/start') {
+      reply(r,{turn:{id:'active'}});
+      notify('turn/started',{threadId:'thread-one',turn:{id:'active'}});
+      send({id:0,method:'item/tool/call',params:{threadId:'thread-one',turnId:'active',callId:'call-1',tool:'loom_agent',arguments:{op:'spawn',requestId:'r1',title:'child',prompt:'inspect',access:'read'}}});
+    }
+    if (r.id === 0 && !r.method) {
+      if (r.result.success !== true || r.result.contentItems[0].type !== 'inputText' || JSON.parse(r.result.contentItems[0].text).sessionId !== 'child-1') process.exit(9);
+      notify('turn/completed',{threadId:'thread-one',turn:{id:'active',status:'completed'}});
+    }
+  `);
+  const commands: unknown[] = [];
+  const handle = await runtime.start(
+    {
+      cwd: process.cwd(),
+      prompt: "go",
+      delegation: "managed",
+      agentTool: async (command) => {
+        commands.push(command);
+        return { sessionId: "child-1" };
+      },
+    },
+    () => {},
+  );
+  assert.equal((await handle.done).status, "completed");
+  assert.deepEqual(commands, [
+    {
+      op: "spawn",
+      requestId: "r1",
+      title: "child",
+      prompt: "inspect",
+      access: "read",
+    },
+  ]);
+});
+
+test("agent wire rejects foreign executions, disabled tools, invalid commands and callback errors", async () => {
+  for (const scenario of [
+    "disabled",
+    "foreign-thread",
+    "foreign-turn",
+    "unknown-tool",
+    "invalid",
+    "extra-field",
+    "failure",
+  ]) {
+    let called = 0;
+    const runtime = fake(`
+      if (r.method === 'thread/start' && ${JSON.stringify(scenario)} === 'disabled' && (r.params.dynamicTools || r.params.config['agents.enabled'] !== false)) process.exit(8);
+      if (r.method === 'turn/start') {
+        reply(r,{turn:{id:'active'}});
+        notify('turn/started',{threadId:'thread-one',turn:{id:'active'}});
+        send({id:'tool',method:'item/tool/call',params:{threadId:${JSON.stringify(scenario === "foreign-thread" ? "foreign" : "thread-one")},turnId:${JSON.stringify(scenario === "foreign-turn" ? "foreign" : "active")},tool:${JSON.stringify(scenario === "unknown-tool" ? "other" : "loom_agent")},arguments:${JSON.stringify(scenario === "invalid" ? { op: "spawn" } : scenario === "extra-field" ? { op: "list", token: "private" } : { op: "list" })}}});
+      }
+      if (r.id === 'tool' && !r.method) {
+        if (r.result.success !== false || JSON.stringify(r.result).includes('callback-secret')) process.exit(9);
+        notify('turn/completed',{threadId:'thread-one',turn:{id:'active',status:'completed'}});
+      }
+    `);
+    const handle = await runtime.start(
+      {
+        cwd: process.cwd(),
+        prompt: "go",
+        delegation: scenario === "disabled" ? "disabled" : "managed",
+        agentTool: async () => {
+          called++;
+          throw new Error("callback-secret");
+        },
+      },
+      () => {},
+    );
+    assert.equal((await handle.done).status, "completed", scenario);
+    assert.equal(called, scenario === "failure" ? 1 : 0, scenario);
+  }
+});
+
+test("interrupt settles a pending agent reply without waiting for its callback", async () => {
+  const runtime = fake(`
+    if (r.method === 'turn/start') {
+      reply(r,{turn:{id:'active'}});
+      notify('turn/started',{threadId:'thread-one',turn:{id:'active'}});
+      send({id:'tool',method:'item/tool/call',params:{threadId:'thread-one',turnId:'active',tool:'loom_agent',arguments:{op:'wait'}}});
+    }
+    if (r.id === 'tool' && !r.method && r.result.success !== false) process.exit(8);
+    if (r.method === 'turn/interrupt') {
+      reply(r,{});
+      notify('turn/completed',{threadId:'thread-one',turn:{id:'active',status:'interrupted'}});
+    }
+  `);
+  let entered!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let reject!: (reason: Error) => void;
+  const pending = new Promise<never>((_, fail) => {
+    reject = fail;
+  });
+  const handle = await runtime.start(
+    {
+      cwd: process.cwd(),
+      prompt: "go",
+      delegation: "managed",
+      agentTool: async () => {
+        entered();
+        return pending;
+      },
+    },
+    () => {},
+  );
+  await ready;
+  await handle.interrupt();
+  assert.equal((await handle.done).status, "interrupted");
+  reject(new Error("late callback failure"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.throws(() => process.kill(handle.pid!, 0));
+});
+
+test("child subprocess and shell environments remove inherited and explicit report credentials", async () => {
+  const original = process.env.HARNESS_PARENT_TOKEN;
+  process.env.HARNESS_PARENT_TOKEN = "parent-private";
+  try {
+    const runtime = fake(`
+      if (process.env.HARNESS_PARENT_TOKEN || process.env.LOOM_TOKEN || process.env.UNIT_REPORT_TOKEN) process.exit(8);
+      if (r.method === 'thread/start') {
+        const config = r.params.config;
+        const env = config['shell_environment_policy.set'];
+        if (config['shell_environment_policy.inherit'] !== 'none' || config['agents.enabled'] !== false || Object.keys(env).some(key => /^(HARNESS|LOOM|UNIT_REPORT)/i.test(key)) || env.CHILD_FIXTURE !== 'preserved') process.exit(9);
+      }
+      if (r.method === 'turn/start') {
+        if (r.params.sandboxPolicy.type !== 'readOnly') process.exit(10);
+        reply(r,{turn:{id:'active'}});
+        notify('turn/completed',{threadId:'thread-one',turn:{id:'active',status:'completed'}});
+      }
+    `);
+    const handle = await runtime.start(
+      {
+        cwd: process.cwd(),
+        prompt: "go",
+        child: true,
+        delegation: "disabled",
+        readOnly: true,
+        env: {
+          LOOM_TOKEN: "explicit-private",
+          UNIT_REPORT_TOKEN: "unit-private",
+          CHILD_FIXTURE: "preserved",
+        },
+      },
+      () => {},
+    );
+    assert.equal((await handle.done).status, "completed");
+  } finally {
+    if (original === undefined) delete process.env.HARNESS_PARENT_TOKEN;
+    else process.env.HARNESS_PARENT_TOKEN = original;
+  }
+});
+
+test("resumed managed threads route their persisted tool to the current callback", async () => {
+  const runtime = fake(`
+    if (r.method === 'thread/resume' && (r.params.dynamicTools || r.params.config['agents.enabled'] !== false)) process.exit(8);
+    if (r.method === 'turn/start') {
+      reply(r,{turn:{id:'active'}});
+      notify('turn/started',{threadId:'saved',turn:{id:'active'}});
+      send({id:'tool',method:'item/tool/call',params:{threadId:'saved',turnId:'active',tool:'loom_agent',arguments:{op:'list'}}});
+    }
+    if (r.id === 'tool' && !r.method) {
+      if (!r.result.success) process.exit(9);
+      notify('turn/completed',{threadId:'saved',turn:{id:'active',status:'completed'}});
+    }
+  `);
+  let called = false;
+  const handle = await runtime.start(
+    {
+      cwd: process.cwd(),
+      prompt: "go",
+      threadId: "saved",
+      delegation: "managed",
+      agentTool: async () => {
+        called = true;
+        return [];
+      },
+    },
+    () => {},
+  );
+  assert.equal((await handle.done).status, "completed");
+  assert.equal(called, true);
+});

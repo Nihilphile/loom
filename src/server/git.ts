@@ -254,21 +254,24 @@ async function merge(workspace: Workspace, shas: string[]): Promise<void> {
   }
 }
 
-function operationRef(workspace: Workspace, kind: string, id: string): string {
+function operationRef(workspace: Workspace, kind: string, id: string, legacy = false): string {
   if (!id || id.length > 512)
     throw new Error("An operation ID of 1–512 characters is required");
-  return `refs/newharness/operations/${hash(workspace.branch)}/${kind}/${hash(id)}`;
+  return legacy
+    ? `refs/newharness/operations/${hash(workspace.branch)}/${kind}/${hash(id)}`
+    : `refs/newharness/ops/${hash(JSON.stringify([workspace.branch, kind, id]))}`;
 }
 
 async function recorded(
   workspace: Workspace,
   ref: string,
+  legacyRef?: string,
 ): Promise<string | undefined> {
-  try {
-    return await git(workspace.path, ["rev-parse", "--verify", ref]);
-  } catch {
-    return undefined;
+  for (const candidate of [ref, legacyRef].filter((value): value is string => !!value)) {
+    try { return await git(workspace.path, ["rev-parse", "--verify", candidate]); }
+    catch {}
   }
+  return undefined;
 }
 
 export class GitWorkspaces implements GitAdapter {
@@ -276,9 +279,10 @@ export class GitWorkspaces implements GitAdapter {
     identifier(sessionId);
     const owner = await inspect(parent);
     const baseCommit = await this.snapshot(parent, "Child workspace baseline", `child-base/${sessionId}`);
-    const directoryPath = join(dirname(parent.path), "children");
-    const path = join(directoryPath, sessionId);
-    const branch = `${parent.branch}-child-${sessionId}`;
+    const directoryPath = join(owner.projectRoot, ".newharness", "children");
+    const identity = hash(sessionId).slice(0, 16);
+    const path = join(directoryPath, identity);
+    const branch = `newharness/child/${identity}`;
     return locked(path, async () => {
       await directory(directoryPath);
       let manifest = await readManifest(path);
@@ -303,7 +307,7 @@ export class GitWorkspaces implements GitAdapter {
     return locked(parent.path, async () => {
       await inspect(parent);
       const ref = operationRef(parent, "child", operationId);
-      const existing = await recorded(parent, ref);
+      const existing = await recorded(parent, ref, operationRef(parent, "child", operationId, true));
       if (existing) return existing;
       await merge(parent, [sha]);
       const result = await git(parent.path, ["rev-parse", "HEAD"]);
@@ -423,7 +427,7 @@ export class GitWorkspaces implements GitAdapter {
     return locked(workspace.path, async () => {
       await inspect(workspace);
       const ref = operationRef(workspace, "snapshot", operationId);
-      const existing = await recorded(workspace, ref);
+      const existing = await recorded(workspace, ref, operationRef(workspace, "snapshot", operationId, true));
       if (existing) return existing;
       await unmerged(workspace);
       if (await merging(workspace))
@@ -501,7 +505,7 @@ export class GitWorkspaces implements GitAdapter {
       if (manifest.kind !== "graph")
         throw new Error("Final merge requires a graph workspace");
       const ref = operationRef(workspace, "final", operationId);
-      const existing = await recorded(workspace, ref);
+      const existing = await recorded(workspace, ref, operationRef(workspace, "final", operationId, true));
       if (existing) return existing;
       await commits(workspace, shas);
       await merge(workspace, shas);

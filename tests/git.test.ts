@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { GitBlockedError, GitWorkspaces } from "../src/server/git.ts";
 
 const execute = promisify(execFile);
@@ -23,8 +23,8 @@ async function git(cwd: string, ...args: string[]) {
     )
   ).stdout.trim();
 }
-async function repository() {
-  const root = await mkdtemp(join(tmpdir(), "harness-git-"));
+async function repository(label = "") {
+  const root = await mkdtemp(join(tmpdir(), "harness-git-" + label));
   await git(root, "init", "-b", "main");
   await git(root, "config", "core.autocrlf", "false");
   await writeFile(join(root, "shared.txt"), "base\n");
@@ -44,14 +44,17 @@ async function cleanup(root: string) {
 }
 
 test("child worktrees isolate siblings and integrate nested exact output with conflict recovery", async () => {
-  const root = await repository();
+  const root = await repository("long-agentic-project-path-for-windows-");
   try {
     const adapter = new GitWorkspaces();
-    const graph = await adapter.createGraph(root, "agentic", "run");
+    const graph = await adapter.createGraph(root, "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222");
     const task = await adapter.createTask(graph, "work", []);
-    const left = await adapter.createChild(task, "left");
-    const right = await adapter.createChild(task, "right");
-    const nested = await adapter.createChild(left, "nested");
+    const left = await adapter.createChild(task, "33333333-3333-3333-3333-333333333333");
+    const right = await adapter.createChild(task, "44444444-4444-4444-4444-444444444444");
+    const nested = await adapter.createChild(left, "55555555-5555-5555-5555-555555555555");
+    assert.equal(dirname(left.path), dirname(nested.path));
+    assert.equal(left.branch.length, nested.branch.length);
+    assert(left.branch.length < 40);
     await writeFile(join(nested.path, "nested.txt"), "nested output");
     await assert.rejects(readFile(join(left.path, "nested.txt")), /ENOENT/);
     await assert.rejects(readFile(join(right.path, "nested.txt")), /ENOENT/);

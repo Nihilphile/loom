@@ -216,3 +216,18 @@ test("failed child input preparation notifies its parent instead of leaving an a
   assert(f.engine.session(graph.tasks[0].units[0].sessionId!).childNotices?.some((n) => !n.consumed));
   assert.throws(() => report(f, 0), /descendants/);
 });
+
+test("cancelling and explicitly discarding a writable subtree releases delivery without deleting its workspaces", async (t) => {
+  const f = fixture(t); await begin(f);
+  const child = await call(f, 0, { op: "spawn", requestId: "writer", title: "writer", prompt: "write", access: "write" });
+  const nested = await call(f, 1, { op: "spawn", requestId: "nested", title: "nested", prompt: "write", access: "write" });
+  await call(f, 0, { op: "cancel", sessionId: child.sessionId });
+  const direct = f.engine.session(child.sessionId);
+  assert.equal(direct.child!.state, "cancelled");
+  assert.equal(f.engine.session(nested.sessionId).child!.output, "pending");
+  assert.throws(() => report(f, 0), /descendants/);
+  await call(f, 0, { op: "discard", requestId: "discard-tree", sessionId: child.sessionId, executionId: direct.child!.resultExecutionId! });
+  assert.equal(f.engine.session(nested.sessionId).child!.output, "discarded");
+  report(f, 0);
+  assert.equal(f.integrations.length, 0);
+});

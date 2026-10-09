@@ -1526,15 +1526,27 @@ export class HarnessEngine {
         const child = target!.child!;
         if (child.resultExecutionId !== text(command.executionId, "executionId")) throw new Error("Output execution changed; inspect the latest result");
         this.ensureStopped(target!);
-        if (this.descendants(target!.id).some((s) => this.childUnsettled(s))) throw new Error("Child has unresolved descendants");
         if (command.op === "integrate") {
+          if (this.descendants(target!.id).some((s) => this.childUnsettled(s))) throw new Error("Child has unresolved descendants");
           if (child.access !== "write" || !child.outputSha || !["pending", "conflict"].includes(child.output)) throw new Error("No writable output to integrate");
           if (!this.git.integrateChild) throw new Error("Git adapter does not support integration");
           try {
             await this.git.integrateChild(parent.child?.workspace ?? task.workspace!, child.workspace, child.outputSha, child.resultExecutionId!);
             child.output = "integrated";
           } catch (error) { child.output = "conflict"; throw error; }
-        } else child.output = "discarded";
+        } else {
+          const subtree = [target!, ...this.descendants(target!.id)];
+          for (const node of subtree) {
+            this.ensureStopped(node);
+            if (node.child!.state === "preparing" || this.state.preparations.some((p) => p.sessionId === node.id && p.receipt.status === "uncertain"))
+              throw new Error("Inspect uncertain child preparation before discarding the subtree");
+          }
+          for (const node of subtree) {
+            node.child!.output = "discarded";
+            node.child!.state = "cancelled";
+            for (const notice of node.childNotices ?? []) notice.consumed = true;
+          }
+        }
         if (["interrupted", "failed", "cancelled"].includes(child.state)) child.state = "cancelled";
         for (const n of parent.childNotices ?? []) if (n.sessionId === target!.id) n.consumed = true;
         receipt.result = this.childResult(target!);

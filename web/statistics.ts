@@ -1,4 +1,4 @@
-import type { AppState, Execution, Usage } from "../src/shared/types.ts";
+import type { AppState, Execution, Usage, Session } from "../src/shared/types.ts";
 
 export interface StatsFilters {
   graph: string;
@@ -55,6 +55,16 @@ export function filterExecutions(rows: Row[], filter: StatsFilters) {
   );
 }
 export function summarize(rows: Row[]) {
+  rows = [...new Map(rows.map((row) => [row.id, row])).values()];
+  const intervals = rows.flatMap((row) => {
+    const start = Date.parse(row.startedAt), end = Date.parse(row.endedAt ?? "");
+    return Number.isFinite(start) && Number.isFinite(end) && end >= start ? [[start, end]] : [];
+  }).sort((a, b) => a[0] - b[0]);
+  let elapsedMs = 0, through = -Infinity;
+  for (const [start, end] of intervals) {
+    elapsedMs += Math.max(0, end - Math.max(start, through));
+    through = Math.max(through, end);
+  }
   const known = rows.filter((row) => row.usageKnown === true && row.metrics);
   const usage = known.reduce<Usage>(
     (sum, row) => ({
@@ -67,6 +77,8 @@ export function summarize(rows: Row[]) {
   );
   return {
     usage,
+    elapsedSeconds: elapsedMs / 1000,
+    intervalsKnown: intervals.length,
     known: known.length,
     count: rows.length,
     seconds: rows.reduce((sum, row) => sum + (row.metrics?.seconds ?? 0), 0),
@@ -75,7 +87,7 @@ export function summarize(rows: Row[]) {
   };
 }
 export function statistics(state: AppState, filter: StatsFilters) {
-  const all = state.executions ?? [];
+  const all = [...new Map((state.executions ?? []).map((row) => [row.id, row])).values()];
   const rows = filterExecutions(all, filter);
   const total = summarize(rows);
   const observerTotal = summarize(rows.filter(observer));
@@ -124,10 +136,18 @@ export function statistics(state: AppState, filter: StatsFilters) {
     group.rows.push(row);
     groups.set(key, group);
   }
+  if (filter.group === "unit") {
+    for (const [key, group] of [...groups]) {
+      if (group.rows.some((row) => state.sessions.some((session) => session.id === row.sessionId && session.child))) {
+        groups.set(key + "/own", { label: group.label + " · 自身", rows: group.rows.filter((row) => !state.sessions.some((session) => session.id === row.sessionId && session.child)) });
+        group.label += " · 自身与后代";
+      }
+    }
+  }
   const summaryCells = (data: ReturnType<typeof summarize>) =>
-    `<td>${data.known ? fmt(data.usage.inputTokens) : "未知"}</td><td>${data.known ? fmt(data.usage.cachedInputTokens) : "未知"}</td><td>${data.known ? fmt(data.usage.outputTokens) : "未知"}</td><td>${data.known ? fmt(data.usage.inputTokens + data.usage.outputTokens) : "未知"}</td><td>${data.known} / ${data.count}</td><td>${data.measured ? fmt(data.seconds) + "s" : "未知"}</td><td>${data.measured ? fmt(data.calls) : "未知"}</td>`;
+    `<td>${data.known ? fmt(data.usage.inputTokens) : "未知"}</td><td>${data.known ? fmt(data.usage.cachedInputTokens) : "未知"}</td><td>${data.known ? fmt(data.usage.outputTokens) : "未知"}</td><td>${data.known ? fmt(data.usage.inputTokens + data.usage.outputTokens) : "未知"}</td><td>${data.known} / ${data.count}</td><td>${data.measured ? fmt(data.seconds) + "s" : "未知"}</td><td>${data.intervalsKnown ? fmt(data.elapsedSeconds) : "未知"} (${data.intervalsKnown}/${data.count})</td><td>${data.measured ? fmt(data.calls) : "未知"}</td>`;
   const tokenHeaders =
-    "<th>输入</th><th>缓存输入</th><th>输出</th><th>总 tokens</th><th>已知 / 执行数</th><th>执行时间</th><th>工具调用</th>";
+    "<th>输入</th><th>缓存输入</th><th>输出</th><th>总 tokens</th><th>已知 / 执行数</th><th>累计 Agent 秒</th><th>区间并集秒（覆盖）</th><th>工具调用</th>";
   const modelValues = [
     ...new Set(all.map((row) => row.model ?? "unknown")),
   ].map((id) => ({ id, name: id === "unknown" ? "未知模型" : id }));

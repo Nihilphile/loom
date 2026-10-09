@@ -1570,3 +1570,9 @@ dialog::backdrop {
     width: 100%;
   }
 }
+
+.agentic-tree { list-style: none; padding: 8px 12px; margin: 0; }
+.agentic-tree ul { list-style: none; padding-left: 16px; border-left: 1px solid var(--line, #ddd); }
+.agentic-tree li { padding: 5px 0; overflow-wrap: anywhere; }
+.agentic-tree .btn { max-width: 100%; white-space: normal; text-align: left; }
+.delegation-fields { margin: 16px 0; border: 1px solid var(--line, #ddd); border-radius: 8px; padding: 12px; }

@@ -34,7 +34,18 @@ export function reasoning(value: unknown): Reasoning | undefined {
     throw new Error("无效 reasoning");
   return value as Reasoning;
 }
+export function validateDelegation(value: unknown) {
+  if (value === undefined) return;
+  if (!value || typeof value !== "object" || Array.isArray(value) || !("enabled" in value) || typeof value.enabled !== "boolean") throw new Error("delegation.enabled 必须是布尔值");
+  if (!value.enabled) return;
+  const policy = value as Record<string, unknown>;
+  for (const key of ["maxDepth", "maxConcurrent"] as const) {
+    if (!Number.isSafeInteger(policy[key]) || Number(policy[key]) < 1) throw new Error(`delegation.${key} 必须是正整数`);
+  }
+  if (policy.models !== undefined) strings(policy.models, "delegation.models").forEach((model) => text(model, "model"));
+}
 export function validateAgent(value: AgentTemplate) {
+  validateDelegation(value.delegation);
   identifier(value.id);
   text(value.name, "模板名称");
   strings(value.skills, "skills");
@@ -65,6 +76,7 @@ export function validateUnit(value: UnitConfig) {
   }
   if (value.kind === "command") {
     text(value.command, "命令");
+    if (value.delegation?.enabled) throw new Error("Command Unit 不能派生 Agent");
     if (value.readOnly)
       throw new Error("Command Unit 是本地脚本，不能声明 Agent 只读沙箱权限");
   }

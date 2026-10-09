@@ -70,10 +70,24 @@ export class Catalog {
         maxReportRetries: 2,
       },
     ];
+    this.agents.push({
+      ...this.agents[0], id: "agentic", name: "Agentic",
+      delegation: { enabled: true, maxDepth: 3, maxConcurrent: 4 },
+      prompt: "完成任务并验证。按需通过 loom_agent 派工，等待子任务完成并整合可写输出后交卷。",
+    });
+    const reviewed = structuredClone(this.taskTypes.find((type) => type.id === "reviewed")!);
+    reviewed.id = "agentic-reviewed";
+    reviewed.name = "Agentic 与独立审查";
+    reviewed.units[0] = {
+      ...reviewed.units[0], templateId: "agentic", name: "Agentic",
+      delegation: { enabled: true, maxDepth: 3, maxConcurrent: 4 },
+      prompt: this.agents.find((agent) => agent.id === "agentic")!.prompt,
+    };
+    this.taskTypes.push(reviewed);
     if (existsSync(file)) {
       const data = JSON.parse(readFileSync(file, "utf8"));
-      this.agents = data.agents;
-      this.taskTypes = data.taskTypes;
+      this.agents = [...data.agents, ...this.agents.filter((builtin) => !data.agents.some((saved: AgentTemplate) => saved.id === builtin.id))];
+      this.taskTypes = [...data.taskTypes, ...this.taskTypes.filter((builtin) => !data.taskTypes.some((saved: TaskType) => saved.id === builtin.id))];
     }
   }
   save() {

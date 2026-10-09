@@ -19,6 +19,7 @@ import type {
 } from "../src/shared/types.ts";
 import { defaultInterviews } from "../src/shared/types.ts";
 import { statistics, type StatsFilters } from "./statistics.ts";
+import { agenticSession, delegationFields, delegationLabel, readDelegation, sessionTree } from "./agentic.ts";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 const dialog = document.querySelector<HTMLDialogElement>("#dialog")!;
@@ -528,7 +529,7 @@ function inspector() {
     body = `${t.units
       .map((u) => {
         const address = `${g.id}/${t.id}/${u.id}`;
-        return `<div class="unit"><button class="unitmain" data-unit="${esc(u.id)}"><div class="row"><span class="avatar">${u.kind === "command" ? "›_" : esc(u.name.slice(0, 1))}</span><div class="grow"><h3>${esc(u.name)}</h3><div class="tiny muted">${u.kind === "command" ? "命令执行" : `${esc(u.model || "运行时默认")} · ${esc(u.reasoning || "默认")}`}</div></div>${badge(u.status)}</div><div class="unitfoot"><span>${u.sessionId ? esc(u.sessionId) : "尚未启动"}</span><span>详情 ↗</span></div></button><div class="unitmetrics"><span>${fmt(u.metrics.seconds)}s<small>累计执行</small></span><span>${u.metrics.toolCalls}<small>tool calls</small></span><span>${u.kind === "command" ? "无模型 tokens" : tokenSummary(u.metrics)}<small>输入 / 缓存 / 输出</small></span></div><div class="unitmail"><button data-mail-address="${esc(address)}" data-direction="inbox">↓ 收件箱 ${state?.letters.filter((l) => l.to.includes(address)).length}</button><button data-mail-address="${esc(address)}" data-direction="sent">↑ 发件箱 ${state?.letters.filter((l) => l.from === address).length}</button></div></div>`;
+        return `<div class="unit"><button class="unitmain" data-unit="${esc(u.id)}"><div class="row"><span class="avatar">${u.kind === "command" ? "›_" : esc(u.name.slice(0, 1))}</span><div class="grow"><h3>${esc(u.name)}</h3><div class="tiny muted">${u.kind === "command" ? "命令执行" : `${esc(u.model || "运行时默认")} · ${esc(u.reasoning || "默认")}`}</div></div>${badge(u.status)}</div><div class="unitfoot"><span>${u.sessionId ? esc(u.sessionId) : "尚未启动"}</span><span>详情 ↗</span></div></button><div class="unitmetrics"><span>${fmt(u.metrics.seconds)}s<small>自身历史累计</small></span><span>${u.metrics.toolCalls}<small>自身 tool calls</small></span><span>${u.kind === "command" ? "无模型 tokens" : tokenSummary(u.metrics)}<small>自身输入 / 缓存 / 输出</small></span></div>${u.sessionId ? sessionTree(state!, u.sessionId) : ""}<div class="unitmail"><button data-mail-address="${esc(address)}" data-direction="inbox">↓ 收件箱 ${state?.letters.filter((l) => l.to.includes(address)).length}</button><button data-mail-address="${esc(address)}" data-direction="sent">↑ 发件箱 ${state?.letters.filter((l) => l.from === address).length}</button></div></div>`;
       })
       .join(
         "",
@@ -761,14 +762,14 @@ function sessionsPage() {
   const s = session();
   const list = (kind: Session["kind"]) =>
     state?.sessions
-      .filter((x) => x.kind === kind)
+      .filter((x) => x.kind === kind && !x.child)
       .map(
         (x) =>
           `<button class="sessionitem ${x.id === sessionId ? "active" : ""}" data-session="${esc(x.id)}"><div class="row between"><h3>${esc(x.title)}</h3>${badge(x.status)}</div><small>${esc(x.model || "默认模型")} · ${x.turns} turns${x.queue?.length ? ` · ${x.queue.length} 条待发送` : ""}</small></button>`,
       )
       .join("") || '<div class="empty">暂无会话</div>';
   const queue = s?.queue ?? [];
-  return `${intro("Sessions", "对话、工具记录和待发送消息。切换项目后执行继续运行。", btn("new-session", "＋ 自由会话", "primary"))}<div class="sessionlayout"><section class="panel sessionlist" data-scroll="sessions"><div class="sessionsection">自由会话</div>${list("free")}<div class="sessionsection">TASK 会话</div>${list("task")}<div class="sessionsection">只读侧聊</div>${list("sidechat")}<div class="sessionsection">开发者访谈</div>${list("interview")}</section><div class="stack">${s ? `<section class="panel chat-panel"><div class="chathead"><div class="row between"><h2>${esc(s.title)}</h2>${badge(s.status)}</div>${observerActions(s)}<div class="tiny muted">${esc(s.model || "运行时默认模型")} · ${esc(s.reasoning || "默认推理")} · ${s.turns} turns</div><div class="chat-usage">输入 ${fmt(s.metrics.usage.inputTokens)} <span>缓存 ${fmt(s.metrics.usage.cachedInputTokens)}</span> 输出 ${fmt(s.metrics.usage.outputTokens)} <span>${esc(contextLabel(s))}</span></div></div>${observerSource(s)}<div class="messages" data-scroll="messages-${esc(s.id)}">${s.messages.length ? s.messages.map((m) => `<article class="message ${esc(m.role)}"><div class="messageheader">${esc(m.role === "user" ? "你" : m.role === "assistant" ? "Codex" : m.role === "mailbox" ? "Mailbox" : "系统")} · ${esc(time(m.at))}${m.delivery ? ` · ${m.delivery === "steer" ? "已引导" : "来自队列"}` : ""}</div><p>${esc(m.text)}</p><div class="message-attachments">${(m.attachments ?? []).map(attachmentView).join("")}</div>${(m.skills ?? []).map((skill) => `<span class="badge">$${esc(skill.name)}</span>`).join("")}</article>`).join("") : empty("开始对话", "输入目标或问题，或用 / 查看命令。")}${s.status === "running" ? '<div class="stream-indicator"><span></span> Codex 正在工作…</div>' : ""}</div><div id="chat-tools" class="chat-tools">${chatTools()}</div>${s.error ? `<div class="notice amber">${esc(s.error)}</div>` : ""}${queue.length || s.queuePaused ? `<section class="queued-messages"><div class="row between"><strong>待发送 ${queue.length}${s.queuePaused ? " · 已暂停" : ""}</strong>${s.queuePaused ? btn("continue-queue", "继续队列", "small", s.status === "running" || !queue.length) : ""}</div>${queue.map((q, i) => `<div class="queued-message"><span class="muted">${i + 1}</span><div class="grow"><p>${esc(q.input.text || "附件消息")}</p><small>${q.attachments.map((a) => esc(a.name)).join(" · ")}${q.input.skills?.map((skill) => ` $${esc(skill.name)}`).join("") ?? ""}</small></div><button class="btn small" data-cancel-queue="${esc(q.id)}">取消</button></div>`).join("")}</section>` : ""}${s.kind !== "task" ? composer(s) : '<div class="notice">Task 会话由调度器管理。请通过成员收发件箱发送报告文件，或在 Graph 中暂停和编辑任务。</div>'}<details class="session-context" data-detail="session-context-${esc(s.id)}"><summary>Context · 本次会话输入记录</summary>${preparationHistory(s.id)}</details></section>` : empty("创建一个自由会话", "自由会话不属于任务图，适合调查、讨论与临时工作。", btn("new-session", "＋ 创建自由会话", "primary"))}${trace()}</div></div>`;
+  return `${intro("Sessions", "对话、工具记录和待发送消息。切换项目后执行继续运行。", btn("new-session", "＋ 自由会话", "primary"))}<div class="sessionlayout"><section class="panel sessionlist" data-scroll="sessions"><div class="sessionsection">自由会话</div>${list("free")}<div class="sessionsection">TASK 会话</div>${state?.sessions.filter((item) => item.kind === "task" && !item.child).map((item) => sessionTree(state!, item.id)).join("") || empty("暂无 Task 会话", "启动任务后显示会话树") }<div class="sessionsection">只读侧聊</div>${list("sidechat")}<div class="sessionsection">开发者访谈</div>${list("interview")}</section><div class="stack">${s ? `<section class="panel chat-panel"><div class="chathead"><div class="row between"><h2>${esc(s.title)}</h2>${badge(s.status)}</div>${observerActions(s)}<div class="tiny muted">${esc(s.model || "运行时默认模型")} · ${esc(s.reasoning || "默认推理")} · ${s.turns} turns</div><div class="chat-usage">输入 ${fmt(s.metrics.usage.inputTokens)} <span>缓存 ${fmt(s.metrics.usage.cachedInputTokens)}</span> 输出 ${fmt(s.metrics.usage.outputTokens)} <span>${esc(contextLabel(s))}</span></div></div>${observerSource(s)}${agenticSession(state!, s)}<div class="messages" data-scroll="messages-${esc(s.id)}">${s.messages.length ? s.messages.map((m) => `<article class="message ${esc(m.role)}"><div class="messageheader">${esc(m.role === "user" ? "你" : m.role === "assistant" ? "Codex" : m.role === "mailbox" ? "Mailbox" : "系统")} · ${esc(time(m.at))}${m.delivery ? ` · ${m.delivery === "steer" ? "已引导" : "来自队列"}` : ""}</div><p>${esc(m.text)}</p><div class="message-attachments">${(m.attachments ?? []).map(attachmentView).join("")}</div>${(m.skills ?? []).map((skill) => `<span class="badge">$${esc(skill.name)}</span>`).join("")}</article>`).join("") : empty("开始对话", "输入目标或问题，或用 / 查看命令。")}${s.status === "running" ? '<div class="stream-indicator"><span></span> Codex 正在工作…</div>' : ""}</div><div id="chat-tools" class="chat-tools">${chatTools()}</div>${s.error ? `<div class="notice amber">${esc(s.error)}</div>` : ""}${queue.length || s.queuePaused ? `<section class="queued-messages"><div class="row between"><strong>待发送 ${queue.length}${s.queuePaused ? " · 已暂停" : ""}</strong>${s.queuePaused ? btn("continue-queue", "继续队列", "small", s.status === "running" || !queue.length) : ""}</div>${queue.map((q, i) => `<div class="queued-message"><span class="muted">${i + 1}</span><div class="grow"><p>${esc(q.input.text || "附件消息")}</p><small>${q.attachments.map((a) => esc(a.name)).join(" · ")}${q.input.skills?.map((skill) => ` $${esc(skill.name)}`).join("") ?? ""}</small></div><button class="btn small" data-cancel-queue="${esc(q.id)}">取消</button></div>`).join("")}</section>` : ""}${s.kind !== "task" ? composer(s) : '<div class="notice">Task 会话由调度器管理。请通过成员收发件箱发送报告文件，或在 Graph 中暂停和编辑任务。</div>'}<details class="session-context" data-detail="session-context-${esc(s.id)}"><summary>Context · 本次会话输入记录</summary>${preparationHistory(s.id)}</details></section>` : empty("创建一个自由会话", "自由会话不属于任务图，适合调查、讨论与临时工作。", btn("new-session", "＋ 创建自由会话", "primary"))}${trace()}</div></div>`;
 }
 function mailboxPage() {
   const letters =
@@ -799,7 +800,7 @@ function statsPage() {
   return state ? statistics(state, statsFilters) : "";
 }
 function templatesPage() {
-  return `${intro("Agent templates", "跨项目复用的成员配置。库更新不会回写已有任务的配置快照。", btn("new-template", "＋ 创建模板", "primary"), "PERSONAL LIBRARY / AGENTS")}<div class="grid3">${state?.agentTemplates.map((a) => `<article class="card"><span class="badge">v${a.version} · ${a.readOnly ? "只读" : "可写工作区"}</span><h2>${esc(a.name)}</h2><p>${esc(a.model || "运行时默认模型")} · ${esc(a.reasoning || "默认推理")}</p><div class="librarymeta">${a.skills.map((s) => `<span class="badge">${esc(s)}</span>`).join("") || '<span class="tiny muted">未指定 skills</span>'}</div><p>${esc(a.prompt.slice(0, 150))}${a.prompt.length > 150 ? "…" : ""}</p><button class="btn" data-template="${esc(a.id)}">编辑模板 ↗</button></article>`).join("")}</div>`;
+  return `${intro("Agent templates", "跨项目复用的成员配置。库更新不会回写已有任务的配置快照。", btn("new-template", "＋ 创建模板", "primary"), "PERSONAL LIBRARY / AGENTS")}<div class="grid3">${state?.agentTemplates.map((a) => `<article class="card"><span class="badge">v${a.version} · ${a.readOnly ? "只读" : "可写工作区"}</span><h2>${esc(a.name)}</h2><p>${esc(delegationLabel(a.delegation))}</p><p>${esc(a.model || "运行时默认模型")} · ${esc(a.reasoning || "默认推理")}</p><div class="librarymeta">${a.skills.map((s) => `<span class="badge">${esc(s)}</span>`).join("") || '<span class="tiny muted">未指定 skills</span>'}</div><p>${esc(a.prompt.slice(0, 150))}${a.prompt.length > 150 ? "…" : ""}</p><button class="btn" data-template="${esc(a.id)}">编辑模板 ↗</button></article>`).join("")}</div>`;
 }
 function typesPage() {
   return `${intro("Task types", "定义成员、初始执行与结果规则，Task 保存类型版本快照。", btn("new-type", "＋ 创建类型", "primary"), "PERSONAL LIBRARY / TASK TYPES")}<div class="grid3">${state?.taskTypes.map((t) => `<article class="card"><span class="badge">v${t.version} · 跨项目</span><h2>${esc(t.name)}</h2><p>${t.units.map((u) => esc(u.name)).join(" · ")}</p><div class="rule">启动：${t.start.map(esc).join("、")}</div><div class="rule">${t.rules.length} 条结果规则 · ${t.maxRounds} 轮执行上限</div><p>漏报补跑上限 ${t.maxReportRetries}</p><button class="btn" data-type="${esc(t.id)}">编辑类型 ↗</button></article>`).join("")}</div><div class="notice spaced">高级规则使用 JSON 编辑，支持 agent 与 command 成员。保存时由服务校验成员引用与规则。</div>`;
@@ -912,7 +913,7 @@ function unitModal(id: string) {
   const pending = !!accepted && accepted.revision < t.configRevision;
   modal(
     u.name,
-    `<div class="row between">${badge(u.status)}<span class="tiny muted">${u.kind === "command" ? "命令执行" : u.readOnly ? "只读 Agent" : "工作区可写 Agent"}</span><button class="btn small" data-unit="${esc(u.id)}">刷新详情</button></div><div class="rule">地址 <code>${esc(`${g.id}/${t.id}/${u.id}`)}</code></div><h3 class="spaced">Config</h3><div class="config-grid"><section><h4>声明配置 · v${t.configRevision}</h4><div class="rule">模型 ${esc(u.model || "运行时默认")} · 推理 ${esc(u.reasoning || "默认")}</div><div class="rule">Skills ${u.skills.map(esc).join("、") || "未指定"}</div><div class="rule">权限 ${u.readOnly ? "只读" : "工作区可写"}</div><div class="rule">工作目录 ${esc(t.workspace?.path ?? "依赖交付后准备")}</div><p class="hint">返修、再审默认沿用原 session。</p>${u.command ? `<pre class="report">${esc(u.command)}</pre>` : ""}</section><section><h4>已接受配置${accepted ? ` · v${accepted.revision}` : ""}</h4>${accepted ? `<div class="rule">模型 ${esc(accepted.model || "运行时默认")} · 推理 ${esc(accepted.reasoning || "默认")}</div><div class="rule">Skills ${accepted.skills.map(esc).join("、") || "未指定"}</div><div class="rule">权限 ${accepted.readOnly ? "只读" : "工作区可写"}</div><div class="rule">工作目录 ${esc(accepted.cwd)}</div>` : `<p class="hint">${u.kind === "command" ? "命令 Unit 不做模型会话初始化。" : "尚未收到运行时接收回执。"}</p>`}${pending ? '<p class="notice amber">声明配置已更新，等待下一次执行接受。当前 session 尚未应用此版本。</p>' : ""}</section></div><h3 class="spaced">Context</h3><details class="context-input"><summary>配置来源预览 · 尚不代表已注入</summary><h4 class="spaced">初始 prompt</h4><pre class="report">${esc(u.prompt || "未指定额外 prompt")}</pre><h4 class="spaced">上下文选择</h4><pre class="jsondetail">${json(u.context ?? {})}</pre></details>${u.sessionId ? preparationHistory(u.sessionId) : '<p class="hint">首次运行前会根据配置组装上下文。</p>'}${s?.error ? `<p class="notice amber">${esc(s.error)}</p>` : ""}<div class="spaced">${u.sessionId ? `<button class="btn primary" data-open-session="${esc(u.sessionId)}">查看会话 ↗</button>` : '<span class="muted">成员尚未创建会话</span>'}</div>${observerActions(s)}`,
+    `<div class="row between">${badge(u.status)}<span class="tiny muted">${u.kind === "command" ? "命令执行" : u.readOnly ? "只读 Agent" : "工作区可写 Agent"}</span><button class="btn small" data-unit="${esc(u.id)}">刷新详情</button></div><div class="rule">地址 <code>${esc(`${g.id}/${t.id}/${u.id}`)}</code></div><h3 class="spaced">Config</h3><div class="config-grid"><section><h4>声明配置 · v${t.configRevision}</h4><div class="rule">模型 ${esc(u.model || "运行时默认")} · 推理 ${esc(u.reasoning || "默认")}</div><div class="rule">Skills ${u.skills.map(esc).join("、") || "未指定"}</div><div class="rule">${esc(delegationLabel(u.delegation))}</div><div class="rule">权限 ${u.readOnly ? "只读" : "工作区可写"}</div><div class="rule">工作目录 ${esc(t.workspace?.path ?? "依赖交付后准备")}</div><p class="hint">返修、再审默认沿用原 session。</p>${u.command ? `<pre class="report">${esc(u.command)}</pre>` : ""}</section><section><h4>已接受配置${accepted ? ` · v${accepted.revision}` : ""}</h4>${accepted ? `<div class="rule">模型 ${esc(accepted.model || "运行时默认")} · 推理 ${esc(accepted.reasoning || "默认")}</div><div class="rule">Skills ${accepted.skills.map(esc).join("、") || "未指定"}</div><div class="rule">${esc(delegationLabel(accepted.delegation))}</div><div class="rule">权限 ${accepted.readOnly ? "只读" : "工作区可写"}</div><div class="rule">工作目录 ${esc(accepted.cwd)}</div>` : `<p class="hint">${u.kind === "command" ? "命令 Unit 不做模型会话初始化。" : "尚未收到运行时接收回执。"}</p>`}${pending ? '<p class="notice amber">声明配置已更新，等待下一次执行接受。当前 session 尚未应用此版本。</p>' : ""}</section></div><h3 class="spaced">Context</h3><details class="context-input"><summary>配置来源预览 · 尚不代表已注入</summary><h4 class="spaced">初始 prompt</h4><pre class="report">${esc(u.prompt || "未指定额外 prompt")}</pre><h4 class="spaced">上下文选择</h4><pre class="jsondetail">${json(u.context ?? {})}</pre></details>${u.sessionId ? preparationHistory(u.sessionId) : '<p class="hint">首次运行前会根据配置组装上下文。</p>'}${s?.error ? `<p class="notice amber">${esc(s.error)}</p>` : ""}<div class="spaced">${u.sessionId ? `<button class="btn primary" data-open-session="${esc(u.sessionId)}">查看会话 ↗</button>` : '<span class="muted">成员尚未创建会话</span>'}</div>${s ? agenticSession(state!, s) : ""}${observerActions(s)}`,
   );
 }
 function resolvePreparationModal(p: Preparation) {
@@ -950,7 +951,7 @@ function templateModal(id?: string) {
   const a = state?.agentTemplates.find((x) => x.id === id);
   modal(
     a ? "编辑 Agent template" : "创建 Agent template",
-    `<div class="grid2">${field("id", "模板 ID", a?.id ?? "", 'required pattern="[A-Za-z0-9_\\-]+" ' + (a ? "readonly" : ""))}${field("name", "显示名称", a?.name ?? "", "required")}</div><div class="grid2">${field("model", "模型", a?.model ?? "", 'placeholder="留空使用运行时默认"')}<label class="field"><span>推理强度</span><select name="reasoning">${reasonOptions(a?.reasoning)}</select></label></div>${field("skills", "Skills（逗号或换行分隔）", a?.skills.join(", ") ?? "")}${area("prompt", "初始 prompt", a?.prompt ?? "", 'rows="7"')}<label class="checkrow"><input type="checkbox" name="readOnly" ${a?.readOnly ? "checked" : ""}>只读工作区权限</label><input type="hidden" name="version" value="${a?.version ?? 0}"><div class="notice">保存为新的配置版本。已有 Task 的成员配置快照不变。</div>`,
+    `<div class="grid2">${field("id", "模板 ID", a?.id ?? "", 'required pattern="[A-Za-z0-9_\\-]+" ' + (a ? "readonly" : ""))}${field("name", "显示名称", a?.name ?? "", "required")}</div><div class="grid2">${field("model", "模型", a?.model ?? "", 'placeholder="留空使用运行时默认"')}<label class="field"><span>推理强度</span><select name="reasoning">${reasonOptions(a?.reasoning)}</select></label></div>${delegationFields(a?.delegation)}${field("skills", "Skills（逗号或换行分隔）", a?.skills.join(", ") ?? "")}${area("prompt", "初始 prompt", a?.prompt ?? "", 'rows="7"')}<label class="checkrow"><input type="checkbox" name="readOnly" ${a?.readOnly ? "checked" : ""}>只读工作区权限</label><input type="hidden" name="version" value="${a?.version ?? 0}"><div class="notice">保存为新的配置版本。已有 Task 的成员配置快照不变。</div>`,
     "template",
     "保存模板",
   );
@@ -986,7 +987,9 @@ function typeModal(id?: string) {
       JSON.stringify(t, null, 2),
       'class="codeeditor" spellcheck="false" required',
     ) +
-      '<div class="notice">规则的 from 与 activate.unit 必须引用成员 ID。Command Unit 通过 command 字段配置程序验证。</div>',
+      '<div class="notice">规则的 from 与 activate.unit 必须引用成员 ID。Command Unit 通过 command 字段配置程序验证。</div>' +
+      t.units.filter((u) => u.kind === "agent").map((u) => `<section data-delegation-unit="${esc(u.id)}"><h3>${esc(u.name)} · 派工配置</h3>${delegationFields(u.delegation, `unit-${u.id}-`)}</section>`).join("") +
+      '<p class="hint">下方控件优先于 JSON 中同名 Unit 的 delegation；新增 Unit 可直接在 JSON 配置。</p>',
     "type",
     "保存类型",
   );
@@ -1294,16 +1297,17 @@ async function submit(form: HTMLFormElement) {
   }
   if (kind === "template") {
     const reason = value(form, "reasoning");
-    if (!["minimal", "low", "medium", "high", "xhigh"].includes(reason))
+    if (!["", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(reason))
       throw new Error("推理强度无效");
     const payload = {
       id: value(form, "id"),
       name: value(form, "name"),
       version: Number(value(form, "version")) + 1,
       model: value(form, "model") || undefined,
-      reasoning: reason,
+      reasoning: reason || undefined,
       skills: split(value(form, "skills")),
       prompt: value(form, "prompt"),
+      delegation: readDelegation(form),
       readOnly:
         form.querySelector<HTMLInputElement>("[name=readOnly]")?.checked ??
         false,
@@ -1323,6 +1327,11 @@ async function submit(form: HTMLFormElement) {
       !Array.isArray(payload.units)
     )
       throw new Error("TaskType 必须包含 id 与 units 数组。");
+    for (const section of form.querySelectorAll<HTMLElement>("[data-delegation-unit]")) {
+      const id = section.dataset.delegationUnit!;
+      const unit = payload.units.find((u: { id?: string }) => u.id === id);
+      if (unit?.kind === "agent") unit.delegation = readDelegation(section, `unit-${id}-`);
+    }
     await mutate("/api/catalog/task-types", payload);
     dialog.close();
     toast("类型已保存");
@@ -1336,6 +1345,16 @@ document.addEventListener("click", (event) => {
   void click(el).catch(showError);
 });
 async function click(el: HTMLElement) {
+  if (el.dataset.sessionUnit) {
+    const source = state?.sessions.find((s) => s.id === el.dataset.sessionUnit);
+    if (source?.graphId && source.taskId && source.unitId) {
+      graphId = source.graphId;
+      taskId = source.taskId;
+      navigate("graphs");
+      unitModal(source.unitId);
+    }
+    return;
+  }
   if (el.dataset.sidechat || el.dataset.interview) {
     if (requestPending) return;
     const source = el.dataset.sidechat ?? el.dataset.interview!;

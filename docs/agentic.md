@@ -1,0 +1,9 @@
+# Agentic configuration and session inspection
+
+The personal library includes the `agentic` Agent template and the `agentic-reviewed` TaskType. The TaskType starts an Agentic worker and activates a separate readonly reviewer after delivery. Child reviews do not replace that reviewer. Missing built-ins are added when loading an existing catalog; saved entries with the same ID keep their customizations.
+
+Enable delegation in an Agent template or in the per-Unit controls below the TaskType JSON editor. Configure maximum depth, concurrent children, and optional model IDs. Delegation is disabled when omitted. The built-in Agentic configuration permits depth 3 and concurrency 4. Saving a template or TaskType does not rewrite existing Task snapshots. The per-Unit controls override the matching Unit's `delegation` in the JSON editor; new Units can declare it directly in JSON.
+
+Task members and the Sessions page show nested children. Open a child to inspect its parent, owning Unit, native thread ID, state, work directory, access, accepted configuration, output state, result execution, conversation, tools, and preparation history. Parent and Unit buttons navigate back to their respective views. Task and child sessions remain scheduler-managed.
+
+The session detail shows separate own and subtree totals from unique execution IDs. Repeated child turns count as separate executions. Input includes cached input. Unknown token usage is excluded from the numeric subtotal and retained in the coverage count. Agent seconds sum measured execution durations. Interval-union seconds merge overlapping execution intervals and include only valid completed intervals, with separate coverage. They describe active execution time, not end-to-end task latency including idle gaps. Statistics grouped by Unit show own and subtree rows when children exist; observer sessions remain independent of their source Unit.

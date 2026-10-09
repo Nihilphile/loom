@@ -12,7 +12,8 @@ import { dirname, join, resolve } from "node:path";
 import type { GitAdapter, Workspace } from "../shared/types.ts";
 
 interface Manifest {
-  kind: "graph" | "task";
+  kind: "graph" | "task" | "child";
+  parentPath?: string;
   projectRoot: string;
   workspace: Workspace;
   dependencies: string[];
@@ -271,6 +272,46 @@ async function recorded(
 }
 
 export class GitWorkspaces implements GitAdapter {
+  async createChild(parent: Workspace, sessionId: string): Promise<Workspace> {
+    identifier(sessionId);
+    const owner = await inspect(parent);
+    const baseCommit = await this.snapshot(parent, "Child workspace baseline", `child-base/${sessionId}`);
+    const directoryPath = join(dirname(parent.path), "children");
+    const path = join(directoryPath, sessionId);
+    const branch = `${parent.branch}-child-${sessionId}`;
+    return locked(path, async () => {
+      await directory(directoryPath);
+      let manifest = await readManifest(path);
+      if (manifest && (manifest.kind !== "child" || manifest.parentPath !== parent.path))
+        throw new Error("Child workspace belongs to another parent");
+      if (!manifest) {
+        manifest = { kind: "child", parentPath: parent.path, projectRoot: owner.projectRoot,
+          workspace: { path, branch, baseCommit }, dependencies: [], prepared: true };
+        await saveManifest(manifest);
+      }
+      return ensureWorktree(manifest);
+    });
+  }
+
+  async integrateChild(parent: Workspace, child: Workspace, sha: string, operationId: string): Promise<string> {
+    const manifest = await inspect(child);
+    if (manifest.kind !== "child" || manifest.parentPath !== parent.path)
+      throw new Error("Output can only be integrated into its immediate parent");
+    await commits(child, [sha]);
+    if (!(await merging(parent)))
+      await this.snapshot(parent, "Parent changes before child integration", `integration-base/${operationId}`);
+    return locked(parent.path, async () => {
+      await inspect(parent);
+      const ref = operationRef(parent, "child", operationId);
+      const existing = await recorded(parent, ref);
+      if (existing) return existing;
+      await merge(parent, [sha]);
+      const result = await git(parent.path, ["rev-parse", "HEAD"]);
+      await git(parent.path, ["update-ref", ref, result]);
+      return result;
+    });
+  }
+
   async createGraph(
     projectRoot: string,
     graphId: string,

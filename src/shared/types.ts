@@ -67,10 +67,13 @@ export type DelegationPolicy = { enabled: false } | { enabled: true; maxDepth: n
 export type AgentCommand =
   | { op: "spawn"; requestId: string; title: string; prompt: string; access?: "read" | "write"; model?: string; reasoning?: Reasoning }
   | { op: "send"; requestId: string; sessionId: string; prompt: string }
-  | { op: "list" | "wait"; sessionIds?: string[] }
-  | { op: "integrate" | "discard"; requestId: string; sessionId: string; executionId: string }
+  | { op: "list"; sessionIds?: string[] }
+  | { op: "wait"; sessionIds?: string[] }
+  | { op: "integrate"; requestId: string; sessionId: string; executionId: string }
+  | { op: "discard"; requestId: string; sessionId: string; executionId: string }
   | { op: "cancel"; sessionId: string };
 export interface ChildSession {
+  config?: ResolvedConfig;
   parentSessionId: string;
   depth: number;
   state: "preparing" | "active" | "waiting" | "finished" | "interrupted" | "failed" | "cancelled";

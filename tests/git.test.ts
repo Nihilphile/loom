@@ -43,6 +43,38 @@ async function cleanup(root: string) {
   });
 }
 
+test("child worktrees isolate siblings and integrate nested exact output with conflict recovery", async () => {
+  const root = await repository();
+  try {
+    const adapter = new GitWorkspaces();
+    const graph = await adapter.createGraph(root, "agentic", "run");
+    const task = await adapter.createTask(graph, "work", []);
+    const left = await adapter.createChild(task, "left");
+    const right = await adapter.createChild(task, "right");
+    const nested = await adapter.createChild(left, "nested");
+    await writeFile(join(nested.path, "nested.txt"), "nested output");
+    await assert.rejects(readFile(join(left.path, "nested.txt")), /ENOENT/);
+    await assert.rejects(readFile(join(right.path, "nested.txt")), /ENOENT/);
+    const nestedSha = await adapter.snapshot(nested, "nested", "nested-output");
+    await assert.rejects(adapter.integrateChild(task, nested, nestedSha, "wrong-parent"), /immediate parent/);
+    await adapter.integrateChild(left, nested, nestedSha, "nested-output");
+    const leftSha = await adapter.snapshot(left, "left", "left-output");
+    const merged = await adapter.integrateChild(task, left, leftSha, "left-output");
+    assert.equal(await adapter.integrateChild(task, left, leftSha, "left-output"), merged);
+    assert.equal(await readFile(join(task.path, "nested.txt"), "utf8"), "nested output");
+    await writeFile(join(task.path, "shared.txt"), "parent\n");
+    await writeFile(join(right.path, "shared.txt"), "child\n");
+    const rightSha = await adapter.snapshot(right, "right", "right-output");
+    await assert.rejects(adapter.integrateChild(task, right, rightSha, "right-output"), GitBlockedError);
+    assert.match(await git(task.path, "ls-files", "--unmerged"), /shared.txt/);
+    await writeFile(join(task.path, "shared.txt"), "resolved\n");
+    await git(task.path, "add", "shared.txt");
+    await adapter.integrateChild(task, right, rightSha, "right-output");
+    assert.equal(await readFile(join(task.path, "shared.txt"), "utf8"), "resolved\n");
+    assert.equal(await readFile(join(root, "shared.txt"), "utf8"), "base\n");
+  } finally { await cleanup(root); }
+});
+
 test("report-only tasks snapshot cleanly when runtime metadata is ignored", async () => {
   const root = await repository();
   try {

@@ -41,6 +41,8 @@ import type {
   InterviewSettings,
   Feedback,
   ObserverSource,
+  AgentCommand,
+  AgentReceipt,
 } from "../shared/types.ts";
 import { SessionInputs, contextItem } from "./session-inputs.ts";
 import { emptyMetrics, defaultInterviews } from "../shared/types.ts";
@@ -77,6 +79,7 @@ export class HarnessEngine {
   private preparing = new Set<string>();
   private closing = false;
   private turnOperations = new Map<string, Promise<unknown>>();
+  private agentOperations = new Map<string, Promise<unknown>>();
   constructor(
     root: string,
     readonly runtime: Runtime,
@@ -108,6 +111,10 @@ export class HarnessEngine {
       const session = this.session(execution.sessionId);
       session.status = "interrupted";
       session.error = execution.error;
+      if (session.child) {
+        session.child.state = "interrupted";
+        session.child.error = execution.error;
+      }
       if (execution.graphId && execution.purpose !== "mail") {
         const graph = this.graph(execution.graphId);
         graph.status = "paused";
@@ -124,6 +131,16 @@ export class HarnessEngine {
       }
     }
     for (const session of this.state.sessions) {
+      for (const receipt of session.agentReceipts ?? []) {
+        if (receipt.status === "pending") {
+          receipt.status = "failed";
+          receipt.error = "Service restarted during operation; inspect the registered child before issuing a new request";
+        }
+      }
+      if (session.child && ["preparing", "active", "waiting"].includes(session.child.state)) {
+        session.child.state = "interrupted";
+        session.child.error = "Service restarted; inspect existing history and resume explicitly";
+      }
       if (session.queue?.length) session.queuePaused = true;
     }
     for (const graph of this.state.graphs) {
@@ -879,6 +896,7 @@ export class HarnessEngine {
   }
   private graphBusy(graph: Graph) {
     return (
+      this.state.sessions.some((s) => s.graphId === graph.id && s.child?.state === "preparing") ||
       this.preparing.has(graph.id) ||
       graph.tasks.some((t) => this.preparing.has(graph.id + "/" + t.id)) ||
       this.state.executions.some(
@@ -949,6 +967,7 @@ export class HarnessEngine {
     this.record("graph.resumed", "恢复调度", { graphId: id });
     this.schedule(graph);
     for (const session of this.state.sessions) {
+      if (session.graphId === id) void this.continueFromChildren(session);
       if (
         this.pendingLetters(session).some((item) => item.letter.graphId === id)
       )
@@ -1146,8 +1165,10 @@ export class HarnessEngine {
         e.graphId === graph.id &&
         e.taskId === task.id &&
         e.unitId === unit.id &&
+        !this.session(e.sessionId).child &&
         e.configRevision === task.configRevision &&
         e.purpose === "work" &&
+        !this.state.preparations.some((p) => p.executionId === e.id && p.inputs.some((i) => i.id.startsWith("child/"))) &&
         e.status === "completed",
     ).length;
     if (purpose === "work" && priorRuns >= task.type.maxRounds) {
@@ -1208,6 +1229,9 @@ export class HarnessEngine {
         [
           `你是 Task ${task.id} 的 ${unit.name}。`,
           unit.prompt,
+          unit.delegation?.enabled
+            ? "可以使用 loom_agent 委派独立子会话。spawn 提供 requestId、title、prompt，可选 access read/write、model、reasoning；配置与权限自动继承。list/wait 获取结果。写入成果必须用 integrate 或 discard 指定精确 executionId 处理，才能交卷。send 可继续同一子会话。子会话尚在运行时结束本轮会等待结果并自动继续，不要补报。"
+            : "本 Unit 禁用委派。",
           `代码工作区：${task.workspace!.path}`,
           unit.readOnly
             ? "代码只读，报告写入独立报告目录。"
@@ -1289,7 +1313,9 @@ export class HarnessEngine {
     purpose: Execution["purpose"],
     context?: { task: Task; unit: Unit },
   ): ResolvedConfig {
+    if (session.child) return { ...(session.acceptedConfig ?? session.child.config)!, cwd };
     return {
+      delegation: session.source ? { enabled: false } : context?.unit.delegation,
       revision: context?.task.configRevision ?? 1,
       model:
         context?.unit.model ?? session.model ?? session.acceptedConfig?.model,
@@ -1304,6 +1330,224 @@ export class HarnessEngine {
         ...(context?.unit.skills ?? session.acceptedConfig?.skills ?? []),
       ],
     };
+  }
+  private descendants(sessionId: string): Session[] {
+    const children = this.state.sessions.filter((s) => s.child?.parentSessionId === sessionId);
+    return children.flatMap((s) => [s, ...this.descendants(s.id)]);
+  }
+  private childUnsettled(session: Session): boolean {
+    const child = session.child!;
+    return ["preparing", "active", "waiting", "interrupted"].includes(child.state) ||
+      ["pending", "conflict"].includes(child.output) ||
+      this.state.preparations.some((p) => p.sessionId === session.id && p.receipt.status === "uncertain");
+  }
+  private unitHasPendingChildren(unit: Unit): boolean {
+    if (!unit.sessionId) return false;
+    return [this.session(unit.sessionId), ...this.descendants(unit.sessionId)].some((s) => s.agentReceipts?.some((r) => r.status === "pending")) ||
+      this.descendants(unit.sessionId).some((s) => this.childUnsettled(s)) ||
+      !!this.session(unit.sessionId).childNotices?.some((n) => !n.consumed);
+  }
+  private childResult(session: Session) {
+    const execution = this.state.executions.find((e) => e.id === session.child?.resultExecutionId);
+    return {
+      sessionId: session.id, title: session.title, threadId: session.threadId,
+      ...session.child, config: session.acceptedConfig ?? session.child?.config,
+      executionId: execution?.id,
+      result: execution ? session.messages.filter((m) => m.role === "assistant" && m.at >= execution.startedAt).map((m) => m.text).join("\n") : undefined,
+      metrics: execution?.metrics, usageKnown: execution?.usageKnown,
+    };
+  }
+  private childNotice(session: Session, execution: Pick<Execution, "id">) {
+    const parent = this.session(session.child!.parentSessionId);
+    const notices = parent.childNotices ??= [];
+    if (!notices.some((n) => n.executionId === execution.id))
+      notices.push({ sessionId: session.id, executionId: execution.id });
+    this.record("agent.result", "子会话结果已保存", { sessionId: session.id, graphId: session.graphId });
+  }
+  private async finishChild(session: Session, execution: Execution, result: RuntimeResult) {
+    const child = session.child!;
+    child.resultExecutionId = execution.id;
+    if (child.access === "write" && (result.status !== "completed" || child.state === "cancelled")) {
+      child.output = "pending";
+      try { child.outputSha = await this.git.snapshot(child.workspace, `Interrupted child ${session.title}`, execution.id); }
+      catch (error) { child.output = "conflict"; child.error = errorText(error); }
+    }
+    if (child.state === "cancelled") {
+      this.childNotice(session, execution);
+      return;
+    }
+    if (result.status !== "completed") {
+      child.state = result.status;
+      child.error = result.error;
+      this.childNotice(session, execution);
+      return;
+    }
+    if (this.descendants(session.id).some((s) => this.childUnsettled(s)) || session.childNotices?.some((n) => !n.consumed)) {
+      child.state = "waiting";
+      return;
+    }
+    if (child.access === "write") {
+      child.outputSha = await this.git.snapshot(child.workspace, `Child ${session.title}`, execution.id);
+      child.output = "pending";
+    }
+    child.state = "finished";
+    this.childNotice(session, execution);
+  }
+  private async continueFromChildren(session: Session) {
+    if (this.closing || this.jobs.has(session.id) || session.status === "running" ||
+      !session.childNotices?.some((n) => !n.consumed) || !session.graphId) return;
+    const graph = this.graph(session.graphId);
+    if (graph.status !== "running") return;
+    const task = this.task(graph, session.taskId!);
+    const unit = task.units.find((u) => u.id === session.unitId)!;
+    if (session.child?.state === "cancelled" || task.status === "done") return;
+    if (this.state.preparations.some((p) => p.sessionId === session.id && p.receipt.status === "uncertain")) return;
+    if (session.child) session.child.state = "active";
+    else { task.status = unit.readOnly ? "reviewing" : "running"; unit.status = "running"; }
+    this.launch(session, "子会话有新结果。检查新增材料，继续工作；仍有活动子会话时可等待，全部成果处理后再完成。", "work",
+      session.child?.workspace.path ?? task.workspace!.path,
+      { graph, task, unit, reports: this.reportDirectory(graph, task, unit) });
+  }
+  async agentCommand(executionId: string, command: AgentCommand): Promise<unknown> {
+    const caller = this.state.executions.find((e) => e.id === executionId);
+    if (!caller) throw new Error("Unknown execution");
+    const key = `${caller.graphId}/${caller.taskId}/${caller.unitId}`;
+    const prior = this.agentOperations.get(key) ?? Promise.resolve();
+    const operation = prior.catch(() => {}).then(() => this.applyAgentCommand(caller, command));
+    this.agentOperations.set(key, operation);
+    try { return await operation; }
+    finally { if (this.agentOperations.get(key) === operation) this.agentOperations.delete(key); }
+  }
+  private async applyAgentCommand(execution: Execution, command: AgentCommand): Promise<unknown> {
+    const parent = this.session(execution.sessionId);
+    const config = parent.acceptedConfig;
+    if (!activeExecution(execution) || execution.submissionId || parent.kind !== "task" ||
+      !config?.delegation?.enabled || parent.child?.state === "cancelled")
+      throw new Error("Delegation is unavailable for this execution");
+    const graph = this.graph(execution.graphId!);
+    const task = this.task(graph, execution.taskId!);
+    const unit = task.units.find((u) => u.id === execution.unitId)!;
+    if (!command || !["spawn", "send", "list", "wait", "integrate", "discard", "cancel"].includes(command.op))
+      throw new Error("Unknown agent operation");
+    const children = this.state.sessions.filter((s) => s.child?.parentSessionId === parent.id);
+    if (command.op === "list" || command.op === "wait") {
+      if (command.sessionIds && (!Array.isArray(command.sessionIds) || command.sessionIds.some((id) => !children.some((s) => s.id === id))))
+        throw new Error("Only direct children may be inspected");
+      const selected = children.filter((s) => !command.sessionIds || command.sessionIds.includes(s.id));
+      for (const child of selected) for (const notice of parent.childNotices ?? [])
+        if (notice.sessionId === child.id && notice.executionId === child.child!.resultExecutionId) notice.consumed = true;
+      this.record("agent.observed", "读取子会话结果", { sessionId: parent.id });
+      return { children: selected.map((s) => this.childResult(s)), guidance: "This is a snapshot, not a blocking wait. If children are still working, end this turn. Loom will resume this same session when results arrive; do not repeatedly poll." };
+    }
+    const target = command.op === "spawn" ? undefined : children.find((s) => s.id === command.sessionId);
+    if (command.op !== "spawn" && !target) throw new Error("Only the direct parent may control a child");
+    if (command.op === "cancel") {
+      const subtree = [target!, ...this.descendants(target!.id)];
+      for (const child of subtree) child.child!.state = "cancelled";
+      this.record("agent.cancelled", "取消子会话及后代", { sessionId: target!.id });
+      await Promise.all(subtree.map((s) => this.interrupt(s.id)));
+      return this.childResult(target!);
+    }
+    if (graph.status !== "running" || this.closing) throw new Error("Graph is paused; new child operations are disabled");
+    const requestId = text(command.requestId, "requestId");
+    const fingerprint = hash(JSON.stringify(command));
+    const receipts = parent.agentReceipts ??= [];
+    const previous = receipts.find((r) => r.requestId === requestId);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint) throw new Error("requestId was used for a different operation");
+      if (previous.status === "completed") return previous.result;
+      throw new Error(previous.error ?? "Operation outcome is pending; inspect child state before retrying");
+    }
+    const receipt: AgentReceipt = { requestId, fingerprint, op: command.op, status: "pending" };
+    receipts.push(receipt);
+    this.record("agent.requested", "接收子会话操作", { sessionId: parent.id });
+    try {
+      if (command.op === "spawn") {
+        const depth = (parent.child?.depth ?? 0) + 1;
+        if (depth > config.delegation.maxDepth) throw new Error("Delegation depth limit reached");
+        const active = this.descendants(unit.sessionId!).filter((s) => ["preparing", "active", "waiting"].includes(s.child!.state));
+        if (active.length >= config.delegation.maxConcurrent) throw new Error("Unit child concurrency limit reached");
+        const access = command.access ?? (config.readOnly ? "read" : "write");
+        if (!["read", "write"].includes(access) || (config.readOnly && access === "write")) throw new Error("Child access cannot exceed parent access");
+        let model = command.model ?? config.model, effort = command.reasoning ?? config.reasoning;
+        if (command.model || command.reasoning) {
+          if (!this.runtime.discoverOptions) throw new Error("Runtime model catalog unavailable");
+          const options = await this.runtime.discoverOptions(config.cwd);
+          const found = options.models.find((m) => m.id === model);
+          if (!found || (config.delegation.models && !config.delegation.models.includes(found.id))) throw new Error("Child model is outside the allowed catalog");
+          if (effort && !found.reasoning.includes(effort)) throw new Error("Child reasoning effort is unsupported");
+          model = found.id;
+          effort ??= found.defaultReasoning;
+        }
+        if (!this.git.createChild) throw new Error("Git adapter does not support isolated child workspaces");
+        const id = randomUUID();
+        const child: Session = {
+          id, title: text(command.title, "title"), kind: "task", graphId: graph.id, taskId: task.id, unitId: unit.id,
+          status: "idle", model, reasoning: effort, messages: [], metrics: emptyMetrics(), turns: 0,
+          child: { parentSessionId: parent.id, depth, state: "preparing", access,
+            workspace: parent.child?.workspace ?? task.workspace!, output: "none" },
+        };
+        const prompt = text(command.prompt, "prompt");
+        receipt.sessionId = id;
+        this.state.sessions.push(child);
+        this.record("agent.preparing", "准备隔离子会话", { sessionId: id, graphId: graph.id });
+        try {
+          child.child!.workspace = await this.git.createChild(parent.child?.workspace ?? task.workspace!, id);
+          child.child!.config = { ...structuredClone(config), cwd: child.child!.workspace.path, readOnly: access === "read", model, reasoning: effort };
+          if (graph.status !== "running" || !activeExecution(execution) || child.child!.state !== "preparing")
+            throw new Error("Child preparation interrupted before dispatch");
+          child.child!.state = "active";
+          this.launch(child, `You are an independent child session. Work only in your assigned workspace. Reply with your result; do not submit a Unit report. Use loom_agent for bounded descendants when needed. Writable child outputs require integration or discard before you finish.\n\n${prompt}`, "work", child.child!.workspace.path,
+            { graph, task, unit, reports: "" });
+          receipt.result = this.childResult(child);
+        } catch (error) {
+          child.child!.state = "failed";
+          child.child!.error = errorText(error);
+          child.child!.resultExecutionId = `preparation-${id}`;
+          this.childNotice(child, { id: child.child!.resultExecutionId });
+          throw error;
+        }
+      } else if (command.op === "send") {
+        this.ensureStopped(target!);
+        const active = this.descendants(unit.sessionId!).filter((s) => ["preparing", "active", "waiting"].includes(s.child!.state));
+        if (active.length >= config.delegation.maxConcurrent) throw new Error("Unit child concurrency limit reached");
+        if (target!.child!.output === "pending" || target!.child!.output === "conflict") throw new Error("Resolve the previous writable output before continuing");
+        if (target!.child!.state === "cancelled") throw new Error("Cancelled child cannot restart");
+        if (this.descendants(target!.id).some((s) => this.childUnsettled(s))) throw new Error("Child still has unresolved descendants");
+        const prompt = text(command.prompt, "prompt");
+        target!.child!.state = "active";
+        target!.child!.output = "none";
+        target!.child!.outputSha = undefined;
+        target!.child!.resultExecutionId = undefined;
+        for (const n of parent.childNotices ?? []) if (n.sessionId === target!.id) n.consumed = true;
+        this.launch(target!, prompt, "work", target!.child!.workspace.path, { graph, task, unit, reports: "" });
+        receipt.result = this.childResult(target!);
+      } else {
+        const child = target!.child!;
+        if (child.resultExecutionId !== text(command.executionId, "executionId")) throw new Error("Output execution changed; inspect the latest result");
+        this.ensureStopped(target!);
+        if (this.descendants(target!.id).some((s) => this.childUnsettled(s))) throw new Error("Child has unresolved descendants");
+        if (command.op === "integrate") {
+          if (child.access !== "write" || !child.outputSha || !["pending", "conflict"].includes(child.output)) throw new Error("No writable output to integrate");
+          if (!this.git.integrateChild) throw new Error("Git adapter does not support integration");
+          try {
+            await this.git.integrateChild(parent.child?.workspace ?? task.workspace!, child.workspace, child.outputSha, child.resultExecutionId!);
+            child.output = "integrated";
+          } catch (error) { child.output = "conflict"; throw error; }
+        } else child.output = "discarded";
+        if (["interrupted", "failed", "cancelled"].includes(child.state)) child.state = "cancelled";
+        for (const n of parent.childNotices ?? []) if (n.sessionId === target!.id) n.consumed = true;
+        receipt.result = this.childResult(target!);
+      }
+      receipt.status = "completed";
+      this.record("agent.completed", "子会话操作完成", { sessionId: parent.id });
+      return receipt.result;
+    } catch (error) {
+      receipt.status = "failed";
+      receipt.error = errorText(error);
+      this.record("agent.failed", receipt.error, { sessionId: parent.id });
+      throw error;
+    } finally { this.settlePause(graph); }
   }
   private launch(
     session: Session,
@@ -1326,10 +1570,10 @@ export class HarnessEngine {
       purpose,
       status: "starting",
       startedAt: now(),
-      tokenHash: context && purpose !== "mail" ? hash(token) : undefined,
+      tokenHash: context && purpose !== "mail" && !session.child ? hash(token) : undefined,
       configRevision: context?.task.configRevision,
-      model: context?.unit.model || session.model,
-      reasoning: context?.unit.reasoning || session.reasoning,
+      model: session.child ? session.model : context?.unit.model || session.model,
+      reasoning: session.child ? session.reasoning : context?.unit.reasoning || session.reasoning,
       metrics: emptyMetrics(),
       usageKnown: false,
     };
@@ -1358,17 +1602,23 @@ export class HarnessEngine {
         ? `你正在 Loom 的自由会话中工作。需要规划可执行任务图时，可使用本地 CLI：node "${fileURLToPath(new URL("../../dist/cli.js", import.meta.url))}" --help。使用 graph create --file graph.json 创建图，graph run --id ID 运行；state 可查看 TaskTypes 和已有任务。图外会话地址为 session/${session.id}。仅在用户要求执行任务时启动图，不要把普通讨论当作执行请求。`
         : "";
     const config = this.configFor(session, cwd, purpose, context);
+    const notices = (session.childNotices ?? []).filter((n) => !n.consumed);
     let preparation: Preparation;
     try {
       const sources =
-        context && purpose !== "mail"
+        context && purpose !== "mail" && !session.child
           ? this.unitSources(
               context.task,
               context.unit,
               context.reports,
               session,
             )
-          : [];
+          : session.child
+            ? [...new Map(this.state.preparations.filter((p) => p.sessionId === session.child!.parentSessionId && p.receipt.status === "accepted")
+                .flatMap((p) => p.inputs).filter((i) => i.kind === "skill").map((i) => [i.id, structuredClone(i)])).values()]
+            : [];
+      for (const notice of notices)
+        sources.push(contextItem(`child/${notice.executionId}`, "instruction", JSON.stringify(this.childResult(this.session(notice.sessionId)))));
       if (controllerGuide)
         sources.push(
           contextItem("platform-help", "instruction", controllerGuide),
@@ -1407,7 +1657,13 @@ export class HarnessEngine {
       execution.endedAt = now();
       session.status = "failed";
       session.error = execution.error;
-      if (context) {
+      if (session.child) {
+        session.child.state = "failed";
+        session.child.error = execution.error;
+        session.child.resultExecutionId = execution.id;
+        this.childNotice(session, execution);
+      }
+      if (context && !session.child) {
         context.unit.status = "failed";
         this.block(context.graph, context.task, execution.error);
       }
@@ -1444,7 +1700,7 @@ export class HarnessEngine {
             JSON.parse(
               JSON.stringify(event).replaceAll(token, "[execution credential]"),
             ) as RuntimeEvent,
-            context?.unit,
+            session.child ? undefined : context?.unit,
           );
         preparation.receipt = { status: "dispatching" };
         this.record("preparation.dispatching", "输入已组装，等待运行时接收", {
@@ -1463,6 +1719,13 @@ export class HarnessEngine {
                   reasoning: config.reasoning,
                   readOnly: config.readOnly,
                   observer: !!session.source,
+                  child: !!session.child,
+                  delegation: session.kind === "task" || session.source ? (config.delegation?.enabled ? "managed" : "disabled") : undefined,
+                  agentTool: config.delegation?.enabled && session.kind === "task"
+                    ? async (command) => {
+                        try { return await this.agentCommand(execution.id, command); }
+                        catch (error) { return { error: errorText(error).replaceAll(token, "[execution credential]") }; }
+                      } : undefined,
                   fork:
                     session.source && !session.acceptedConfig
                       ? {
@@ -1471,10 +1734,10 @@ export class HarnessEngine {
                         }
                       : undefined,
                   writableRoots:
-                    context && purpose !== "mail"
+                    context && purpose !== "mail" && !session.child
                       ? [context.reports]
                       : undefined,
-                  env: session.source
+                  env: session.source || session.child
                     ? {}
                     : {
                         HARNESS_URL: this.endpoint,
@@ -1505,6 +1768,7 @@ export class HarnessEngine {
           if (purpose === "mail" && priorConfig)
             session.acceptedConfig = priorConfig;
           if (receipt.status === "accepted") {
+            for (const notice of notices) notice.consumed = true;
             execution.threadId = receipt.threadId;
             for (const item of pending) this.markDelivered(item, session);
           } else if (receipt.status === "uncertain") session.queuePaused = true;
@@ -1587,7 +1851,7 @@ export class HarnessEngine {
         ] as const)
           session.metrics.usage[key] += result.usage[key];
       }
-      if (context) {
+      if (context && !session.child) {
         context.unit.status = session.status;
         context.unit.metrics = structuredClone(session.metrics);
       }
@@ -1612,7 +1876,9 @@ export class HarnessEngine {
         detail: { seconds, usage: result.usage },
       });
       this.finishInterview(session, result);
-      if (context && purpose !== "mail")
+      if (session.child)
+        await this.finishChild(session, execution, result);
+      else if (context && purpose !== "mail")
         await this.advance(
           context.graph,
           context.task,
@@ -1626,7 +1892,11 @@ export class HarnessEngine {
         session.error = errorText(error);
         execution.status = "failed";
         session.queuePaused = true;
-        if (context) this.block(context.graph, context.task, errorText(error));
+        if (session.child) {
+          session.child.state = "failed";
+          session.child.error = errorText(error);
+          this.childNotice(session, execution);
+        } else if (context) this.block(context.graph, context.task, errorText(error));
         else
           this.record("execution.failed", errorText(error), {
             sessionId: session.id,
@@ -1640,6 +1910,8 @@ export class HarnessEngine {
         }
         if (!this.closing)
           queueMicrotask(() => {
+            void this.continueFromChildren(session);
+            if (session.child) void this.continueFromChildren(this.session(session.child.parentSessionId));
             this.drainQueue(session);
             void this.deliverWaiting(session);
           });
@@ -1782,6 +2054,11 @@ export class HarnessEngine {
       this.block(graph, task, result.error || "执行失败");
       return;
     }
+    if (this.unitHasPendingChildren(unit)) {
+      task.status = "awaiting";
+      unit.status = "waiting";
+      return;
+    }
     const submission = task.submissions.find(
       (s) => s.id === execution.submissionId,
     );
@@ -1894,11 +2171,14 @@ export class HarnessEngine {
     input: { outcome: Outcome; report: string; key?: string },
   ): Submission {
     const execution = this.authenticate(token);
+    if (this.session(execution.sessionId).child) throw new Error("Child sessions cannot submit a Unit report");
     if (!execution.graphId || !execution.taskId || !execution.unitId)
       throw new Error("此执行不能汇报");
     const graph = this.graph(execution.graphId),
       task = this.task(graph, execution.taskId),
       unit = task.units.find((u) => u.id === execution.unitId)!;
+    if (unit.sessionId !== execution.sessionId || this.unitHasPendingChildren(unit))
+      throw new Error("Unit delivery requires all descendants to finish and writable outputs to be integrated or discarded");
     if (
       !["ready", "approved", "changes_requested", "blocked"].includes(
         input.outcome,
@@ -2100,7 +2380,7 @@ export class HarnessEngine {
     return letter;
   }
   private pendingLetters(session: Session) {
-    if (session.source) return [];
+    if (session.source || session.child) return [];
     const address = this.address(session);
     return this.state.letters.flatMap((letter) =>
       letter.deliveries

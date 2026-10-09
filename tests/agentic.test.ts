@@ -65,7 +65,7 @@ async function begin(f: ReturnType<typeof fixture>, type = "reviewed") {
 }
 async function call(f: ReturnType<typeof fixture>, turn: number, command: AgentCommand) {
   const result = await f.runtime.turns[turn].input.agentTool!(command);
-  if (result && typeof result === "object" && "error" in result && typeof result.error === "string") throw new Error(result.error);
+  if (result && typeof result === "object" && !("sessionId" in result) && "error" in result && typeof result.error === "string") throw new Error(result.error);
   await flush();
   return result as { sessionId: string; executionId: string; output: string; children: { sessionId: string; executionId: string }[] };
 }
@@ -230,4 +230,70 @@ test("cancelling and explicitly discarding a writable subtree releases delivery 
   assert.equal(f.engine.session(nested.sessionId).child!.output, "discarded");
   report(f, 0);
   assert.equal(f.integrations.length, 0);
+});
+
+for (const mode of ["soft", "hard"] as const) test(`${mode} pause waits for the completed child's pending Git snapshot`, async (t) => {
+  const f = fixture(t), graph = await begin(f);
+  await call(f, 0, { op: "spawn", requestId: "writer", title: "writer", prompt: "write", access: "write" });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const snapshot = f.git.snapshot;
+  f.git.snapshot = async (...args) => { await gate; return snapshot(...args); };
+  f.runtime.turns[0].finish(); f.runtime.turns[1].finish(); await flush();
+  assert(f.engine.state.executions.every((e) => e.status === "completed"));
+  await f.engine.pauseGraph(graph.id, mode);
+  assert.equal(graph.status, "pausing");
+  release(); await flush();
+  assert.equal(graph.status, "paused");
+});
+
+test("a child cannot inherit a model outside the delegation model allowlist", async (t) => {
+  const f = fixture(t);
+  f.catalog.taskTypes.find((x) => x.id === "direct")!.units[0].delegation = { enabled: true, maxDepth: 2, maxConcurrent: 4, models: ["test-model"] };
+  await begin(f, "direct");
+  await assert.rejects(call(f, 0, { op: "spawn", requestId: "default", title: "child", prompt: "read", access: "read" }), /allowed catalog/);
+  await call(f, 0, { op: "spawn", requestId: "selected", title: "child", prompt: "read", access: "read", model: "test-model", reasoning: "high" });
+  assert.equal(f.runtime.turns[1].input.model, "test-model");
+});
+
+test("failed writable snapshots still block delivery until explicit discard", async (t) => {
+  const f = fixture(t); await begin(f);
+  const child = await call(f, 0, { op: "spawn", requestId: "writer", title: "writer", prompt: "write", access: "write" });
+  f.git.snapshot = async () => { throw new Error("snapshot failed"); };
+  f.runtime.turns[1].finish(); await flush();
+  const output = f.engine.session(child.sessionId).child!;
+  assert.equal(output.state, "failed");
+  assert.equal(output.output, "conflict");
+  await call(f, 0, { op: "wait" });
+  assert.throws(() => report(f, 0), /descendants/);
+  await call(f, 0, { op: "discard", requestId: "discard", sessionId: child.sessionId, executionId: output.resultExecutionId! });
+  report(f, 0);
+});
+
+test("failed workspace creation cannot continue a child inside the parent's workspace", async (t) => {
+  const f = fixture(t); await begin(f);
+  f.git.createChild = async () => { throw new Error("workspace unavailable"); };
+  await assert.rejects(call(f, 0, { op: "spawn", requestId: "writer", title: "writer", prompt: "write", access: "write" }), /workspace unavailable/);
+  const child = f.engine.state.sessions.find((s) => s.child)!;
+  assert.equal(child.child!.workspace.path, "");
+  await assert.rejects(call(f, 0, { op: "send", requestId: "resume", sessionId: child.id, prompt: "write" }), /workspace preparation failed/);
+  assert.equal(f.runtime.turns.length, 1);
+});
+
+test("shutdown drains a child workspace operation after the native parent turn is interrupted", async (t) => {
+  const f = fixture(t); await begin(f);
+  const create = f.git.createChild!;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  f.git.createChild = async (parent, id) => { await gate; return create(parent, id); };
+  const pending = call(f, 0, { op: "spawn", requestId: "slow", title: "slow", prompt: "read", access: "read" });
+  const rejected = assert.rejects(pending, /interrupted/);
+  await flush();
+  let stopped = false;
+  const shutdown = f.engine.shutdown().then(() => { stopped = true; });
+  await flush();
+  assert.equal(stopped, false);
+  release(); await rejected; await shutdown;
+  assert.equal(stopped, true);
+  assert.equal(f.runtime.turns.length, 1);
 });

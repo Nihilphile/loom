@@ -896,6 +896,8 @@ export class HarnessEngine {
   }
   private graphBusy(graph: Graph) {
     return (
+      [...this.jobs.keys()].some((id) => this.session(id).graphId === graph.id) ||
+      [...this.agentOperations.keys()].some((key) => key.startsWith(graph.id + "/")) ||
       this.state.sessions.some((s) => s.graphId === graph.id && s.child?.state === "preparing") ||
       this.preparing.has(graph.id) ||
       graph.tasks.some((t) => this.preparing.has(graph.id + "/" + t.id)) ||
@@ -1387,8 +1389,9 @@ export class HarnessEngine {
       return;
     }
     if (child.access === "write") {
-      child.outputSha = await this.git.snapshot(child.workspace, `Child ${session.title}`, execution.id);
       child.output = "pending";
+      try { child.outputSha = await this.git.snapshot(child.workspace, `Child ${session.title}`, execution.id); }
+      catch (error) { child.output = "conflict"; throw error; }
     }
     child.state = "finished";
     this.childNotice(session, execution);
@@ -1416,7 +1419,10 @@ export class HarnessEngine {
     const operation = prior.catch(() => {}).then(() => this.applyAgentCommand(caller, command));
     this.agentOperations.set(key, operation);
     try { return await operation; }
-    finally { if (this.agentOperations.get(key) === operation) this.agentOperations.delete(key); }
+    finally {
+      if (this.agentOperations.get(key) === operation) this.agentOperations.delete(key);
+      if (caller.graphId) this.settlePause(this.graph(caller.graphId));
+    }
   }
   private async applyAgentCommand(execution: Execution, command: AgentCommand): Promise<unknown> {
     const parent = this.session(execution.sessionId);
@@ -1470,6 +1476,8 @@ export class HarnessEngine {
         const access = command.access ?? (config.readOnly ? "read" : "write");
         if (!["read", "write"].includes(access) || (config.readOnly && access === "write")) throw new Error("Child access cannot exceed parent access");
         let model = command.model ?? config.model, effort = command.reasoning ?? config.reasoning;
+        if (config.delegation.models && (!model || !config.delegation.models.includes(model)))
+          throw new Error("Inherited or requested child model is outside the allowed catalog; specify an allowed model");
         if (command.model || command.reasoning) {
           if (!this.runtime.discoverOptions) throw new Error("Runtime model catalog unavailable");
           const options = await this.runtime.discoverOptions(config.cwd);
@@ -1485,7 +1493,7 @@ export class HarnessEngine {
           id, title: text(command.title, "title"), kind: "task", graphId: graph.id, taskId: task.id, unitId: unit.id,
           status: "idle", model, reasoning: effort, messages: [], metrics: emptyMetrics(), turns: 0,
           child: { parentSessionId: parent.id, depth, state: "preparing", access,
-            workspace: parent.child?.workspace ?? task.workspace!, output: "none" },
+            workspace: { path: "", branch: "", baseCommit: "" }, output: "none" },
         };
         const prompt = text(command.prompt, "prompt");
         receipt.sessionId = id;
@@ -1509,6 +1517,8 @@ export class HarnessEngine {
         }
       } else if (command.op === "send") {
         this.ensureStopped(target!);
+        if (!target!.child!.config || !target!.child!.workspace.path)
+          throw new Error("Child workspace preparation failed; create a new child instead of continuing this registration");
         const active = this.descendants(unit.sessionId!).filter((s) => ["preparing", "active", "waiting"].includes(s.child!.state));
         if (active.length >= config.delegation.maxConcurrent) throw new Error("Unit child concurrency limit reached");
         if (target!.child!.output === "pending" || target!.child!.output === "conflict") throw new Error("Resolve the previous writable output before continuing");
@@ -1941,7 +1951,10 @@ export class HarnessEngine {
       execution.usageKnown = true;
     }
     if (event.contextUsage) session.contextUsage = event.contextUsage;
-    if (event.model) execution.model = event.model;
+    if (event.model) {
+      execution.model = event.model;
+      if (session.acceptedConfig) session.acceptedConfig.model = event.model;
+    }
     if (event.type === "turn.started")
       queueMicrotask(() => void this.deliverWaiting(session));
     if (event.type === "assistant.delta" && event.text) {
@@ -2611,7 +2624,7 @@ export class HarnessEngine {
         graph.pauseMode = "hard";
       }
     await Promise.all([...this.jobs.keys()].map((id) => this.interrupt(id)));
-    while (this.preparing.size || this.pumping.size)
+    while (this.preparing.size || this.pumping.size || this.agentOperations.size)
       await new Promise((resolve) => setTimeout(resolve, 20));
     for (const graph of this.state.graphs) this.settlePause(graph);
   }

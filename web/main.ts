@@ -18,7 +18,7 @@ import type {
   InterviewSettings,
 } from "../src/shared/types.ts";
 import { defaultInterviews } from "../src/shared/types.ts";
-import { statistics, type StatsFilters } from "./statistics.ts";
+import { statistics, summarize, type StatsFilters } from "./statistics.ts";
 import { agenticSession, delegationFields, delegationLabel, readDelegation, sessionTree } from "./agentic.ts";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -426,18 +426,9 @@ function intro(
 function tokenSummary(m: Metrics) {
   return `${fmt(m.usage.inputTokens)} / ${fmt(m.usage.cachedInputTokens)} / ${fmt(m.usage.outputTokens)}`;
 }
-function metrics(items: Metrics[], tasks: Task[] = []) {
-  const total = items.reduce(
-    (sum, m) => ({
-      input: sum.input + m.usage.inputTokens,
-      cached: sum.cached + m.usage.cachedInputTokens,
-      output: sum.output + m.usage.outputTokens,
-      seconds: sum.seconds + m.seconds,
-      calls: sum.calls + m.toolCalls,
-    }),
-    { input: 0, cached: 0, output: 0, seconds: 0, calls: 0 },
-  );
-  return `<div class="metrics"><div class="metric"><label>输入 TOKENS</label><div class="value">${fmt(total.input)}<small>含缓存</small></div></div><div class="metric"><label>缓存输入 TOKENS</label><div class="value">${fmt(total.cached)}<small>输入的子集</small></div></div><div class="metric"><label>输出 TOKENS</label><div class="value">${fmt(total.output)}</div></div><div class="metric"><label>执行记录</label><div class="value">${fmt(total.seconds)}<small>秒 · ${fmt(total.calls)} 次工具调用</small></div></div></div>${tasks.length ? `<p class="tiny muted">已交付 ${tasks.filter((t) => t.status === "done").length} / ${tasks.length} Tasks</p>` : ""}`;
+function metrics(items: NonNullable<AppState["executions"]>, tasks: Task[] = []) {
+  const total = summarize(items);
+  return `<div class="metrics"><div class="metric"><label>输入 TOKENS</label><div class="value">${total.known ? fmt(total.usage.inputTokens) : "未知"}<small>含缓存</small></div></div><div class="metric"><label>缓存输入 TOKENS</label><div class="value">${total.known ? fmt(total.usage.cachedInputTokens) : "未知"}<small>输入的子集</small></div></div><div class="metric"><label>输出 TOKENS</label><div class="value">${total.known ? fmt(total.usage.outputTokens) : "未知"}</div></div><div class="metric"><label>累计 Agent 秒</label><div class="value">${total.measured ? fmt(total.seconds) : "未知"}<small>秒 · ${total.measured ? fmt(total.calls) : "未知"} 次工具调用</small></div></div></div><p class="tiny muted">自身与后代 · 已知用量 ${total.known} / ${total.count} 条执行记录</p>${tasks.length ? `<p class="tiny muted">已交付 ${tasks.filter((t) => t.status === "done").length} / ${tasks.length} Tasks</p>` : ""}`;
 }
 function graphsPage() {
   const g = graph();
@@ -460,8 +451,8 @@ function graphsPage() {
       )
     );
   output += metrics(
-    g.tasks.flatMap((t) =>
-      t.units.filter((u) => u.kind === "agent").map((u) => u.metrics),
+    (state?.executions ?? []).filter(
+      (row) => row.graphId === g.id && row.purpose !== "sidechat" && row.purpose !== "interview",
     ),
     g.tasks,
   );

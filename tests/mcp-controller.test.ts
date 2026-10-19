@@ -127,7 +127,7 @@ test("stdio + HTTP + Engine complete command graph delivery, reports, graph cont
   const type: TaskType = {
     id: "controller-command", name: "Controller command", version: 1,
     units: [{ id: "check", name: "check", kind: "command", skills: [], prompt: "", readOnly: false,
-      command: "node -e \"require('fs').writeFileSync('command-result.txt','ok');console.log('stdio command verified')\"" }],
+      command: "node -e \"setTimeout(()=>{require('fs').writeFileSync('command-result.txt','ok');console.log('stdio command verified')},200)\"" }],
     start: ["check"], rules: [{ from: "check", outcome: "ready", action: { type: "finish" } }], maxRounds: 2, maxReportRetries: 0,
   };
   f.app.engine!.saveType(type);

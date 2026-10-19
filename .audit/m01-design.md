@@ -18,7 +18,7 @@ Both require explicit `mcp_servers.loom.enabled=false` on Task/child/observer st
 
 Data first, per Model the Domain: `Session.executionOwner` is `{kind:'loom'}` or `{kind:'external',client:'desktop'}`. Old records normalize to Loom. A private ProjectState controller-access collection stores session ID, credential hash and mutation receipts. Engine.view never exposes it. No connected/disconnected execution policy exists.
 
-Controller credentials use a dedicated HTTP header, never a Unit Bearer token. MCP reads a configured private environment key and sends no HARNESS credentials. HTTP rejects Unit credentials on controller routes and controller credentials on ordinary routes. The adapter accepts only a local port, a project UUID and session UUID, never an arbitrary URL.
+Controller credentials use a dedicated HTTP header, never a Unit Bearer token. MCP reads a configured private environment key and sends no HARNESS credentials. HTTP rejects Unit credentials on controller routes and controller credentials on ordinary routes. The adapter accepts only a local port, a 24-character project ID and session UUID, never an arbitrary URL.
 
 Shared strict schemas define each tool's bounded inputs and the matching HTTP operation. Engine verifies external ownership, principal and graph association on every operation. MCP imports neither Engine nor SQLite. Its only effects are typed localhost HTTP calls.
 
@@ -32,7 +32,7 @@ Ordinary send/queue/steer/continue/interrupt/observer entry points reject extern
 
 ## Scores and synthesis decision
 
-Scores are 0..5 for external never starts / Unit unchanged / durable explicit ack / narrow single owner / stdio and graph testability. Parent scores A 5/5/5/5/5; B 5/5/5/4/5. A is the base. Graft B's private credential storage to avoid publishing authentication metadata with session history. Reject generation and a second binding identity because disconnect never transfers ownership. Reduced diversity: both allowed inherited gpt-6.1-sol, high/xhigh reasoning. Independent cross-judge pending.
+Scores are 0..5 for external never starts / Unit unchanged / durable explicit ack / narrow single owner / stdio and graph testability. Initial parent estimates were A 5/5/5/5/5; B 5/5/5/4/5. The independent cross-judge corrected both to 21/25; the initial estimates did not establish verification and were too generous. A is the base on simplicity. Graft B's private credential storage to avoid publishing authentication metadata with session history. Reject generation and a second binding identity because disconnect never transfers ownership. Reduced diversity: both allowed inherited gpt-6.1-sol, high/xhigh reasoning.
 
 ## Tradeoffs and implementation reconciliation
 
@@ -42,4 +42,10 @@ Queued input preservation is an intentional deviation from candidate A's strict 
 
 The current Windows sandbox denies Node pipe creation even before edits. Baseline typecheck passed; baseline build failed at Vite's pipe-backed subprocess with EPERM. Mandatory SDK stdio/full-suite execution remains a delivery gate, never a claimed pass.
 
-Next: independent cross-judge, then parent-only implementation and real artifact checks. Outer Task reviewer independently accepts the final candidate.
+Cross-judge e68e9fbd-9361-46e1-b6e6-e88ad3fa03b6 conditionally approved A with private credentials. Its rubric scored both candidates 21/25 and correctly rejected the parent's perfect verification scores as premature. It selected A on simplicity, not a single-owner deficit in B. The parent accepts that correction.
+
+The implementation added the cross-judge's requested safeguards: observer-source checks, atomic queue freeze and receipts, deterministic feedback files, separated HTTP credentials, refused redirects, and Runtime disabling at both boundaries. The subsequent implementation preflight found that the observer check was incomplete: it tested absence of a thread ID while dispatch tested absence of accepted configuration. A rejected first turn can leave these states different. The parent accepts that finding and replaces all three decisions with one `forkSource` helper based on accepted configuration. A regression failed with `Missing expected rejection` before the fix and passed afterward, covering rejected-first-turn retries and pending forks during binding. No second controller identity or connection lifecycle was added.
+
+The preflight also found an acknowledgement cursor failure in its earlier snapshot. Cursors now resolve against stable owned Letters before filtering acknowledged deliveries. A three-Letter, two-item page test acknowledges the entire page, restarts Engine, and verifies the continuation returns the last unread Letter. Both preflight fixes passed the 25-test controller/session/preparation run and typecheck; full pipe-backed acceptance remains separate.
+
+The independent implementation preflight is read-only session 18606cc4-150d-4ad9-b125-ce13f8ec6f10, execution e34173fa-2103-4288-9668-7270928ea21d. The same session's bounded recheck, execution eaf63cc5-aa09-4904-aeb0-a98ed092bb0b, confirmed both findings closed against the parent source and tests, without rerunning checks. All children have ended with output none. Outer Task reviewer still independently accepts the final candidate after mandatory verification is unblocked.

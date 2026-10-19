@@ -51,9 +51,10 @@ export function contentWindow(content: string, offset: number) {
   return { content: text, offset, totalLength: content.length,
     nextOffset: offset + text.length < content.length ? offset + text.length : null };
 }
-export function controllerPage<T extends { id: string }>(items: T[], after: string | undefined, limit: number) {
+export function controllerPage<T extends { id: string }>(items: T[], after: string | undefined, limit: number, include?: (item: T) => boolean) {
   const index = after ? items.findIndex((item) => item.id === after) : -1;
   if (after && index < 0) throw new ControllerError("INVALID_CURSOR", "Cursor is outside this selection", 400);
-  const selected = items.slice(index + 1, index + 1 + limit);
-  return { items: selected, next: index + 1 + limit < items.length ? selected.at(-1)?.id : null };
+  const remaining = items.slice(index + 1).filter((item) => !include || include(item));
+  const selected = remaining.slice(0, limit);
+  return { items: selected, next: remaining.length > limit ? selected.at(-1)?.id : null };
 }

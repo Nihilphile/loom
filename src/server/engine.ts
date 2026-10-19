@@ -248,11 +248,14 @@ export class HarnessEngine {
     this.record("session.created", "创建自由会话", { sessionId: session.id });
     return session;
   }
+  private forkSource(session: Session) {
+    return session.acceptedConfig ? undefined : session.source;
+  }
   private requireLoom(session: Session) {
     if (session.executionOwner?.kind === "external")
       throw new ControllerError("EXTERNAL_SESSION", "This free session is managed by Desktop; use its controller inbox");
-    if (session.source && !session.threadId)
-      this.requireLoom(this.session(session.source.sessionId));
+    const source = this.forkSource(session);
+    if (source) this.requireLoom(this.session(source.sessionId));
   }
   private controllerSession(id: string, key: string) {
     if (typeof key !== "string" || key.length < 32 || key.length > 512)
@@ -299,7 +302,7 @@ export class HarnessEngine {
       return { sessionId: id, executionOwner: session.executionOwner, threadId: session.threadId };
     }
     if (session) {
-      const observerPending = this.state.sessions.some((s) => s.source?.sessionId === id && !s.threadId &&
+      const observerPending = this.state.sessions.some((s) => this.forkSource(s)?.sessionId === id &&
         (this.jobs.has(s.id) || this.turnOperations.has(s.id) || s.status === "running" ||
           this.state.feedback.some((f) => f.sessionId === s.id && ["pending", "running"].includes(f.status))));
       if (session.kind !== "free" || session.source || session.child || session.graphId || session.taskId || session.unitId ||
@@ -394,9 +397,10 @@ export class HarnessEngine {
           return { id: letter.id, graphId: letter.graphId, from: letter.from, title: letter.title, digest: letter.digest,
             ...contentWindow(letter.content, command.offset) };
         }
-        return controllerPage(letters.filter((l) => command.includeAcknowledged || l.deliveries.some((d) => d.to === `session/${sessionId}` && d.status !== "acknowledged" && d.status !== "injected"))
-          .map((l) => ({ id: l.id, graphId: l.graphId, from: l.from, title: l.title, digest: l.digest, createdAt: l.createdAt,
-            delivery: l.deliveries.find((d) => d.to === `session/${sessionId}`) })), command.after, command.limit);
+        const page = controllerPage(letters, command.after, command.limit,
+          (l) => command.includeAcknowledged || l.deliveries.some((d) => d.to === `session/${sessionId}` && d.status !== "acknowledged" && d.status !== "injected"));
+        return { ...page, items: page.items.map((l) => ({ id: l.id, graphId: l.graphId, from: l.from, title: l.title,
+          digest: l.digest, createdAt: l.createdAt, delivery: l.deliveries.find((d) => d.to === `session/${sessionId}`) })) };
       }
       case "ack": {
         const letter = this.state.letters.find((l) => l.id === command.letterId && l.graphId === graph!.id);
@@ -2081,6 +2085,7 @@ export class HarnessEngine {
         this.record("preparation.dispatching", "输入已组装，等待运行时接收", {
           sessionId: session.id,
         });
+        const source = this.forkSource(session);
         const handle =
           context?.unit.kind === "command"
             ? this.command(context.unit.command!, cwd, onEvent)
@@ -2102,10 +2107,10 @@ export class HarnessEngine {
                         catch (error) { return { error: errorText(error).replaceAll(token, "[execution credential]") }; }
                       } : undefined,
                   fork:
-                    session.source && !session.acceptedConfig
+                    source
                       ? {
-                          threadId: session.source.threadId,
-                          turnId: session.source.turnId,
+                          threadId: source.threadId,
+                          turnId: source.turnId,
                         }
                       : undefined,
                   writableRoots:

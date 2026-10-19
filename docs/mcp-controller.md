@@ -15,7 +15,7 @@ Engine is the only state writer. `Session.executionOwner` distinguishes `{kind:"
 
 An existing target must be an idle or failed free session. Binding rejects Task, child, observer, interrupted, and active sessions, pending turn validation or delivery, uncertain input acceptance, pending source-thread forks, and a surviving previous Loom process. Binding saves ownership, authentication, and `queuePaused=true` together. Queued user input remains visible and frozen. Historical messages, native thread identity, and execution evidence remain intact.
 
-An observer created before binding must recheck source ownership before its first fork. An observer with its own established native thread remains independent. Ordinary chat, queue, steer, continue, interrupt, and new observer requests cannot control the external session. Automatic queue and Mailbox paths return without dispatch. A final guard in `launch` refuses external ownership before creating an execution.
+An observer created before binding must recheck source ownership whenever it still needs a source fork. A native thread ID alone does not establish independence: a rejected first turn can leave that ID without accepted configuration. Binding, the ownership guard, and Runtime dispatch share the same fork condition. An observer with accepted configuration on its own native thread remains independent. Ordinary chat, queue, steer, continue, interrupt, and new observer requests cannot control the external session. Automatic queue and Mailbox paths return without dispatch. A final guard in `launch` refuses external ownership before creating an execution.
 
 Disconnect and restart preserve external ownership. There is no implicit handback, credential rotation, or unbind operation in this version. Reconnect uses the same session UUID and key. Existing native thread identity cannot be changed by reconnect.
 
@@ -43,7 +43,7 @@ Graph, report, recipient, and acknowledgement operations verify ownership on eve
 
 ## Notifications and retries
 
-Notifications first persist as existing Letters. Reading does not reserve, inject, or acknowledge them, including while a graph is paused. `loom_ack` changes this controller's delivery to `acknowledged`, records its first timestamp, and commits the event. Retrying produces no duplicate event and does not consume newer Letters. Existing Unit deliveries retain `queued` and `injected` semantics.
+Notifications first persist as existing Letters. Reading does not reserve, inject, or acknowledge them, including while a graph is paused. `loom_ack` changes this controller's delivery to `acknowledged`, records its first timestamp, and commits the event. Retrying produces no duplicate event and does not consume newer Letters. Page cursors resolve against the stable owned-letter sequence before acknowledged deliveries are filtered, so acknowledging a page does not invalidate its continuation, including after restart. Existing Unit deliveries retain `queued` and `injected` semantics.
 
 `graph_create` and `send_feedback` require a `requestId`. Receipts are scoped to controller and operation. Repeating validated arguments returns the original graph or Letter ID; changed arguments with the same ID fail. The receipt commits with its effect before delivery starts. Feedback files have deterministic identities under Engine's reports directory, so a crash before commit can safely retry.
 
@@ -58,7 +58,7 @@ Register the server as exactly `loom`. [OpenAI's MCP configuration documentation
 ```toml
 [mcp_servers.loom]
 command = 'C:\Program Files\nodejs\node.exe'
-args = ['F:\path-to-reviewed-candidate\dist\mcp-controller.js', '--port', '4317', '--project', '<24-character-project-id>', '--session', '<free-session-uuid>']
+args = ['F:\path-to-reviewed-candidate\dist\mcp-controller.js', '--port', '4318', '--project', '<24-character-project-id>', '--session', '<free-session-uuid>']
 enabled = true
 
 [mcp_servers.loom.env]
@@ -70,10 +70,10 @@ Generate and retain a private random key locally. Do not paste it into chat, com
 The standalone command is:
 
 ```powershell
-node <reviewed-candidate>/dist/mcp-controller.js --port 4317 --project <project-id> --session <free-session-uuid>
+node <reviewed-candidate>/dist/mcp-controller.js --port 4318 --project <project-id> --session <free-session-uuid>
 ```
 
-The launcher must supply `LOOM_CONTROLLER_KEY` privately. No `HARNESS_*` identity is used. Startup refuses an inherited Unit `HARNESS_TOKEN` as a second check.
+The launcher must supply `LOOM_CONTROLLER_KEY` privately. No `HARNESS_*` identity is used. Startup refuses an inherited Unit `HARNESS_TOKEN` as a second check. The example uses the controller-reported recovery port `4318`; select the actual accepted service port explicitly. The adapter defaults to `4317` only when the port argument is omitted and does not discover a running service.
 
 Runtime explicitly sets `mcp_servers.loom.enabled=false` for every Task, child, and observer, at both app-server startup and thread start/resume/fork. This does not rely on `HARNESS_*`, which child environment filtering removes. Task and child execution retain other MCP configuration, `loom_agent`, and CLI report. Observers retain their existing stricter isolation and `loom_observer`. Other registration names are not aliases for this feature and must not be used.
 
@@ -95,19 +95,19 @@ The last command is also an independent way to run the official SDK stdio fixtur
 
 ### Recorded results in the managed M01 environment
 
-The mandatory full verification gate is **not yet passed**. Do not deploy this candidate on the basis of the following partial results.
+The mandatory full verification gate is **not yet passed**. The controller's Mailbox instruction `487c7faf-1165-40f9-be87-b3faa6b803c4` assigns full tests, build, and native compatibility verification to an independent acceptance worktree after this worker freezes the reviewed candidate. Worker handoff can be ready for that review without claiming those checks passed. Do not deploy on the basis of partial results.
 
 | Check | Actual result |
 |---|---|
 | `npm run typecheck` | Passed. |
-| Direct Node behavior run across controller, session, preparation, Agentic, UI helpers, HTTP foundation, statistics, attachments | 50 passed, 0 failed. |
+| Direct Node behavior run across controller, session, preparation, Agentic, UI helpers, HTTP foundation, statistics, attachments | Final run: 53 passed, 0 failed. After preflight fixes, controller/session/preparation also passed 25 tests, including rejected observer acceptance and acknowledgement of a complete inbox page across restart. |
 | `npm test` | Blocked by Windows `spawn EPERM` while Node creates test-runner pipes. |
 | `npm run build` | Server TypeScript emitted; Vite failed with `spawn EPERM`. The same failure occurred before implementation. |
 | Official SDK `StdioClientTransport` test | Executed and failed at process pipe creation with `spawn EPERM`, before initialize. |
 | Complete Git/HTTP/Engine/MCP fixture | Executed and failed at Git subprocess pipe creation with `spawn EPERM`. |
-| Direct shell-to-stdio initialize and tools/list | Passed against emitted server: protocol `2025-11-25`, server `loom`, exactly 9 tools, JSON-only stdout. This is not a substitute for the official SDK client gate. |
+| Direct shell-to-stdio initialize, tools/list, tools/call | Passed against the source server: protocol `2025-11-25`, server `loom`, exactly 9 tools, JSON-only stdout. A state call to a deliberately closed fixture port returned `isError:true` with `HTTP_UNAVAILABLE`. This is not a substitute for the official SDK client gate. |
 
-Raw logs are in `.newharness/reports/worker/`: `typecheck.log`, `npm-test.log`, `build.log`, `behavior-tests.log`, and `shell-stdio.jsonl`. The worker report records the final check outputs and review status. The operator-supplied pre-change baseline of 100 pass / 3 real-Codex skips is historical evidence, not a claimed candidate result.
+Raw logs are in `.newharness/reports/worker/`: `typecheck.log`, `npm-test.log`, `build.log`, `behavior-tests.log`, `final-behavior-tests.log`, `controller-final.log`, `preflight-observer-red.log`, `preflight-regressions.log`, `sdk-stdio.log`, and `shell-stdio.jsonl`. The observer regression failed before its fix with `Missing expected rejection`, then passed after the fix. The worker report records the final check outputs and review status. The operator-supplied pre-change baseline of 100 pass / 3 real-Codex skips is historical evidence, not a claimed candidate result.
 
 ## Deploy this candidate after acceptance
 
@@ -118,3 +118,5 @@ Raw logs are in `.newharness/reports/worker/`: `typecheck.log`, `npm-test.log`, 
 5. From Desktop, call connect without `create` for an existing session, inspect its external ownership, and read its inbox. Existing graph controller associations and queued notices remain. Acknowledge only notices actually handled. Verify the UI shows external ownership and offers no local send/continue/observer controls.
 
 The key has no recovery/rotation endpoint in this version. Keep it safe. A server update is required for Engine ownership enforcement; registering the adapter against an old server does not provide the new boundary. No deployment or global registration has been performed by this task.
+
+SSE backpressure is explicitly outside M01 and belongs to dependent Task M02. This candidate does not alter stream writes or attempt to repair the running service. The controller's isolated native MCP probe is an outer acceptance action, with zero model turns and no resumption of the current Desktop thread.

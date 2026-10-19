@@ -17,6 +17,8 @@ class ControllerRuntime implements Runtime {
   capabilities = { inject: true, interrupt: true, readOnly: true, fork: true };
   starts: RuntimeInput[] = [];
   injections: string[] = [];
+  uncertain = false;
+  rejected = false;
   finish: (() => void)[] = [];
   discoverOptions = async (_cwd: string) => ({ models: [{ id: "fixture", name: "fixture", reasoning: [] }], skills: [], warnings: [] });
   async start(input: RuntimeInput, emit: (event: RuntimeEvent) => void) {
@@ -26,7 +28,7 @@ class ControllerRuntime implements Runtime {
     let finish!: () => void;
     const done = new Promise<RuntimeResult>((resolve) => { finish = () => resolve({ status: "completed", text: "done", threadId }); });
     this.finish.push(finish);
-    return { accepted: Promise.resolve({ status: "accepted" as const, threadId, turnId: "checkpoint" }), done,
+    return { accepted: Promise.resolve(this.rejected ? { status: "rejected" as const, reason: "native turn rejected" } : this.uncertain ? { status: "uncertain" as const, reason: "lost native acknowledgement" } : { status: "accepted" as const, threadId, turnId: "checkpoint" }), done,
       inject: async (text: string) => { this.injections.push(text); return true; }, interrupt: async () => { finish(); } };
   }
 }
@@ -50,20 +52,60 @@ function fixture(t: TestContext) {
 const graphInput = (requestId: string) => ({ op: "graph_create", requestId, name: requestId,
   tasks: [{ id: "A", title: "A", goal: "fixture", deps: [], taskTypeId: "direct" }] });
 
+test("observer rejected acceptance cannot fork an externally owned source on retry or cross binding while pending", async (t) => {
+  const f = fixture(t);
+  f.runtime.rejected = true;
+  for (const pending of [false, true]) {
+    const source = f.engine.createSession({ title: "source before Desktop takeover" });
+    source.threadId = "source-native"; source.lastCompletedTurnId = "checkpoint";
+    const observer = f.engine.createSidechat(source.id);
+    await f.engine.sendMessage(observer.id, "first fork");
+    const index = f.runtime.starts.length - 1;
+    assert.ok(observer.threadId);
+    assert.equal(observer.acceptedConfig, undefined);
+    if (pending) await assert.rejects(f.call(source.id, { op: "connect" }), /pending Loom work/);
+    f.runtime.finish[index](); await until(() => !f.engine.busy);
+    assert.equal(observer.status, "failed");
+    await f.call(source.id, { op: "connect" });
+    const starts = f.runtime.starts.length;
+    await assert.rejects(f.engine.sendMessage(observer.id, "retry after rejected turn"), /managed by Desktop/);
+    assert.equal(f.runtime.starts.length, starts);
+  }
+});
+
+test("acknowledging a full inbox page preserves its continuation through restart", async (t) => {
+  const f = fixture(t), sessionId = randomUUID();
+  await f.call(sessionId, { op: "connect", create: true });
+  const created = await f.call(sessionId, graphInput("pagination")) as { graphId: string };
+  const sender = f.engine.createSession({ title: "sender" });
+  const path = join(f.root, "notices.md"); writeFileSync(path, "three durable notices");
+  const letters = [1, 2, 3].map((n) => f.engine.sendLetter({ graphId: created.graphId, from: `session/${sender.id}`,
+    to: [`session/${sessionId}`], title: `Notice ${n}`, path }));
+  const page = await f.call(sessionId, { op: "inbox", graphId: created.graphId, limit: 2 }) as { items: { id: string }[]; next: string };
+  assert.deepEqual(page.items.map((l) => l.id), letters.slice(0, 2).map((l) => l.id));
+  assert.equal(page.next, letters[1].id);
+  for (const item of page.items) await f.call(sessionId, { op: "ack", graphId: created.graphId, letterId: item.id });
+  f.restart();
+  const continuation = await f.call(sessionId, { op: "inbox", graphId: created.graphId, after: page.next, limit: 2 }) as { items: { id: string }[]; next: null };
+  assert.deepEqual(continuation.items.map((l) => l.id), [letters[2].id]);
+  assert.equal(continuation.next, null);
+  assert.equal(f.runtime.starts.length, 0);
+});
+
 test("Desktop binding freezes queued input, preserves native identity and persists inbox until explicit idempotent ack", async (t) => {
   const f = fixture(t);
   const session = f.engine.createSession({ title: "Desktop" });
   session.queuePaused = true;
   await f.engine.sendMessage(session.id, { text: "preserve me", mode: "queue" });
   session.status = "failed"; session.threadId = "desktop-native";
-  await f.call(session.id, { op: "connect" });
-  const created = await f.call(session.id, graphInput("first")) as { graphId: string };
-  const second = await f.call(session.id, graphInput("second")) as { graphId: string };
-  const graph = f.engine.graph(created.graphId);
+  const graph = f.engine.createGraph({ name: "existing controller graph", tasks: [{ id: "A", title: "A", goal: "fixture", deps: [], taskTypeId: "direct" }] });
+  f.engine.updateGraph(graph.id, { controllerSessionId: session.id, subscription: "completed" });
   graph.status = "done";
   const file = join(f.root, "feedback.md"); writeFileSync(file, "durable notice");
   const sender = f.engine.createSession({ title: "Sender" });
   const letter = f.engine.sendLetter({ graphId: graph.id, from: `session/${sender.id}`, to: [`session/${session.id}`], title: "Notice", path: file });
+  await f.call(session.id, { op: "connect" });
+  const second = await f.call(session.id, graphInput("second")) as { graphId: string };
   for (const mode of ["send", "queue", "steer"] as const)
     await assert.rejects(f.engine.sendMessage(session.id, { text: "do not dispatch", mode }), /managed by Desktop/);
   assert.throws(() => f.engine.continueQueue(session.id), /managed by Desktop/);
@@ -85,11 +127,32 @@ test("Desktop binding freezes queued input, preserves native identity and persis
   assert.deepEqual(await f.call(session.id, { op: "ack", graphId: graph.id, letterId: letter.id }), ack);
   const inbox = await f.call(session.id, { op: "inbox" }) as { items: { id: string }[] };
   assert.deepEqual(inbox.items.map((l) => l.id), [newer.id]);
+  assert.deepEqual(await f.call(session.id, { op: "inbox", after: letter.id }), inbox);
   assert.equal(f.engine.session(session.id).queue?.[0].input.text, "preserve me");
   assert.equal(f.engine.session(session.id).threadId, "desktop-native");
   assert.equal(f.engine.session(session.id).queuePaused, true);
   assert.equal(f.runtime.starts.length, 0); assert.equal(f.runtime.injections.length, 0);
   assert.doesNotMatch(JSON.stringify(f.engine.view()), /keyHash|controllerAccess|fixture-controller-key/);
+});
+
+test("binding refuses uncertain native input and a still-live previous Loom process", async (t) => {
+  const f = fixture(t);
+  f.runtime.uncertain = true;
+  const session = f.engine.createSession({ title: "uncertain native input" });
+  await f.engine.sendMessage(session.id, "pending native acceptance");
+  await until(() => f.runtime.starts.length === 1);
+  f.runtime.finish[0](); await until(() => !f.engine.busy);
+  assert.equal(session.status, "failed");
+  await assert.rejects(f.call(session.id, { op: "connect" }), /pending Loom work/);
+  const previous = f.engine.createSession({ title: "live previous process" });
+  f.runtime.uncertain = false;
+  await f.engine.sendMessage(previous.id, "fixture");
+  await until(() => f.runtime.starts.length === 2);
+  f.runtime.finish[1](); await until(() => !f.engine.busy);
+  const execution = f.engine.state.executions.findLast((e) => e.sessionId === previous.id)!;
+  execution.pid = process.pid;
+  await assert.rejects(f.call(previous.id, { op: "connect" }), /previous Loom process is still alive/);
+  assert.equal(execution.pid, process.pid);
 });
 
 test("controller retries survive restart, keep graphs isolated and cannot reassign an external owner", async (t) => {

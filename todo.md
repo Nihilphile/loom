@@ -1,5 +1,7 @@
 # Prototype 0.3
 
+> Historical prototype work log from 2026-10-08. The checklists below describe browser simulations and the predecessor investigation. They are not this implementation's task list or verification evidence. The final whole-graph merge shown by the prototype has been replaced by the [current Graph integration contract](docs/SPEC.md). Preserve the old claims, including the then-absent Git repository, within their historical scope.
+
 - [x] Scope the decision the prototype exists to make: which layout, which interaction, which density, or for an empirical fork which behavior, timing, or approach. No decision means no prototype. Route to Feature.
   Question: can the user distinguish an accepted report, a finished turn, a paused graph, and a final delivery?
 - [x] Gather references when the design space is open. Search for prior art, summarize a moodboard of themes, palettes, and layouts, let the user pick directions before building. Skip when the direction is set.

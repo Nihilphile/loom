@@ -35,7 +35,9 @@ Task 调度规则选中 Unit
 
 Preparation 不决定应该采用 Matt 或 pstack，不选择信件收件人，不代写交接报告，也不根据自然语言判定任务完成。工作流给出明确配置与材料选择，Loom 校验和执行。最小 CLI 使用说明属于平台帮助，不等于启用某个工作流。
 
-Task 的 Git 工作区准备仍由 Engine／Git 执行，包括依赖成果合并和冲突检查。它与每次 Unit 输入准备是两个职责。工作区状态展示在 Task 信息中。
+Task 的 Git 工作区准备由 Engine／Git 执行。所有前置 Task 已成功集成后，程序固定 Graph 当前集成 HEAD 并创建独立工作区，可能包含已集成的独立 Task。它不在启动时另合并依赖列表，与每次 Unit 输入准备是两个职责。工作区状态展示在 Task 信息中。
+
+TaskType 的 finish 只将验收后的不可变候选交给每 Graph 串行集成队列。程序在隔离工作区合并并验证实际结果，通过后才推进 Graph 分支、完成 Task 并放行下游。Command Unit 的工作流检查不能代替合并后验证。交付记录区分输入接收、报告、候选快照和实际集成提交，完整契约见 [实施规格 R10、R11](SPEC.md)。Agentic 子会话仍需先完成或处置其写入成果，不能绕过外部审查或直接交付到 Graph。
 
 ## Unit Config 与 Context
 

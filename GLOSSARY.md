@@ -14,7 +14,25 @@
 由任务节点及其依赖关系组成的有向无环图，可由 agent 创建。用户启动任务图后，harness 根据依赖关系自动派发 agent 执行任务。
 
 **任务（Task）**：
-任务图中的一个工作节点，其执行需要遵循图中声明的依赖关系。
+任务图中的一个工作节点。所有前置 Task 成功集成后才能启动，从固定的 Graph 当前集成 HEAD 创建独立执行工作区。工作流验收后还需排队集成，成功发布才完成。
+
+**集成分支（Integration branch）**：
+Graph 专用的 Git 分支，首次运行固定项目已提交 HEAD 为初始起点，每次 Task 集成验证通过后推进。它可以包含无 DAG 依赖关系的已交付成果，不自动更新项目原分支。
+
+**执行起点（Start commit）**：
+Task 创建工作区之前固定的 Graph 集成 HEAD，保存在 `Task.startCommit`。活动工作区不随 Graph 集成分支推进。
+
+**候选（Candidate）**：
+程序在安全边界固定的源提交。经过 TaskType 配置验收后才能进入交付队列，队列绑定这一不可变提交。它区别于实际合并后发布到 Graph 的集成提交。
+
+**交付（Delivery）**：
+将已验收候选合并、验证并发布到 Graph 集成分支的操作及持久记录。`TaskDelivery` 关联固定源提交、验证证据和发布回执；Task 只有发布成功才完成。`Task.deliverySha` 记录源提交，实际集成提交由发布回执标识。暂停后编辑未交付 Task 会把旧记录标为 `superseded` 并保留历史，新候选产生新交付。
+
+**交付队列（Integration queue）**：
+每个 Graph 串行处理候选的持久队列。Task 使用 `merge_queued` 和 `integrating` 表示等待与处理中，追加 Task 的 `queued` 仍表示追加屏障。一次交付失败不阻塞独立队列项。
+
+**集成验证（Integration validation）**：
+在隔离工作区的真实合并结果上执行 Graph 创建时配置的命令。通过后才发布，未配置命令也明确记录。TaskType 的 Command Unit 检查属于工作流验收，不代替此验证。
 
 **任务类型（TaskType）**：
 跨项目复用的可执行工作流配置，定义 Task 的 Unit 组成、成员模板、调度规则、完成条件与运行限制。具体 Task 提供目标、依赖及必要覆盖，运行时使用配置快照。

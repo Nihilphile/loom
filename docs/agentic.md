@@ -1,6 +1,6 @@
 # Agentic configuration and session inspection
 
-The personal library includes the `agentic` Agent template and the `agentic-reviewed` TaskType. The TaskType starts an Agentic worker and activates a separate readonly reviewer after delivery. Child reviews do not replace that reviewer. Missing built-ins are added when loading an existing catalog; saved entries with the same ID keep their customizations.
+The personal library includes the `agentic` Agent template and the `agentic-reviewed` TaskType. The TaskType starts an Agentic worker and activates a separate readonly reviewer after the worker's valid report, normal turn completion and candidate snapshot. Child reviews do not replace that reviewer. Graph delivery happens later through the [integration queue](architecture.md#graph-集成队列). Missing built-ins are added when loading an existing catalog; saved entries with the same ID keep their customizations.
 
 Enable delegation in an Agent template or in the per-Unit controls below the TaskType JSON editor. Configure maximum depth, concurrent children, and optional model IDs. Delegation is disabled when omitted. The built-in Agentic configuration permits depth 3 and concurrency 4. Saving a template or TaskType does not rewrite existing Task snapshots. The per-Unit controls override the matching Unit's `delegation` in the JSON editor; new Units can declare it directly in JSON.
 

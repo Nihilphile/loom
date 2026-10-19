@@ -2,7 +2,19 @@
 
 User authorized implementation on 2026-10-08. Matt Task owns specification and task registration; Matt Task Take owns implementation and delivery. The predecessor is development tracking only.
 
-## Architecture / arena
+## Graph integration queue, 2026-10-20
+
+The current contract uses a Graph integration branch and a persisted per-Graph delivery queue. Every Task starts from a fixed current integration commit after all prerequisites publish. Accepted candidates merge and validate in isolation before publication. A failed delivery leaves downstream Tasks waiting while independent candidates can continue. Graph completion has no final whole-graph merge.
+
+The synchronized specification is in [SPEC.md](SPEC.md), with data and Git operation ownership in [architecture.md](architecture.md). [DESIGN-NOTES.md](../DESIGN-NOTES.md) replaces the obsolete dependency-only workspace proposal and records future rework and revert decisions separately. Full reopening, inverse delivery and downstream reassessment remain outside this implementation slice. The product choice between squash and merge commits remains open.
+
+This documentation update does not supply new runtime or browser acceptance evidence. Reports below retain their original date, commit and scope. The original Git, scheduler and first acceptance reports describe the replaced workspace preparation and final merge behavior. Their banners link to the current contract.
+
+## Historical first implementation
+
+The following checklist records the first implementation on 2026-10-08. Its completed checks are historical evidence, not completion claims for the integration queue.
+
+### Architecture / arena
 
 - [x] Ground: greenfield application; inspect agreed design, prototype and runtime research.
 - [x] Frame: compare a single authoritative local coordinator with event-log projection architecture. Rubric: submission/turn correctness, durable restart behavior, isolated Git results, runtime capability fit, and smallest comprehensible public API.

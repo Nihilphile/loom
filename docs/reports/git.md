@@ -1,5 +1,7 @@
 # Git 工作区交付
 
+> 历史验收记录，范围为初版 Git 交付。下文的依赖成果组装、`mergeFinal` 与整图汇总已由 2026-10-20 的逐 Task 集成设计替换。原测试数量与结论保留，不作为新队列的验证证据。当前契约见 [实施规格 R10、R11](../SPEC.md) 和 [集成队列接口](../architecture.md#graph-集成队列)。
+
 实现 `src/server/git.ts` 的 `GitWorkspaces`，遵循现有 `GitAdapter`，构造函数无需参数。
 
 - Graph 固定创建时的已提交 HEAD。原项目未提交内容保留，不复制到 Graph；原分支之后提交也不会改变这个起点。

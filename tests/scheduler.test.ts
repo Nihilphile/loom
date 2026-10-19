@@ -165,6 +165,36 @@ class HeldIntegrationHead extends GitWorkspaces {
   }
 }
 
+test("resuming an idle blocked graph restores blocked status without rerunning work", async () => {
+  const f = await fixture();
+  try {
+    const created = await f.request("/api/graphs", {
+      name: "blocked resume",
+      tasks: [{ id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" }],
+    });
+    assert.equal(created.status, 201);
+    const graph = f.app.engine!.graph(created.data.id);
+    assert.equal((await f.request(`/api/graphs/${graph.id}/run`, {})).status, 200);
+    await waitFor(() => f.runtime.turns.length === 1, "initial worker");
+    await f.report(0, "blocked");
+    f.runtime.turns[0].finish();
+    await waitFor(() => graph.status === "blocked" && !f.app.engine!.busy, "blocked work settled");
+    const blockReason = graph.tasks[0].blockReason;
+
+    assert.equal((await f.request(`/api/graphs/${graph.id}/pause`, { mode: "hard" })).status, 200);
+    assert.equal(graph.status, "paused");
+    assert.equal((await f.request(`/api/graphs/${graph.id}/resume`, {})).status, 200);
+    await waitFor(() => !f.app.engine!.busy, "resume settled");
+
+    assert.equal(graph.status, "blocked");
+    assert.equal(graph.tasks[0].status, "blocked");
+    assert.equal(graph.tasks[0].blockReason, blockReason);
+    assert.equal(f.runtime.turns.length, 1);
+  } finally {
+    await f.app.close();
+  }
+});
+
 for (const action of ["resume", "resolve", "close"] as const) {
   test(`pending ${action === "resolve" ? "resolve" : "resume"} cannot override concurrent ${action === "close" ? "close" : "hard pause"} or permit edits`, async () => {
     const adapter = new HeldIntegrationHead();

@@ -1081,6 +1081,7 @@ export class HarnessEngine {
     const operation = action().finally(() => {
       this.graphControls.delete(graph.id);
       this.settlePause(graph);
+      this.schedule(graph);
     });
     this.graphControls.set(graph.id, operation);
     return operation;

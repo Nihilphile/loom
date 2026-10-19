@@ -48,7 +48,9 @@ function fixture(t: { after: (fn: () => Promise<void>) => void }) {
     },
     snapshot: async (workspace) => `sha-${workspace.branch}`,
     integrateChild: async (_, __, sha) => { integrations.push(sha); return sha; },
-    mergeFinal: async () => "final",
+    integrationHead: async () => "final",
+    integrationReceipt: async () => undefined,
+    integrateTask: async (workspace, sourceSha, operationId, validate) => ({ operationId, sourceSha, baseSha: workspace.baseCommit, integratedSha: "final", validation: await validate(workspace, "final") }),
   };
   const catalog = new Catalog(join(root, "catalog.json"));
   for (const type of catalog.taskTypes)

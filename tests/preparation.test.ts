@@ -84,7 +84,9 @@ function fixture(t: { after: (fn: () => Promise<void>) => void }) {
       return { path, branch: id, baseCommit: "base" };
     },
     snapshot: async () => "snapshot",
-    mergeFinal: async () => "final",
+    integrationHead: async () => "final",
+    integrationReceipt: async () => undefined,
+    integrateTask: async (workspace, sourceSha, operationId, validate) => ({ operationId, sourceSha, baseSha: workspace.baseCommit, integratedSha: "final", validation: await validate(workspace, "final") }),
   };
   const catalog = new Catalog(join(root, "catalog.json"));
   const engine = new HarnessEngine(root, runtime, git, catalog);

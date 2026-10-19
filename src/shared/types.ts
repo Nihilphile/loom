@@ -224,9 +224,12 @@ export interface Task {
     | "reviewing"
     | "awaiting"
     | "blocked"
+    | "merge_queued"
+    | "integrating"
     | "done"
     | "queued";
   workspace?: Workspace;
+  startCommit?: string;
   snapshots: Snapshot[];
   submissions: Submission[];
   round: number;
@@ -241,6 +244,29 @@ export interface GraphInput {
   name: string;
   tasks: TaskInput[];
   concurrency?: number;
+  integrationCommand?: string;
+}
+export type IntegrationValidation =
+  | { status: "not_configured" }
+  | { status: "passed"; command: string; output: string };
+export interface IntegrationReceipt {
+  operationId: string;
+  sourceSha: string;
+  baseSha: string;
+  integratedSha: string;
+  validation: IntegrationValidation;
+}
+export interface TaskDelivery {
+  id: string;
+  taskId: string;
+  sourceSha: string;
+  queuedAt: string;
+  state:
+    | { status: "queued" }
+    | { status: "integrating"; validatorPid?: number }
+    | { status: "blocked"; error: string; validatorPid?: number; reconcileRequired?: boolean }
+    | { status: "superseded" }
+    | { status: "published"; receipt: IntegrationReceipt };
 }
 export interface Graph {
   id: string;
@@ -252,6 +278,9 @@ export interface Graph {
   concurrency: number;
   tasks: Task[];
   workspace?: Workspace;
+  integrationCommand?: string;
+  integration?: { headSha: string; deliveries: TaskDelivery[] };
+  mirrorWarning?: string;
   finalSha?: string;
   error?: string;
   createdAt: string;
@@ -412,18 +441,23 @@ export interface GitAdapter {
   createTask(
     graph: Workspace,
     taskId: string,
-    dependencyShas: string[],
+    startCommit: string,
   ): Promise<Workspace>;
   snapshot(
     workspace: Workspace,
     message: string,
     operationId: string,
   ): Promise<string>;
-  mergeFinal(
+  integrationHead(workspace: Workspace): Promise<string>;
+  refreshIntegrationMirror?(workspace: Workspace): Promise<void>;
+  integrationReceipt(workspace: Workspace, operationId: string): Promise<IntegrationReceipt | undefined>;
+  integrateTask(
     workspace: Workspace,
-    shas: string[],
+    sourceSha: string,
     operationId: string,
-  ): Promise<string>;
+    validate: (candidate: Workspace, sha: string) => Promise<IntegrationValidation>,
+    cancelled: () => boolean,
+  ): Promise<IntegrationReceipt>;
 }
 export const emptyMetrics = (): Metrics => ({
   seconds: 0,

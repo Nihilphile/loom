@@ -9,10 +9,11 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type { GitAdapter, Workspace } from "../shared/types.ts";
+import type { GitAdapter, Workspace, IntegrationReceipt, IntegrationValidation } from "../shared/types.ts";
 
 interface Manifest {
-  kind: "graph" | "task" | "child";
+  kind: "graph" | "task" | "child" | "integration";
+  detached?: boolean;
   parentPath?: string;
   projectRoot: string;
   workspace: Workspace;
@@ -137,8 +138,9 @@ async function inspect(workspace: Workspace): Promise<Manifest> {
     resolve(await realpath(workspace.path)) !== resolve(workspace.path) ||
     resolve(await git(workspace.path, ["rev-parse", "--show-toplevel"])) !==
       resolve(workspace.path) ||
-    (await git(workspace.path, ["symbolic-ref", "--short", "HEAD"])) !==
-      workspace.branch
+    (manifest.detached
+      ? !!(await git(workspace.path, ["branch", "--show-current"]))
+      : (await git(workspace.path, ["symbolic-ref", "--short", "HEAD"])) !== workspace.branch)
   ) {
     throw new Error(
       `Managed workspace location or branch changed: ${workspace.path}`,
@@ -162,12 +164,17 @@ async function ensureWorktree(manifest: Manifest): Promise<Workspace> {
       ]);
       branchExists = true;
     } catch {}
+    if (manifest.detached && manifest.kind === "graph" && !branchExists)
+      await git(manifest.projectRoot, ["update-ref", `refs/heads/${workspace.branch}`, workspace.baseCommit, "0".repeat(workspace.baseCommit.length)]);
+    const target = manifest.kind === "integration"
+      ? workspace.baseCommit
+      : branchExists || manifest.detached ? workspace.branch : workspace.baseCommit;
     await git(manifest.projectRoot, [
       "worktree",
       "add",
-      ...(branchExists ? [] : ["-b", workspace.branch]),
+      ...(manifest.detached ? ["--detach"] : branchExists ? [] : ["-b", workspace.branch]),
       workspace.path,
-      branchExists ? workspace.branch : workspace.baseCommit,
+      target,
     ]);
   }
   await inspect(workspace);
@@ -356,6 +363,7 @@ export class GitWorkspaces implements GitAdapter {
         ]);
         manifest = {
           kind: "graph",
+          detached: true,
           projectRoot: root,
           dependencies: [],
           prepared: true,
@@ -370,13 +378,13 @@ export class GitWorkspaces implements GitAdapter {
   async createTask(
     graph: Workspace,
     taskId: string,
-    dependencyShas: string[],
+    startCommit: string,
   ): Promise<Workspace> {
     identifier(taskId);
     const graphManifest = await inspect(graph);
     if (graphManifest.kind !== "graph")
       throw new Error("Tasks require a graph workspace");
-    await commits(graph, dependencyShas);
+    await commits(graph, [startCommit]);
     const tasks = join(dirname(graph.path), "tasks");
     const path = join(tasks, taskId);
     const branch = graph.branch.replace(/\/graph$/, `/task/${taskId}`);
@@ -393,29 +401,23 @@ export class GitWorkspaces implements GitAdapter {
       }
       if (
         manifest &&
-        JSON.stringify(manifest.dependencies) !== JSON.stringify(dependencyShas)
+        manifest.workspace.baseCommit !== startCommit
       ) {
         throw new Error(
-          `Task ${taskId} already has different fixed dependencies`,
+          `Task ${taskId} already has a different fixed start commit`,
         );
       }
       if (!manifest) {
         manifest = {
           kind: "task",
           projectRoot: graphManifest.projectRoot,
-          dependencies: [...dependencyShas],
-          prepared: false,
-          workspace: { path, branch, baseCommit: graph.baseCommit },
+          dependencies: [],
+          prepared: true,
+          workspace: { path, branch, baseCommit: startCommit },
         };
         await saveManifest(manifest);
       }
-      const workspace = await ensureWorktree(manifest);
-      if (!manifest.prepared) {
-        await merge(workspace, manifest.dependencies);
-        manifest.prepared = true;
-        await saveManifest(manifest);
-      }
-      return workspace;
+      return ensureWorktree(manifest);
     });
   }
 
@@ -495,28 +497,82 @@ export class GitWorkspaces implements GitAdapter {
     });
   }
 
-  async mergeFinal(
+  async integrationHead(workspace: Workspace): Promise<string> {
+    const manifest = await inspect(workspace);
+    if (manifest.kind !== "graph" || !manifest.detached)
+      throw new Error("Graph requires the current integration format; legacy runs cannot resume safely");
+    return git(workspace.path, ["rev-parse", `refs/heads/${workspace.branch}`]);
+  }
+
+  async integrationReceipt(workspace: Workspace, operationId: string): Promise<IntegrationReceipt | undefined> {
+    const ref = operationRef(workspace, "delivery", operationId);
+    const sha = await git(workspace.path, ["for-each-ref", "--format=%(objectname)", ref]);
+    if (!sha) return undefined;
+    const receipt = JSON.parse(await git(workspace.path, ["cat-file", "blob", sha])) as IntegrationReceipt;
+    await git(workspace.path, ["merge-base", "--is-ancestor", receipt.integratedSha, `refs/heads/${workspace.branch}`]);
+    return receipt;
+  }
+
+  async integrateTask(
     workspace: Workspace,
-    shas: string[],
+    sourceSha: string,
     operationId: string,
-  ): Promise<string> {
+    validate: (candidate: Workspace, sha: string) => Promise<IntegrationValidation>,
+    cancelled: () => boolean,
+  ): Promise<IntegrationReceipt> {
     return locked(workspace.path, async () => {
       const manifest = await inspect(workspace);
-      if (manifest.kind !== "graph")
-        throw new Error("Final merge requires a graph workspace");
-      const ref = operationRef(workspace, "final", operationId);
-      const existing = await recorded(workspace, ref, operationRef(workspace, "final", operationId, true));
-      if (existing) return existing;
-      await commits(workspace, shas);
-      await merge(workspace, shas);
-      const sha = await git(workspace.path, ["rev-parse", "HEAD"]);
-      await git(workspace.path, [
-        "update-ref",
-        ref,
-        sha,
-        "0".repeat(sha.length),
-      ]);
-      return sha;
+      const existing = await this.integrationReceipt(workspace, operationId);
+      if (existing) {
+        if (existing.sourceSha !== sourceSha) throw new Error("Delivery source changed");
+        return existing;
+      }
+      const baseSha = await this.integrationHead(workspace);
+      await commits(workspace, [sourceSha]);
+      if (cancelled()) throw new Error("Integration cancelled before publication");
+      const candidates = join(dirname(workspace.path), "integrations");
+      await directory(candidates);
+      const path = join(candidates, hash(operationId + baseSha).slice(0, 24));
+      let candidateManifest = await readManifest(path);
+      if (candidateManifest && (candidateManifest.workspace.baseCommit !== baseSha || candidateManifest.dependencies[0] !== sourceSha))
+        throw new Error("Integration candidate belongs to a different delivery source");
+      if (!candidateManifest) {
+        candidateManifest = { kind: "integration", detached: true, projectRoot: manifest.projectRoot,
+          dependencies: [sourceSha], prepared: false,
+          workspace: { path, branch: workspace.branch, baseCommit: baseSha } };
+        await saveManifest(candidateManifest);
+      }
+      const candidate = await ensureWorktree(candidateManifest);
+      await merge(candidate, [sourceSha]);
+      let integratedSha = await git(path, ["rev-parse", "HEAD"]);
+      if (integratedSha === baseSha) {
+        const tree = await git(path, ["rev-parse", "HEAD^{tree}"]);
+        integratedSha = await git(path, ["commit-tree", tree, "-p", baseSha], `Task delivery ${operationId}\n`);
+        await git(path, ["checkout", "--detach", integratedSha]);
+      }
+      let validation: IntegrationValidation;
+      try {
+        validation = await validate(candidate, integratedSha);
+      } catch (error) {
+        throw new GitBlockedError(candidate, error instanceof Error ? error.message : String(error));
+      }
+      if ((await git(path, ["rev-parse", "HEAD"])) !== integratedSha ||
+          await git(path, ["status", "--porcelain", "--untracked-files=all", "--", ...codePaths]))
+        throw new GitBlockedError(candidate, "Integration validation changed the candidate commit or code");
+      if (cancelled()) throw new Error("Integration cancelled before publication");
+      const receipt: IntegrationReceipt = { operationId, sourceSha, baseSha, integratedSha, validation };
+      const receiptSha = await git(path, ["hash-object", "-w", "--stdin"], JSON.stringify(receipt));
+      if (cancelled()) throw new Error("Integration cancelled before publication");
+      await git(path, ["update-ref", "--stdin"],
+        `start\nupdate refs/heads/${workspace.branch} ${integratedSha} ${baseSha}\ncreate ${operationRef(workspace, "delivery", operationId)} ${receiptSha}\nprepare\ncommit\n`);
+      return receipt;
     });
+  }
+
+  async refreshIntegrationMirror(workspace: Workspace): Promise<void> {
+    const head = await this.integrationHead(workspace);
+    if (await git(workspace.path, ["status", "--porcelain", "--untracked-files=all", "--", ...codePaths]))
+      throw new Error(`Integration published; graph mirror has local changes and remains stale at ${workspace.path}`);
+    await git(workspace.path, ["checkout", "--detach", head]);
   }
 }

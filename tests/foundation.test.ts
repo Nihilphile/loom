@@ -24,7 +24,9 @@ const git: GitAdapter = {
   async snapshot() {
     throw new Error("Unexpected Git call");
   },
-  async mergeFinal() {
+  async integrationHead() { throw new Error("Unexpected Git call"); },
+  async integrationReceipt() { throw new Error("Unexpected Git call"); },
+  async integrateTask() {
     throw new Error("Unexpected Git call");
   },
 };

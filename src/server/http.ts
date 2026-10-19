@@ -389,7 +389,7 @@ export async function createHttpServer(options: {
             return;
           }
           if (method === "POST" && parts[3] === "resume") {
-            json(200, engine.resumeGraph(id));
+            json(200, await engine.resumeGraph(id));
             return;
           }
           if (method === "POST" && parts[3] === "resolve") {

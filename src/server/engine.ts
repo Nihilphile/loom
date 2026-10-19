@@ -43,6 +43,8 @@ import type {
   ObserverSource,
   AgentCommand,
   AgentReceipt,
+  TaskDelivery,
+  IntegrationReceipt,
 } from "../shared/types.ts";
 import { SessionInputs, contextItem } from "./session-inputs.ts";
 import { emptyMetrics, defaultInterviews } from "../shared/types.ts";
@@ -80,6 +82,8 @@ export class HarnessEngine {
   private closing = false;
   private turnOperations = new Map<string, Promise<unknown>>();
   private agentOperations = new Map<string, Promise<unknown>>();
+  private integrations = new Map<string, Promise<void>>();
+  private validators = new Map<string, RuntimeHandle>();
   constructor(
     root: string,
     readonly runtime: Runtime,
@@ -148,6 +152,18 @@ export class HarnessEngine {
       if (session.queue?.length) session.queuePaused = true;
     }
     for (const graph of this.state.graphs) {
+      if (graph.workspace && !graph.integration && graph.status !== "done") {
+        graph.status = "paused";
+        graph.error = "Legacy Graph lacks verified integration state. Create a new Graph; existing workspaces are preserved.";
+      }
+      for (const delivery of graph.integration?.deliveries ?? []) {
+        if (delivery.state.status === "integrating") {
+          delivery.state = { status: "blocked", error: "Integration interrupted; resume reconciles publication before explicit retry", validatorPid: delivery.state.validatorPid, reconcileRequired: true };
+          const task = this.task(graph, delivery.taskId);
+          task.status = "blocked";
+          task.blockReason = delivery.state.error;
+        }
+      }
       if (["running", "pausing", "merging"].includes(graph.status)) {
         graph.status = "paused";
         graph.error = "上次服务未正常关闭，请检查工作区后恢复";
@@ -206,7 +222,7 @@ export class HarnessEngine {
   }
   get busy() {
     return (
-      this.jobs.size > 0 || this.pumping.size > 0 || this.preparing.size > 0
+      this.jobs.size > 0 || this.pumping.size > 0 || this.preparing.size > 0 || this.integrations.size > 0
     );
   }
   createSession(input: {
@@ -740,6 +756,7 @@ export class HarnessEngine {
     if (!Array.isArray(input.tasks) || !input.tasks.length)
       throw new Error("Graph 至少需要一个 Task");
     const concurrency = input.concurrency ?? 2;
+    const integrationCommand = input.integrationCommand === undefined ? undefined : text(input.integrationCommand, "Integration command");
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8)
       throw new Error("并发数需要在 1 至 8 之间");
     const graph: Graph = {
@@ -748,6 +765,7 @@ export class HarnessEngine {
       status: "draft",
       tasks: input.tasks.map((t, i) => this.makeTask(t, i)),
       concurrency,
+      integrationCommand,
       createdAt: now(),
       subscription: "blocked",
     };
@@ -789,7 +807,7 @@ export class HarnessEngine {
     if (graph.status === "running") {
       task.appendBarrier = graph.tasks
         .filter((t) =>
-          ["preparing", "running", "reviewing", "awaiting", "blocked"].includes(
+          ["preparing", "running", "reviewing", "awaiting", "blocked", "merge_queued", "integrating"].includes(
             t.status,
           ),
         )
@@ -807,6 +825,11 @@ export class HarnessEngine {
       throw new Error("请先暂停并等待当前执行结束");
     const task = this.task(graph, taskId);
     if (task.status === "done") throw new Error("已交付 Task 暂不支持重开");
+    const delivery = graph.integration?.deliveries.find((d) => d.taskId === taskId && d.state.status !== "superseded");
+    if (delivery && (delivery.state.status === "integrating" || delivery.state.status === "published" ||
+        (delivery.state.status === "blocked" && delivery.state.reconcileRequired)))
+      throw new Error("Reconcile the delivery before editing this Task");
+    if (delivery) this.ensureValidatorStopped(delivery);
     if (input.taskTypeId && input.taskTypeId !== task.type.id)
       throw new Error("已创建 Task 暂不支持替换类型，请添加新任务");
     const next = {
@@ -816,7 +839,7 @@ export class HarnessEngine {
       deps: input.deps ?? task.deps,
     };
     if (
-      task.workspace &&
+      task.startCommit &&
       JSON.stringify(next.deps) !== JSON.stringify(task.deps)
     )
       throw new Error("已准备工作区的依赖不可修改，请添加新任务");
@@ -830,6 +853,7 @@ export class HarnessEngine {
     });
     validateDag(graph.tasks.map((t) => (t.id === taskId ? next : t)));
     Object.assign(task, next);
+    if (delivery) delivery.state = { status: "superseded" };
     task.configRevision++;
     task.candidateSha = undefined;
     task.nextUnit = task.type.start[0];
@@ -886,6 +910,7 @@ export class HarnessEngine {
         id,
         graph.runId,
       );
+      graph.integration = { headSha: graph.workspace.baseCommit, deliveries: [] };
       this.record("graph.prepared", "Graph 基线已准备", { graphId: id });
     } catch (error) {
       graph.status = "blocked";
@@ -904,6 +929,7 @@ export class HarnessEngine {
       [...this.agentOperations.keys()].some((key) => key.startsWith(graph.id + "/")) ||
       this.state.sessions.some((s) => s.graphId === graph.id && s.child?.state === "preparing") ||
       this.preparing.has(graph.id) ||
+      this.integrations.has(graph.id) ||
       graph.tasks.some((t) => this.preparing.has(graph.id + "/" + t.id)) ||
       this.state.executions.some(
         (e) => e.graphId === graph.id && activeExecution(e),
@@ -922,6 +948,7 @@ export class HarnessEngine {
       mode === "soft" ? "等待活动执行正常收尾" : "正在中断活动执行",
       { graphId: id },
     );
+    if (mode === "hard") await this.validators.get(id)?.interrupt();
     await Promise.all(
       this.state.executions
         .filter(
@@ -935,6 +962,7 @@ export class HarnessEngine {
         )
         .map((e) => this.interrupt(e.sessionId)),
     );
+    if (mode === "hard") await this.integrations.get(id);
     this.settlePause(graph);
     return graph;
   }
@@ -946,7 +974,7 @@ export class HarnessEngine {
       });
     }
   }
-  resumeGraph(id: string) {
+  async resumeGraph(id: string) {
     const graph = this.graph(id);
     if (graph.status !== "paused") throw new Error("只有已暂停图可以恢复");
     if (!graph.workspace) {
@@ -955,6 +983,7 @@ export class HarnessEngine {
       void this.runGraph(id);
       return graph;
     }
+    await this.reconcileIntegration(graph);
     for (const task of graph.tasks)
       for (const unit of task.units)
         if (unit.sessionId) this.ensureStopped(this.session(unit.sessionId));
@@ -963,7 +992,7 @@ export class HarnessEngine {
     graph.error = undefined;
     for (const task of graph.tasks) {
       if (
-        task.status !== "done" &&
+        task.status !== "done" && !graph.integration!.deliveries.some((d) => d.taskId === task.id && d.state.status !== "superseded") &&
         task.units.some((u) => u.status === "interrupted")
       ) {
         task.status = "waiting";
@@ -981,16 +1010,25 @@ export class HarnessEngine {
     }
     return graph;
   }
-  resolveGraph(id: string, taskId?: string) {
+  async resolveGraph(id: string, taskId?: string) {
     const graph = this.graph(id);
     if (this.graphBusy(graph)) throw new Error("请等待活动执行结束后处理阻塞");
     if (!["blocked", "paused", "running"].includes(graph.status))
       throw new Error("当前状态不能解除阻塞");
+    if (graph.workspace) await this.reconcileIntegration(graph);
     const targets = taskId
       ? [this.task(graph, taskId)]
       : graph.tasks.filter((t) => t.status === "blocked");
     for (const task of targets) {
       if (task.status !== "blocked") continue;
+      const delivery = graph.integration?.deliveries.find((d) => d.taskId === task.id && d.state.status !== "superseded");
+      if (delivery) {
+        this.ensureValidatorStopped(delivery);
+        delivery.state = { status: "queued" };
+        task.status = "merge_queued";
+        task.blockReason = undefined;
+        continue;
+      }
       const recovering = task.blockReason?.startsWith("恢复检查：");
       for (const unit of task.units) {
         if (unit.sessionId) this.ensureStopped(this.session(unit.sessionId));
@@ -1040,6 +1078,7 @@ export class HarnessEngine {
       return;
     this.pumping.add(graph.id);
     try {
+      this.drainIntegration(graph);
       for (const task of graph.tasks) {
         if (graph.status !== "running") break;
         if (
@@ -1059,8 +1098,9 @@ export class HarnessEngine {
         ).length;
         if (count >= graph.concurrency) break;
         task.status = "preparing";
+        task.startCommit ??= graph.integration!.headSha;
         this.preparing.add(graph.id + "/" + task.id);
-        this.record("task.preparing", "准备依赖工作区", {
+        this.record("task.preparing", "从当前集成提交准备固定工作区", {
           graphId: graph.id,
           taskId: task.id,
         });
@@ -1095,7 +1135,7 @@ export class HarnessEngine {
         task.workspace = await this.git.createTask(
           graph.workspace!,
           task.id,
-          task.deps.map((id) => this.task(graph, id).deliverySha!),
+          task.startCommit!,
         );
       task.status = "waiting";
       this.record("task.prepared", "Task 工作区已准备", {
@@ -1121,27 +1161,109 @@ export class HarnessEngine {
       this.schedule(graph);
     }
   }
-  private async finishGraph(graph: Graph) {
-    graph.status = "merging";
-    this.preparing.add(graph.id);
-    this.record("graph.merging", "汇总到 Graph 基线", { graphId: graph.id });
+  private finishGraph(graph: Graph) {
+    graph.finalSha = graph.integration!.headSha;
+    graph.status = "done";
+    this.record("graph.done", "Graph 已完成，项目主分支未合并", { graphId: graph.id });
+  }
+  private ensureValidatorStopped(delivery: TaskDelivery) {
+    if (delivery.state.status !== "blocked" || !delivery.state.validatorPid) return;
     try {
-      graph.finalSha = await this.git.mergeFinal(
-        graph.workspace!,
-        graph.tasks.map((t) => t.deliverySha!),
-        graph.runId + "-final",
-      );
-      graph.status = "done";
-      this.record("graph.done", "Graph 已完成，项目主分支未合并", {
-        graphId: graph.id,
-      });
+      process.kill(delivery.state.validatorPid, 0);
     } catch (error) {
-      graph.status = "blocked";
-      graph.error = errorText(error);
-      this.record("graph.blocked", graph.error, { graphId: graph.id });
-    } finally {
-      this.preparing.delete(graph.id);
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
     }
+    throw new Error(`Integration validator ${delivery.state.validatorPid} is still alive; stop it before retry`);
+  }
+  private publishDelivery(graph: Graph, delivery: TaskDelivery, receipt: IntegrationReceipt) {
+    if (receipt.operationId !== delivery.id || receipt.sourceSha !== delivery.sourceSha)
+      throw new Error("Integration receipt does not match accepted delivery");
+    const task = this.task(graph, delivery.taskId);
+    delivery.state = { status: "published", receipt };
+    graph.integration!.headSha = receipt.integratedSha;
+    task.deliverySha = delivery.sourceSha;
+    task.status = "done";
+    task.blockReason = undefined;
+    this.record("task.done", "任务已通过集成并发布", { graphId: graph.id, taskId: task.id, detail: receipt });
+    this.notify(graph, "completed", `${task.id} 已交付\n${task.submissions.at(-1)?.content ?? ""}`);
+    this.interviewTask(graph, task, "completed");
+  }
+  private async refreshMirror(graph: Graph) {
+    try {
+      await this.git.refreshIntegrationMirror?.(graph.workspace!);
+      graph.mirrorWarning = undefined;
+    } catch (error) {
+      graph.mirrorWarning = errorText(error);
+    }
+    this.record("graph.integration", "更新集成分支状态", { graphId: graph.id });
+  }
+  private async reconcileIntegration(graph: Graph) {
+    if (!graph.integration)
+      throw new Error("Legacy Graph lacks verified integration state. Create a new Graph; existing workspaces are preserved.");
+    for (const delivery of graph.integration.deliveries) {
+      this.ensureValidatorStopped(delivery);
+      if (delivery.state.status === "superseded") continue;
+      const receipt = await this.git.integrationReceipt(graph.workspace!, delivery.id);
+      if (receipt && delivery.state.status !== "published") this.publishDelivery(graph, delivery, receipt);
+      if (delivery.state.status === "blocked") delivery.state.reconcileRequired = false;
+    }
+    graph.integration.headSha = await this.git.integrationHead(graph.workspace!);
+    await this.refreshMirror(graph);
+  }
+  private drainIntegration(graph: Graph) {
+    if (this.integrations.has(graph.id) || graph.status !== "running" || this.closing) return;
+    const delivery = graph.integration!.deliveries.find((d) => d.state.status === "queued");
+    if (!delivery) return;
+    const task = this.task(graph, delivery.taskId);
+    delivery.state = { status: "integrating" };
+    task.status = "integrating";
+    this.record("task.integrating", "正在合并并验证实际候选", { graphId: graph.id, taskId: task.id });
+    const cancelled = () => this.closing || (graph.status === "pausing" && graph.pauseMode === "hard");
+    const job = (async () => {
+      try {
+        const receipt = await this.git.integrateTask(graph.workspace!, delivery.sourceSha, delivery.id,
+          async (candidate) => {
+            if (cancelled()) throw new Error("Integration cancelled before validation");
+            if (!graph.integrationCommand) return { status: "not_configured" };
+            const command = graph.integrationCommand;
+            const handle = this.command(command, candidate.path, (event) => {
+              this.record("integration.output", event.text ?? "", { graphId: graph.id, taskId: task.id });
+            });
+            this.validators.set(graph.id, handle);
+            delivery.state = { status: "integrating", validatorPid: handle.pid };
+            this.record("integration.validation", "验证合并候选", { graphId: graph.id, taskId: task.id });
+            try {
+              const result = await handle.done;
+              delivery.state = { status: "integrating" };
+              if (result.status !== "completed") throw new Error(`${result.error || "Integration validation interrupted"}\n${result.text}`.trim());
+              return { status: "passed", command, output: result.text };
+            } finally {
+              this.validators.delete(graph.id);
+            }
+          }, cancelled);
+        this.publishDelivery(graph, delivery, receipt);
+        await this.refreshMirror(graph);
+      } catch (error) {
+        let reconcileRequired = false;
+        const receipt = await this.git.integrationReceipt(graph.workspace!, delivery.id).catch(() => {
+          reconcileRequired = true;
+          return undefined;
+        });
+        if (receipt) {
+          this.publishDelivery(graph, delivery, receipt);
+          await this.refreshMirror(graph);
+        } else {
+          delivery.state = { status: "blocked", error: errorText(error), reconcileRequired };
+          this.block(graph, task, errorText(error));
+        }
+      }
+    })().finally(() => {
+      this.integrations.delete(graph.id);
+      this.settlePause(graph);
+      this.schedule(graph);
+    });
+    this.integrations.set(graph.id, job);
   }
   private block(graph: Graph, task: Task, message: string) {
     task.status = "blocked";
@@ -2162,19 +2284,13 @@ export class HarnessEngine {
           `${task.id} ${unit.name}：${submission.outcome}\n${submission.content}`,
         );
       if (rule.action.type === "finish") {
-        task.deliverySha = sha;
-        task.status = "done";
+        graph.integration!.deliveries.push({ id: execution.id, taskId: task.id, sourceSha: sha, queuedAt: now(), state: { status: "queued" } });
+        task.status = "merge_queued";
         task.nextUnit = undefined;
-        this.record("task.done", "任务已交付", {
+        this.record("task.merge_queued", "工作验收完成，等待集成", {
           graphId: graph.id,
           taskId: task.id,
         });
-        this.notify(
-          graph,
-          "completed",
-          `${task.id} 已交付\n${submission.content}`,
-        );
-        this.interviewTask(graph, task, "completed");
       } else {
         const targetId = rule.action.unit;
         const target = task.units.find((u) => u.id === targetId)!;
@@ -2633,11 +2749,13 @@ export class HarnessEngine {
   async shutdown() {
     this.closing = true;
     for (const graph of this.state.graphs)
-      if (["running", "blocked"].includes(graph.status)) {
+      if (["running", "blocked", "pausing"].includes(graph.status)) {
         graph.status = "pausing";
         graph.pauseMode = "hard";
       }
+    await Promise.all([...this.validators.values()].map((handle) => handle.interrupt()));
     await Promise.all([...this.jobs.keys()].map((id) => this.interrupt(id)));
+    await Promise.all(this.integrations.values());
     while (this.preparing.size || this.pumping.size || this.agentOperations.size)
       await new Promise((resolve) => setTimeout(resolve, 20));
     for (const graph of this.state.graphs) this.settlePause(graph);

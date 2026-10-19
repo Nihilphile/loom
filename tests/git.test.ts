@@ -5,9 +5,133 @@ import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
+import type { Workspace } from "../src/shared/types.ts";
 import { GitBlockedError, GitWorkspaces } from "../src/server/git.ts";
 
 const execute = promisify(execFile);
+const noValidation = async () => ({ status: "not_configured" as const });
+const deliver = (adapter: GitWorkspaces, graph: Workspace, source: string, id: string) => adapter.integrateTask(graph, source, id, noValidation, () => false);
+
+test("serial deliveries include unrelated results, preserve fixed task bases and leave main untouched", async () => {
+  const root = await repository();
+  try {
+    const adapter = new GitWorkspaces();
+    const original = await git(root, "rev-parse", "HEAD");
+    await writeFile(join(root, "shared.txt"), "user uncommitted\n");
+    const graph = await adapter.createGraph(root, "graph", "run");
+    assert.equal(await git(graph.path, "branch", "--show-current"), "");
+    const [left, right] = await Promise.all([
+      adapter.createTask(graph, "left", original), adapter.createTask(graph, "right", original),
+    ]);
+    await writeFile(join(left.path, "left.txt"), "left");
+    await writeFile(join(right.path, "right.txt"), "right");
+    const a = await adapter.snapshot(left, "left", "left");
+    const b = await adapter.snapshot(right, "right", "right");
+    const receipts = await Promise.all([deliver(adapter, graph, a, "a"), deliver(adapter, graph, b, "b")]);
+    assert.equal(receipts[1].baseSha, receipts[0].integratedSha);
+    const head = await adapter.integrationHead(graph);
+    const joined = await adapter.createTask(graph, "join", head);
+    assert.equal(await readFile(join(joined.path, "left.txt"), "utf8"), "left");
+    assert.equal(await readFile(join(joined.path, "right.txt"), "utf8"), "right");
+    await assert.rejects(readFile(join(right.path, "left.txt")));
+    assert.equal(right.baseCommit, original);
+    assert.deepEqual(await deliver(new GitWorkspaces(), graph, a, "a"), receipts[0]);
+    assert.equal(await adapter.integrationHead(graph), head);
+    await adapter.refreshIntegrationMirror(graph);
+    assert.equal(await git(graph.path, "rev-parse", "HEAD"), head);
+    assert.equal(await git(root, "rev-parse", "HEAD"), original);
+    assert.equal(await readFile(join(root, "shared.txt"), "utf8"), "user uncommitted\n");
+  } finally { await cleanup(root); }
+});
+
+test("conflict blocks publication while independent delivery proceeds and staged resolution retries the source", async () => {
+  const root = await repository();
+  try {
+    const adapter = new GitWorkspaces();
+    const graph = await adapter.createGraph(root, "conflict", "run");
+    const left = await adapter.createTask(graph, "left", graph.baseCommit);
+    const right = await adapter.createTask(graph, "right", graph.baseCommit);
+    const independent = await adapter.createTask(graph, "independent", graph.baseCommit);
+    await writeFile(join(left.path, "shared.txt"), "left\n");
+    await writeFile(join(right.path, "shared.txt"), "right\n");
+    await writeFile(join(independent.path, "independent.txt"), "independent");
+    const a = await adapter.snapshot(left, "left", "left");
+    const b = await adapter.snapshot(right, "right", "right");
+    const c = await adapter.snapshot(independent, "independent", "independent");
+    const first = await deliver(adapter, graph, a, "a");
+    await assert.rejects(deliver(adapter, graph, b, "b"), GitBlockedError);
+    assert.equal(await adapter.integrationHead(graph), first.integratedSha);
+    assert.equal(await adapter.integrationReceipt(graph, "b"), undefined);
+    const third = await deliver(adapter, graph, c, "c");
+    let candidate!: Workspace;
+    await assert.rejects(deliver(adapter, graph, b, "b"), (error) => {
+      assert(error instanceof GitBlockedError); candidate = error.workspace; return true;
+    });
+    assert.equal(candidate.baseCommit, third.integratedSha);
+    await writeFile(join(candidate.path, "shared.txt"), "resolved\n");
+    await git(candidate.path, "add", "shared.txt");
+    const result = await deliver(adapter, graph, b, "b");
+    assert.equal(result.sourceSha, b);
+    assert.equal(await git(graph.path, "show", `${result.integratedSha}:shared.txt`), "resolved");
+    assert.equal(await git(root, "rev-parse", "HEAD"), graph.baseCommit);
+  } finally { await cleanup(root); }
+});
+
+test("validation sees the merged candidate and failure, mutations and cancellation hold the branch", async () => {
+  const root = await repository();
+  try {
+    const adapter = new GitWorkspaces();
+    const graph = await adapter.createGraph(root, "validation", "run");
+    const task = await adapter.createTask(graph, "task", graph.baseCommit);
+    await writeFile(join(task.path, "code.txt"), "code");
+    const source = await adapter.snapshot(task, "source", "source");
+    await assert.rejects(adapter.integrateTask(graph, source, "fail", async (candidate) => {
+      assert.equal(await readFile(join(candidate.path, "code.txt"), "utf8"), "code");
+      throw new Error("tests failed");
+    }, () => false), /tests failed/);
+    await assert.rejects(deliver(adapter, graph, graph.baseCommit, "fail"), /different delivery source/);
+    for (const mutation of ["untracked", "tracked", "commit"]) {
+      await assert.rejects(adapter.integrateTask(graph, source, mutation, async (candidate) => {
+        if (mutation === "untracked") await writeFile(join(candidate.path, "extra.txt"), "oops");
+        else await writeFile(join(candidate.path, "code.txt"), "oops");
+        if (mutation === "commit") { await git(candidate.path, "add", "."); await git(candidate.path, "commit", "-m", "unexpected"); }
+        return { status: "passed", command: mutation, output: "" };
+      }, () => false), /changed the candidate/);
+    }
+    let cancelled = false;
+    await assert.rejects(adapter.integrateTask(graph, source, "cancel", async () => {
+      cancelled = true; return noValidation();
+    }, () => cancelled), /cancelled/);
+    assert.equal(await adapter.integrationHead(graph), graph.baseCommit);
+    const receipt = await deliver(adapter, graph, source, "fail");
+    assert.equal(receipt.validation.status, "not_configured");
+    assert.equal(await git(root, "rev-parse", "HEAD"), graph.baseCommit);
+  } finally { await cleanup(root); }
+});
+
+test("receipts survive stale dirty mirrors and no-change deliveries have distinct boundaries", async () => {
+  const root = await repository();
+  try {
+    const adapter = new GitWorkspaces();
+    const graph = await adapter.createGraph(root, "receipt", "run");
+    await writeFile(join(graph.path, "shared.txt"), "user mirror edits");
+    const first = await deliver(adapter, graph, graph.baseCommit, "empty-one");
+    assert.notEqual(first.integratedSha, graph.baseCommit);
+    await assert.rejects(adapter.refreshIntegrationMirror(graph), /mirror has local changes/);
+    const reopened = new GitWorkspaces();
+    assert.deepEqual(await reopened.integrationReceipt(graph, "empty-one"), first);
+    assert.deepEqual(await deliver(reopened, graph, graph.baseCommit, "empty-one"), first);
+    const second = await deliver(adapter, graph, graph.baseCommit, "empty-two");
+    assert.notEqual(second.integratedSha, first.integratedSha);
+    assert.equal(await git(graph.path, "rev-parse", "HEAD"), graph.baseCommit);
+    assert.equal(await readFile(join(graph.path, "shared.txt"), "utf8"), "user mirror edits");
+    const task = await adapter.createTask(graph, "after", second.integratedSha);
+    assert.equal(task.baseCommit, second.integratedSha);
+    await git(graph.path, "update-ref", `refs/heads/${graph.branch}`, graph.baseCommit);
+    await assert.rejects(reopened.integrationReceipt(graph, "empty-one"), /merge-base/);
+    await assert.rejects(deliver(reopened, graph, graph.baseCommit, "empty-one"), /merge-base/);
+  } finally { await cleanup(root); }
+});
 async function git(cwd: string, ...args: string[]) {
   return (
     await execute(
@@ -48,7 +172,7 @@ test("child worktrees isolate siblings and integrate nested exact output with co
   try {
     const adapter = new GitWorkspaces();
     const graph = await adapter.createGraph(root, "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222");
-    const task = await adapter.createTask(graph, "work", []);
+    const task = await adapter.createTask(graph, "work", graph.baseCommit);
     const left = await adapter.createChild(task, "33333333-3333-3333-3333-333333333333");
     const right = await adapter.createChild(task, "44444444-4444-4444-4444-444444444444");
     const nested = await adapter.createChild(left, "55555555-5555-5555-5555-555555555555");
@@ -86,7 +210,7 @@ test("report-only tasks snapshot cleanly when runtime metadata is ignored", asyn
     await git(root, "commit", "-m", "ignore runtime state");
     const adapter = new GitWorkspaces();
     const graph = await adapter.createGraph(root, "ignored", "run");
-    const task = await adapter.createTask(graph, "reports", []);
+    const task = await adapter.createTask(graph, "reports", graph.baseCommit);
     await mkdir(join(task.path, ".newharness", "reports"), { recursive: true });
     await writeFile(
       join(task.path, ".newharness", "reports", "done.md"),
@@ -128,172 +252,6 @@ test("report-only tasks snapshot cleanly when runtime metadata is ignored", asyn
   }
 });
 
-test("fixed graph baseline, parallel tasks, snapshots and final merge preserve the original branch", async () => {
-  const root = await repository();
-  try {
-    const adapter = new GitWorkspaces();
-    const original = await git(root, "rev-parse", "HEAD");
-    await writeFile(join(root, "shared.txt"), "user uncommitted\n");
-    const graph = await adapter.createGraph(root, "graph", "run");
-    assert.equal(graph.baseCommit, original);
-    assert.equal(
-      await readFile(join(graph.path, "shared.txt"), "utf8"),
-      "base\n",
-    );
-    const [left, right] = await Promise.all([
-      adapter.createTask(graph, "left", []),
-      adapter.createTask(graph, "right", []),
-    ]);
-    await writeFile(join(left.path, "left.txt"), "left output\n");
-    await mkdir(join(left.path, ".newharness"));
-    await writeFile(
-      join(left.path, ".newharness", "secret.json"),
-      "runtime metadata",
-    );
-    await writeFile(join(right.path, "right.txt"), "right output\n");
-    const [leftSha, rightSha] = await Promise.all([
-      adapter.snapshot(left, "left", "left-report"),
-      adapter.snapshot(right, "right", "right-report"),
-    ]);
-    assert.equal(
-      await git(left.path, "ls-tree", "-r", "--name-only", leftSha),
-      "left.txt\nshared.txt",
-    );
-    await writeFile(
-      join(left.path, "later.txt"),
-      "not in the fixed dependency\n",
-    );
-    assert.equal(
-      await new GitWorkspaces().snapshot(left, "retry", "left-report"),
-      leftSha,
-    );
-    await adapter.snapshot(left, "later", "later-report");
-    const joined = await adapter.createTask(graph, "join", [leftSha, rightSha]);
-    assert.equal(
-      await readFile(join(joined.path, "left.txt"), "utf8"),
-      "left output\n",
-    );
-    assert.equal(
-      await readFile(join(joined.path, "right.txt"), "utf8"),
-      "right output\n",
-    );
-    await assert.rejects(readFile(join(joined.path, "later.txt")));
-    const final = await adapter.mergeFinal(graph, [leftSha, rightSha], "final");
-    assert.equal(
-      await new GitWorkspaces().mergeFinal(graph, [leftSha, rightSha], "final"),
-      final,
-    );
-    assert.equal(
-      await git(graph.path, "ls-tree", "-r", "--name-only", final),
-      "left.txt\nright.txt\nshared.txt",
-    );
-    assert.equal(await git(root, "rev-parse", "HEAD"), original);
-    assert.equal(await git(root, "branch", "--show-current"), "main");
-    assert.equal(
-      await readFile(join(root, "shared.txt"), "utf8"),
-      "user uncommitted\n",
-    );
-    assert.deepEqual(await adapter.createGraph(root, "graph", "run"), graph);
-  } finally {
-    await cleanup(root);
-  }
-});
-
-test("dependency conflicts preserve the workspace, block snapshots and resume after staged resolution", async () => {
-  const root = await repository();
-  try {
-    const adapter = new GitWorkspaces();
-    const graph = await adapter.createGraph(root, "conflict", "run");
-    const left = await adapter.createTask(graph, "left", []);
-    const right = await adapter.createTask(graph, "right", []);
-    await writeFile(join(left.path, "shared.txt"), "left\n");
-    await writeFile(join(right.path, "shared.txt"), "right\n");
-    const a = await adapter.snapshot(left, "left", "left");
-    const b = await adapter.snapshot(right, "right", "right");
-    let blocked: GitBlockedError | undefined;
-    await assert.rejects(adapter.createTask(graph, "join", [a, b]), (error) => {
-      assert.ok(error instanceof GitBlockedError);
-      blocked = error;
-      assert.ok(error.message.includes(error.workspace.path));
-      return true;
-    });
-    assert.ok(blocked);
-    const workspace = blocked.workspace;
-    assert.match(
-      await readFile(join(workspace.path, "shared.txt"), "utf8"),
-      /<<<<<<< HEAD/,
-    );
-    await assert.rejects(
-      new GitWorkspaces().createTask(graph, "join", [a, b]),
-      GitBlockedError,
-    );
-    await assert.rejects(
-      adapter.snapshot(workspace, "must not commit conflicts", "blocked"),
-      GitBlockedError,
-    );
-    const independent = await adapter.createTask(graph, "independent", []);
-    assert.equal(
-      await readFile(join(independent.path, "shared.txt"), "utf8"),
-      "base\n",
-    );
-    await writeFile(
-      join(workspace.path, "shared.txt"),
-      "resolved dependency\n",
-    );
-    await git(workspace.path, "add", "shared.txt");
-    assert.deepEqual(
-      await new GitWorkspaces().createTask(graph, "join", [a, b]),
-      workspace,
-    );
-    const delivery = await adapter.snapshot(workspace, "delivery", "delivery");
-    assert.equal(
-      await git(workspace.path, "show", `${delivery}:shared.txt`),
-      "resolved dependency",
-    );
-    await adapter.mergeFinal(graph, [delivery], "final");
-    assert.equal(
-      await readFile(join(graph.path, "shared.txt"), "utf8"),
-      "resolved dependency\n",
-    );
-    assert.equal(await readFile(join(root, "shared.txt"), "utf8"), "base\n");
-  } finally {
-    await cleanup(root);
-  }
-});
-
-test("final conflicts remain blocked until resolved and final operation retries return the original result", async () => {
-  const root = await repository();
-  try {
-    const adapter = new GitWorkspaces();
-    const graph = await adapter.createGraph(root, "final-conflict", "run");
-    const left = await adapter.createTask(graph, "left", []);
-    const right = await adapter.createTask(graph, "right", []);
-    await writeFile(join(left.path, "shared.txt"), "left final\n");
-    await writeFile(join(right.path, "shared.txt"), "right final\n");
-    const a = await adapter.snapshot(left, "left", "left");
-    const b = await adapter.snapshot(right, "right", "right");
-    await assert.rejects(
-      adapter.mergeFinal(graph, [a, b], "final"),
-      GitBlockedError,
-    );
-    await assert.rejects(
-      new GitWorkspaces().mergeFinal(graph, [a, b], "final"),
-      GitBlockedError,
-    );
-    await writeFile(join(graph.path, "shared.txt"), "resolved final\n");
-    await git(graph.path, "add", "shared.txt");
-    const final = await new GitWorkspaces().mergeFinal(graph, [a, b], "final");
-    assert.equal(
-      await git(graph.path, "show", `${final}:shared.txt`),
-      "resolved final",
-    );
-    assert.equal(await adapter.mergeFinal(graph, [a, b], "final"), final);
-    assert.equal(await git(root, "rev-parse", "HEAD"), graph.baseCommit);
-  } finally {
-    await cleanup(root);
-  }
-});
-
 test("graph retries freeze HEAD, reject unsafe identifiers and discard only metadata from the index", async () => {
   const root = await repository();
   try {
@@ -310,7 +268,7 @@ test("graph retries freeze HEAD, reject unsafe identifiers and discard only meta
       await new GitWorkspaces().createGraph(root, "fixed", "run"),
       graph,
     );
-    const task = await adapter.createTask(graph, "task", []);
+    const task = await adapter.createTask(graph, "task", graph.baseCommit);
     await assert.rejects(readFile(join(task.path, "after.txt")));
     await writeFile(
       join(task.path, ".newharness", "tracked.json"),
@@ -340,7 +298,7 @@ test("graph retries freeze HEAD, reject unsafe identifiers and discard only meta
       "latest metadata",
     );
     await assert.rejects(
-      adapter.createTask(graph, "../escape", []),
+      adapter.createTask(graph, "../escape", graph.baseCommit),
       /Workspace IDs/,
     );
     await assert.rejects(
@@ -348,12 +306,12 @@ test("graph retries freeze HEAD, reject unsafe identifiers and discard only meta
       /Workspace IDs/,
     );
     await assert.rejects(
-      adapter.createTask(graph, "unsafe-sha", ["--upload-pack=evil"]),
+      adapter.createTask(graph, "unsafe-sha", "--upload-pack=evil"),
       /full commit SHAs/,
     );
     await assert.rejects(
-      adapter.createTask(graph, "task", [first]),
-      /different fixed dependencies/,
+      adapter.createTask(graph, "task", first),
+      /different fixed start commit/,
     );
     await assert.rejects(
       adapter.snapshot(

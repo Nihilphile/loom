@@ -103,6 +103,8 @@ const statusNames: Record<string, string> = {
   blocked: "已阻塞",
   done: "已交付",
   queued: "等待加入",
+  merge_queued: "等待集成",
+  integrating: "合并验证中",
   idle: "空闲",
   paused: "已暂停",
   pausing: "暂停中",
@@ -458,8 +460,25 @@ function graphsPage() {
   );
   return (
     output +
-    `<div class="workspace"><div class="stack"><section class="panel"><div class="panelhead"><div class="row"><strong>任务依赖图</strong>${badge(g.status, g.status === "done" ? "已汇总" : undefined)}</div><div class="row"><select class="graphchoice" id="graph-choice" aria-label="选择任务图">${state?.graphs.map((x) => `<option value="${esc(x.id)}" ${x.id === g.id ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select>${btn("new-task", "＋ Task", "small", g.status === "done")}</div></div><div class="toolbar"><span>并行上限 ${g.concurrency}</span><span>·</span><span>${g.tasks.length} 个任务</span><span class="grow"></span><span>点击节点查看成员</span></div>${graphCanvas(g)}<div class="canvasfoot">连线表示前置依赖；所有前置交付后，下游才能启动。</div></section>${g.error ? `<div class="notice amber">${esc(g.error)}</div>` : ""}${g.status === "pausing" ? '<div class="notice">正在等待活动执行结束。完全暂停后可编辑任务。</div>' : ""}${subscription(g)}${trace()}</div><aside class="panel">${inspector()}</aside></div>`
+    `<div class="workspace"><div class="stack"><section class="panel"><div class="panelhead"><div class="row"><strong>任务依赖图</strong>${badge(g.status, g.status === "done" ? "已完成" : undefined)}</div><div class="row"><select class="graphchoice" id="graph-choice" aria-label="选择任务图">${state?.graphs.map((x) => `<option value="${esc(x.id)}" ${x.id === g.id ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select>${btn("new-task", "＋ Task", "small", g.status === "done")}</div></div><div class="toolbar"><span>并行上限 ${g.concurrency}</span><span>·</span><span>${g.tasks.length} 个任务</span><span class="grow"></span><span>点击节点查看成员</span></div>${graphCanvas(g)}<div class="canvasfoot">连线表示前置依赖；所有前置通过合并验证并发布后，下游才能启动。</div></section>${integrationPanel(g)}${g.error ? `<div class="notice amber">${esc(g.error)}</div>` : ""}${g.status === "pausing" ? '<div class="notice">正在等待活动执行结束。完全暂停后可编辑任务。</div>' : ""}${subscription(g)}${trace()}</div><aside class="panel">${inspector()}</aside></div>`
   );
+}
+function integrationPanel(g: Graph) {
+  if (g.workspace && !g.integration) return `<section class="panel"><div class="rule">历史 Graph，没有新版集成交付记录。</div></section>`;
+  const deliveries = g.integration?.deliveries ?? [];
+  return `<section class="panel"><div class="panelhead"><strong>Graph 集成</strong><span>${deliveries.filter((d) => d.state.status === "published").length} / ${g.tasks.length} 已发布</span></div><div class="rule">验证命令：<code>${esc(g.integrationCommand || "未配置集成验证命令")}</code></div>${g.integration ? `<details class="rule" data-detail="graph-git-${esc(g.id)}"><summary>Git 版本（Debug）</summary>集成分支：<code>${esc(g.workspace?.branch ?? "")}</code><br>当前提交：<code>${esc(g.integration.headSha)}</code></details>` : ""}${g.mirrorWarning ? `<div class="notice amber">${esc(g.mirrorWarning)}</div>` : ""}${deliveries.map((d) => `<div class="rule"><code>${esc(d.taskId)}</code> · ${d.state.status === "published" ? "已发布" : d.state.status === "queued" ? "等待集成" : d.state.status === "integrating" ? "合并验证中" : d.state.status === "superseded" ? "编辑后已失效" : "集成阻塞"}${d.state.status === "blocked" ? `<p>${esc(d.state.error)}</p>` : ""}</div>`).join("")}</section>`;
+}
+function deliveryEvidence(g: Graph, t: Task) {
+  const delivery = g.integration?.deliveries.find((d) => d.taskId === t.id && d.state.status !== "superseded");
+  let versions = `启动提交：<code>${esc(t.startCommit ?? "尚未启动")}</code>`;
+  let body = "";
+  if (delivery) versions += `<br>验收源提交：<code>${esc(delivery.sourceSha)}</code>`;
+  if (delivery?.state.status === "published") {
+    const receipt = delivery.state.receipt;
+    versions += `<br>集成提交：<code>${esc(receipt.integratedSha)}</code>`;
+    body = `<div class="rule">${receipt.validation.status === "passed" ? `集成验证通过：<code>${esc(receipt.validation.command)}</code><pre>${esc(receipt.validation.output)}</pre>` : "未配置集成验证命令"}</div>`;
+  } else if (delivery?.state.status === "blocked") body = `<div class="notice amber">${esc(delivery.state.error)}</div>`;
+  return body + `<details class="rule" data-detail="task-git-${esc(t.id)}"><summary>Git 版本（Debug）</summary>${versions}</details>`;
 }
 function graphCanvas(g: Graph) {
   if (!g.tasks.length)
@@ -526,18 +545,18 @@ function inspector() {
         "",
       )}<p class="hint">成员配置来自 TaskType v${t.type.version} 的快照。点击成员查看初始 prompt、skills 与会话。</p>`;
   if (inspectTab === "goal")
-    body = `<pre>${esc(t.goal)}</pre><div class="rule">依赖：${t.deps.map(esc).join("、") || "无"}</div><div class="rule">工作区：${t.newWorktree ? "独立 worktree" : "共享基线"}</div>${btn("edit-task", "编辑任务", "spaced", !["draft", "paused"].includes(g.status) || t.status === "done")}`;
+    body = `<pre>${esc(t.goal)}</pre><div class="rule">依赖：${t.deps.map(esc).join("、") || "无"}</div><div class="rule">工作区：${t.newWorktree ? "独立 worktree" : "共享基线"}</div>${btn("edit-task", "编辑任务", "spaced", !["draft", "paused"].includes(g.status) || t.status === "done" )}`;
   if (inspectTab === "rules")
-    body = `<div class="notice">规则由程序执行，不调用额外调度模型。</div><div class="rule">初始成员：${t.type.start.map(esc).join("、")}</div>${t.type.rules.map((r) => `<div class="rule"><code>${esc(r.from)} / ${esc(r.outcome)}</code><div>↓ ${r.action.type === "activate" ? `启动 ${esc(r.action.unit)}` : r.action.type === "finish" ? "交付任务" : "标记阻塞"}</div></div>`).join("")}<p class="hint">执行轮数 ${t.round} / ${t.type.maxRounds}<br>漏报补跑上限 ${t.type.maxReportRetries}</p>`;
+    body = `<div class="notice">规则由程序执行，不调用额外调度模型。</div><div class="rule">初始成员：${t.type.start.map(esc).join("、")}</div>${t.type.rules.map((r) => `<div class="rule"><code>${esc(r.from)} / ${esc(r.outcome)}</code><div>↓ ${r.action.type === "activate" ? `启动 ${esc(r.action.unit)}` : r.action.type === "finish" ? "进入合并队列" : "标记阻塞"}</div></div>`).join("")}<p class="hint">执行轮数 ${t.round} / ${t.type.maxRounds}<br>漏报补跑上限 ${t.type.maxReportRetries}</p>`;
   if (inspectTab === "reports")
-    body = t.submissions.length
+    body = deliveryEvidence(g, t) + (t.submissions.length
       ? t.submissions
           .map(
             (s) =>
               `<button class="letter" data-report="${esc(s.id)}"><div class="row between"><code>${esc(s.unitId)}</code>${badge(s.outcome)}</div><h3>${esc(s.reportPath)}</h3><p>${esc(time(s.at))} · 查看固定内容 ↗</p></button>`,
           )
           .join("")
-      : empty("暂无报告", "收到报告、执行结束与任务交付是不同状态。");
+      : empty("暂无报告", "收到报告、执行结束与任务交付是不同状态。"));
   return `<div class="tasksummary"><div class="row between"><code class="muted">TASK / ${esc(t.id)}</code>${badge(t.status)}</div><h2>${esc(t.title)}</h2><p>${esc(t.type.name)} · v${t.type.version}<br>${t.units.length} 个成员 · ${t.deps.length} 个依赖</p></div><div class="tabs">${[
     ["members", "成员"],
     ["goal", "任务说明"],
@@ -853,7 +872,7 @@ function taskFields(input: TaskInput, index: number, existing: Task[] = []) {
 function graphModal() {
   modal(
     "创建任务图",
-    `<div class="grid2">${field("name", "Graph 名称", "", 'required placeholder="例如：认证流程改造"')}${field("concurrency", "并行任务上限", "2", 'type="number" min="1" max="8" required')}</div><div id="task-rows">${taskFields({ title: "", goal: "", deps: [], taskTypeId: state?.taskTypes[0]?.id ?? "", newWorktree: true }, 0)}</div><button type="button" class="btn" data-action="add-row">＋ 添加任务</button><p class="hint">任务 ID 保持稳定；依赖必须存在且不能成环。创建后可先检查任务图，再启动执行。</p>`,
+    `<div class="grid2">${field("name", "Graph 名称", "", 'required placeholder="例如：认证流程改造"')}${field("concurrency", "并行任务上限", "2", 'type="number" min="1" max="8" required')}</div>${field("integrationCommand", "合并后验证命令（可选）", "", 'placeholder="例如 npm test"')}<p class="hint">在每个实际合并候选中运行；成功且代码未被改动才发布。留空表示未配置验证命令。</p><div id="task-rows">${taskFields({ title: "", goal: "", deps: [], taskTypeId: state?.taskTypes[0]?.id ?? "", newWorktree: true }, 0)}</div><button type="button" class="btn" data-action="add-row">＋ 添加任务</button><p class="hint">任务 ID 保持稳定；依赖必须存在且不能成环。创建后可先检查任务图，再启动执行。</p>`,
     "new-graph",
     "创建 Graph",
   );
@@ -1229,6 +1248,7 @@ async function submit(form: HTMLFormElement) {
     const created = await api<Graph>("/api/graphs", "POST", {
       name: value(form, "name"),
       concurrency: Number(value(form, "concurrency")),
+      integrationCommand: value(form, "integrationCommand").trim() || undefined,
       tasks,
     });
     graphId = created.id;

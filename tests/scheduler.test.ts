@@ -70,7 +70,7 @@ async function waitFor(check: () => boolean, label: string) {
     await new Promise((r) => setTimeout(r, 20));
   }
 }
-async function fixture() {
+async function fixture(git = new GitWorkspaces()) {
   const root = await mkdtemp(join(tmpdir(), "harness-behavior-"));
   await exec("git", ["init", "-b", "main"], { cwd: root });
   await writeFile(join(root, "base.txt"), "base");
@@ -91,7 +91,7 @@ async function fixture() {
   const runtime = new ControlledRuntime();
   const app = await createHttpServer({
     runtime,
-    git: new GitWorkspaces(),
+    git,
     projectRoot: root,
     catalogPath: join(root, "catalog.json"),
   });
@@ -137,6 +137,226 @@ async function fixture() {
   }
   return { root, runtime, app, url, request, report };
 }
+
+class HeldIntegration extends GitWorkspaces {
+  release?: () => void;
+  entered = false;
+  override integrateTask(...args: Parameters<GitWorkspaces["integrateTask"]>) {
+    const [workspace, source, id, validate, cancelled] = args;
+    return super.integrateTask(workspace, source, id, async (candidate, sha) => {
+      this.entered = true;
+      await new Promise<void>((resolve) => { this.release = resolve; });
+      return validate(candidate, sha);
+    }, cancelled);
+  }
+}
+
+test("accepted work frees slots, dependent waits for both publications and later launch includes unrelated delivery", async () => {
+  const adapter = new HeldIntegration();
+  const f = await fixture(adapter);
+  try {
+    const graph = f.app.engine!.createGraph({ name: "queue", concurrency: 3, tasks: [
+      { id: "D", title: "unrelated", goal: "d", deps: [], taskTypeId: "direct" },
+      { id: "B", title: "first", goal: "b", deps: [], taskTypeId: "direct" },
+      { id: "C", title: "second", goal: "c", deps: [], taskTypeId: "direct" },
+      { id: "A", title: "dependent", goal: "a", deps: ["B", "C"], taskTypeId: "direct" },
+    ] });
+    await f.app.engine!.runGraph(graph.id);
+    await waitFor(() => f.runtime.turns.length === 3, "parallel tasks");
+    const initial = graph.integration!.headSha;
+    for (let i = 0; i < 3; i++) {
+      const id = graph.tasks.find((t) => t.workspace?.path === f.runtime.turns[i].input.cwd)!.id;
+      await writeFile(join(f.runtime.turns[i].input.cwd, `${id}.txt`), id);
+    }
+    const finish = async (id: string) => {
+      const index = f.runtime.turns.findIndex((turn) => turn.input.cwd === graph.tasks.find((t) => t.id === id)!.workspace?.path);
+      await f.report(index, "ready"); f.runtime.turns[index].finish();
+    };
+    await finish("D");
+    await waitFor(() => adapter.entered, "candidate validation");
+    assert.equal(f.app.engine!.busy, true);
+    await finish("B"); await finish("C");
+    await waitFor(() => graph.tasks.filter((t) => t.status === "merge_queued").length === 2, "queued accepted work");
+    assert.equal(graph.tasks.find((t) => t.id === "A")!.status, "waiting");
+    assert.equal(graph.integration!.headSha, initial);
+    const appended = f.app.engine!.appendTask(graph.id, { id: "E", title: "appended", goal: "e", deps: [], taskTypeId: "direct" });
+    assert.deepEqual(appended.appendBarrier?.sort(), ["B", "C", "D"]);
+    for (let i = 0; i < 3; i++) {
+      adapter.entered = false; adapter.release!();
+      if (i < 2) await waitFor(() => adapter.entered, "next serial candidate");
+    }
+    await waitFor(() => f.runtime.turns.length === 5, "downstream and append launch");
+    const a = graph.tasks.find((t) => t.id === "A")!;
+    for (const id of ["B", "C", "D"]) assert.equal(await readFile(join(a.workspace!.path, `${id}.txt`), "utf8"), id);
+    for (const id of ["B", "C", "D"]) assert.equal(graph.tasks.find((t) => t.id === id)!.startCommit, initial);
+    assert.equal(a.startCommit, graph.integration!.headSha);
+  } finally { adapter.release?.(); await f.app.close(); }
+});
+
+test("soft pause drains active publication while queued edit supersedes source without losing history", async () => {
+  const adapter = new HeldIntegration();
+  const f = await fixture(adapter);
+  try {
+    const graph = f.app.engine!.createGraph({ name: "edit queue", tasks: [
+      { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
+      { id: "B", title: "b", goal: "b", deps: [], taskTypeId: "direct" },
+    ] });
+    await f.app.engine!.runGraph(graph.id);
+    await waitFor(() => f.runtime.turns.length === 2, "workers");
+    await f.report(0, "ready"); f.runtime.turns[0].finish();
+    await waitFor(() => adapter.entered, "integration");
+    await f.report(1, "ready"); f.runtime.turns[1].finish();
+    await waitFor(() => graph.integration!.deliveries.length === 2, "second delivery queued");
+    const queued = graph.integration!.deliveries[1];
+    await f.app.engine!.pauseGraph(graph.id, "soft");
+    assert.equal(graph.status, "pausing");
+    adapter.release!();
+    await waitFor(() => graph.status === "paused", "integration drain");
+    assert.equal(graph.integration!.deliveries[0].state.status, "published");
+    assert.equal(queued.state.status, "queued");
+    const task = graph.tasks.find((t) => t.id === queued.taskId)!;
+    const base = task.startCommit;
+    f.app.engine!.editTask(graph.id, task.id, { goal: "new goal" });
+    assert.equal(queued.state.status, "superseded");
+    assert.equal(task.startCommit, base);
+    assert.throws(() => f.app.engine!.editTask(graph.id, graph.integration!.deliveries[0].taskId, { goal: "no" }), /已交付/);
+    await f.app.engine!.resumeGraph(graph.id);
+    await waitFor(() => f.runtime.turns.length === 3, "edited work resumes");
+    assert.equal(await adapter.integrationReceipt(graph.workspace!, queued.id), undefined);
+    assert.equal(graph.integration!.deliveries.length, 2);
+  } finally { adapter.release?.(); await f.app.close(); }
+});
+
+test("hard pause waits for integration and retry delivers accepted source without another agent turn", async () => {
+  const adapter = new HeldIntegration();
+  const f = await fixture(adapter);
+  try {
+    const graph = f.app.engine!.createGraph({ name: "hard queue", tasks: [
+      { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
+    ] });
+    await f.app.engine!.runGraph(graph.id);
+    await waitFor(() => f.runtime.turns.length === 1, "worker");
+    await f.report(0, "ready"); f.runtime.turns[0].finish();
+    await waitFor(() => adapter.entered, "candidate");
+    const initial = graph.integration!.headSha;
+    const pausing = f.app.engine!.pauseGraph(graph.id, "hard");
+    assert.equal(graph.status, "pausing");
+    adapter.release!(); await pausing;
+    assert.equal(graph.status, "paused");
+    assert.equal(graph.integration!.headSha, initial);
+    assert.equal(graph.tasks[0].status, "blocked");
+    assert.equal(graph.tasks[0].deliverySha, undefined);
+    await f.app.engine!.resolveGraph(graph.id, "A");
+    adapter.entered = false;
+    await f.app.engine!.resumeGraph(graph.id);
+    await waitFor(() => adapter.entered, "retry same delivery");
+    adapter.release!();
+    await waitFor(() => graph.status === "done", "published retry");
+    assert.equal(f.runtime.turns.length, 1);
+    assert.equal(graph.integration!.deliveries.length, 1);
+  } finally { adapter.release?.(); await f.app.close(); }
+});
+
+test("failed integration command blocks dependents while independent delivery proceeds and resolve retries only delivery", async () => {
+  const f = await fixture();
+  try {
+    const allow = join(f.root, ".newharness", "allow").replaceAll("\\", "/");
+    const graph = f.app.engine!.createGraph({ name: "validation queue", concurrency: 2,
+      integrationCommand: `node -e "if(require('fs').existsSync('A.txt')&&!require('fs').existsSync('${allow}'))process.exit(7);console.log('candidate verified')"`, tasks: [
+        { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
+        { id: "B", title: "b", goal: "b", deps: [], taskTypeId: "direct" },
+        { id: "C", title: "c", goal: "c", deps: ["A"], taskTypeId: "direct" },
+      ] });
+    await f.app.engine!.runGraph(graph.id);
+    await waitFor(() => f.runtime.turns.length === 2, "workers");
+    const index = (id: string) => f.runtime.turns.findIndex((turn) => turn.input.cwd === graph.tasks.find((t) => t.id === id)!.workspace?.path);
+    const a = index("A"), b = index("B");
+    await writeFile(join(f.runtime.turns[a].input.cwd, "A.txt"), "A");
+    await writeFile(join(f.runtime.turns[b].input.cwd, "B.txt"), "B");
+    await f.report(a, "ready"); f.runtime.turns[a].finish();
+    await waitFor(() => graph.tasks[0].status === "blocked", "failed validation");
+    assert.equal(graph.integration!.headSha, graph.workspace!.baseCommit);
+    assert.match(graph.tasks[0].blockReason!, /integrations/);
+    await f.report(b, "ready"); f.runtime.turns[b].finish();
+    await waitFor(() => graph.tasks[1].status === "done", "independent delivery");
+    assert.equal(f.runtime.turns.length, 2);
+    assert.equal(graph.tasks[2].status, "waiting");
+    const source = graph.integration!.deliveries[0].sourceSha;
+    await writeFile(allow, "allow");
+    await waitFor(() => graph.status === "blocked", "graph block settlement");
+    await f.app.engine!.resolveGraph(graph.id, "A");
+    await waitFor(() => f.runtime.turns.length === 3, "dependent after retry");
+    assert.equal(graph.tasks[0].deliverySha, source);
+    assert.equal(graph.integration!.deliveries.length, 2);
+    const delivered = graph.integration!.deliveries[0];
+    assert.equal(delivered.state.status, "published");
+    if (delivered.state.status === "published") assert.equal(delivered.state.receipt.validation.status, "passed");
+    assert.equal(await readFile(join(graph.tasks[2].workspace!.path, "B.txt"), "utf8"), "B");
+  } finally { await f.app.close(); }
+});
+
+test("startup pauses and reconciles a committed receipt before dispatch without republishing or rerunning work", async () => {
+  const adapter = new HeldIntegration();
+  const f = await fixture(adapter);
+  let reopened: Awaited<ReturnType<typeof createHttpServer>> | undefined;
+  try {
+    const graph = f.app.engine!.createGraph({ name: "receipt recovery", tasks: [
+      { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
+      { id: "B", title: "b", goal: "b", deps: ["A"], taskTypeId: "direct" },
+    ] });
+    await f.app.engine!.runGraph(graph.id);
+    await waitFor(() => f.runtime.turns.length === 1, "worker");
+    await f.report(0, "ready"); f.runtime.turns[0].finish();
+    await waitFor(() => adapter.entered, "integration before publication");
+    const saved = structuredClone(f.app.engine!.state);
+    await f.app.engine!.pauseGraph(graph.id, "soft");
+    adapter.release!();
+    await waitFor(() => graph.status === "paused", "published before state recovery");
+    const published = graph.integration!.headSha;
+    await f.app.close();
+    const { ProjectStore } = await import("../src/server/store.ts");
+    const store = new ProjectStore(f.root); store.save(saved); store.close();
+    const runtime = new ControlledRuntime();
+    reopened = await createHttpServer({ runtime, git: new GitWorkspaces(), projectRoot: f.root, catalogPath: join(f.root, "catalog.json") });
+    await new Promise<void>((resolve) => reopened!.server.listen(0, "127.0.0.1", resolve));
+    const restored = reopened.engine!.graph(graph.id);
+    assert.equal(restored.status, "paused");
+    assert.equal(runtime.turns.length, 0);
+    assert.throws(() => reopened!.engine!.editTask(graph.id, "A", { goal: "unsafe edit" }), /Reconcile/);
+    await reopened.engine!.resumeGraph(graph.id);
+    await waitFor(() => runtime.turns.length === 1, "dependent only");
+    assert.equal(restored.tasks[0].status, "done");
+    assert.equal(restored.tasks[1].startCommit, published);
+    assert.equal(restored.integration!.headSha, published);
+    assert.equal(restored.integration!.deliveries.length, 1);
+    assert.equal(await adapter.integrationHead(restored.workspace!), published);
+  } finally {
+    adapter.release?.();
+    if (reopened) await reopened.close();
+    else if (f.app.server.listening) await f.app.close();
+  }
+});
+
+test("hard pause terminates the real integration validator before publishing", async () => {
+  const f = await fixture();
+  try {
+    const graph = f.app.engine!.createGraph({ name: "validator cancellation", integrationCommand: 'node -e "setTimeout(()=>{},60000)"', tasks: [
+      { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
+    ] });
+    await f.app.engine!.runGraph(graph.id);
+    await waitFor(() => f.runtime.turns.length === 1, "worker");
+    await f.report(0, "ready"); f.runtime.turns[0].finish();
+    await waitFor(() => {
+      const state = graph.integration!.deliveries[0]?.state;
+      return state?.status === "integrating" && !!state.validatorPid;
+    }, "validator process");
+    await f.app.engine!.pauseGraph(graph.id, "hard");
+    assert.equal(graph.status, "paused");
+    assert.equal(graph.integration!.headSha, graph.workspace!.baseCommit);
+    assert.equal(graph.integration!.deliveries[0].state.status, "blocked");
+    assert.equal(await f.app.engine!.git.integrationReceipt(graph.workspace!, graph.integration!.deliveries[0].id), undefined);
+  } finally { await f.app.close(); }
+});
 
 test("report receipt does not dispatch review before turn end; review gates DAG and resumes the original sessions", async () => {
   const f = await fixture();

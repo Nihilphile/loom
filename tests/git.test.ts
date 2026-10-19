@@ -97,6 +97,9 @@ test("validation sees the merged candidate and failure, mutations and cancellati
         if (mutation === "commit") { await git(candidate.path, "add", "."); await git(candidate.path, "commit", "-m", "unexpected"); }
         return { status: "passed", command: mutation, output: "" };
       }, () => false), /changed the candidate/);
+      await assert.rejects(deliver(new GitWorkspaces(), graph, source, mutation), /restore the exact clean candidate/);
+      assert.equal(await adapter.integrationReceipt(graph, mutation), undefined);
+      assert.equal(await adapter.integrationHead(graph), graph.baseCommit);
     }
     let cancelled = false;
     await assert.rejects(adapter.integrateTask(graph, source, "cancel", async () => {

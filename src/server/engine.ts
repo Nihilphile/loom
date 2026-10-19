@@ -84,6 +84,7 @@ export class HarnessEngine {
   private agentOperations = new Map<string, Promise<unknown>>();
   private integrations = new Map<string, Promise<void>>();
   private validators = new Map<string, RuntimeHandle>();
+  private graphControls = new Map<string, Promise<Graph>>();
   constructor(
     root: string,
     readonly runtime: Runtime,
@@ -222,7 +223,7 @@ export class HarnessEngine {
   }
   get busy() {
     return (
-      this.jobs.size > 0 || this.pumping.size > 0 || this.preparing.size > 0 || this.integrations.size > 0
+      this.jobs.size > 0 || this.pumping.size > 0 || this.preparing.size > 0 || this.integrations.size > 0 || this.graphControls.size > 0
     );
   }
   createSession(input: {
@@ -930,6 +931,7 @@ export class HarnessEngine {
       this.state.sessions.some((s) => s.graphId === graph.id && s.child?.state === "preparing") ||
       this.preparing.has(graph.id) ||
       this.integrations.has(graph.id) ||
+      this.graphControls.has(graph.id) ||
       graph.tasks.some((t) => this.preparing.has(graph.id + "/" + t.id)) ||
       this.state.executions.some(
         (e) => e.graphId === graph.id && activeExecution(e),
@@ -962,7 +964,10 @@ export class HarnessEngine {
         )
         .map((e) => this.interrupt(e.sessionId)),
     );
-    if (mode === "hard") await this.integrations.get(id);
+    if (mode === "hard") {
+      await this.integrations.get(id);
+      await Promise.allSettled([this.graphControls.get(id)]);
+    }
     this.settlePause(graph);
     return graph;
   }
@@ -977,92 +982,108 @@ export class HarnessEngine {
   async resumeGraph(id: string) {
     const graph = this.graph(id);
     if (graph.status !== "paused") throw new Error("只有已暂停图可以恢复");
-    if (!graph.workspace) {
-      graph.status = "draft";
-      graph.pauseMode = undefined;
-      void this.runGraph(id);
-      return graph;
-    }
-    await this.reconcileIntegration(graph);
-    for (const task of graph.tasks)
-      for (const unit of task.units)
-        if (unit.sessionId) this.ensureStopped(this.session(unit.sessionId));
-    graph.status = "running";
-    graph.pauseMode = undefined;
-    graph.error = undefined;
-    for (const task of graph.tasks) {
-      if (
-        task.status !== "done" && !graph.integration!.deliveries.some((d) => d.taskId === task.id && d.state.status !== "superseded") &&
-        task.units.some((u) => u.status === "interrupted")
-      ) {
-        task.status = "waiting";
-        task.blockReason = undefined;
+    return this.controlGraph(graph, async () => {
+      if (!graph.workspace) {
+        graph.status = "draft";
+        graph.pauseMode = undefined;
+        return this.runGraph(id);
       }
-    }
-    this.record("graph.resumed", "恢复调度", { graphId: id });
-    this.schedule(graph);
-    for (const session of this.state.sessions) {
-      if (session.graphId === id) void this.continueFromChildren(session);
-      if (
-        this.pendingLetters(session).some((item) => item.letter.graphId === id)
-      )
-        void this.deliverWaiting(session);
-    }
-    return graph;
+      await this.reconcileIntegration(graph);
+      if (this.closing || graph.status !== "paused") return graph;
+      for (const task of graph.tasks)
+        for (const unit of task.units)
+          if (unit.sessionId) this.ensureStopped(this.session(unit.sessionId));
+      graph.status = "running";
+      graph.pauseMode = undefined;
+      graph.error = undefined;
+      for (const task of graph.tasks) {
+        if (
+          task.status !== "done" && !graph.integration!.deliveries.some((d) => d.taskId === task.id && d.state.status !== "superseded") &&
+          task.units.some((u) => u.status === "interrupted")
+        ) {
+          task.status = "waiting";
+          task.blockReason = undefined;
+        }
+      }
+      this.record("graph.resumed", "恢复调度", { graphId: id });
+      this.schedule(graph);
+      for (const session of this.state.sessions) {
+        if (session.graphId === id) void this.continueFromChildren(session);
+        if (
+          this.pendingLetters(session).some((item) => item.letter.graphId === id)
+        )
+          void this.deliverWaiting(session);
+      }
+      return graph;
+    });
   }
   async resolveGraph(id: string, taskId?: string) {
     const graph = this.graph(id);
     if (this.graphBusy(graph)) throw new Error("请等待活动执行结束后处理阻塞");
     if (!["blocked", "paused", "running"].includes(graph.status))
       throw new Error("当前状态不能解除阻塞");
-    if (graph.workspace) await this.reconcileIntegration(graph);
-    const targets = taskId
-      ? [this.task(graph, taskId)]
-      : graph.tasks.filter((t) => t.status === "blocked");
-    for (const task of targets) {
-      if (task.status !== "blocked") continue;
-      const delivery = graph.integration?.deliveries.find((d) => d.taskId === task.id && d.state.status !== "superseded");
-      if (delivery) {
-        this.ensureValidatorStopped(delivery);
-        delivery.state = { status: "queued" };
-        task.status = "merge_queued";
+    const status = graph.status;
+    return this.controlGraph(graph, async () => {
+      if (graph.workspace) await this.reconcileIntegration(graph);
+      if (this.closing || graph.status !== status) return graph;
+      const targets = taskId
+        ? [this.task(graph, taskId)]
+        : graph.tasks.filter((t) => t.status === "blocked");
+      for (const task of targets) {
+        if (task.status !== "blocked") continue;
+        const delivery = graph.integration?.deliveries.find((d) => d.taskId === task.id && d.state.status !== "superseded");
+        if (delivery) {
+          this.ensureValidatorStopped(delivery);
+          delivery.state = { status: "queued" };
+          task.status = "merge_queued";
+          task.blockReason = undefined;
+          continue;
+        }
+        const recovering = task.blockReason?.startsWith("恢复检查：");
+        for (const unit of task.units) {
+          if (unit.sessionId) this.ensureStopped(this.session(unit.sessionId));
+          unit.reportRetries = 0;
+        }
+        task.status = "waiting";
         task.blockReason = undefined;
-        continue;
+        task.nextUnit = task.nextUnit || task.type.start[0];
+        const completed = this.state.executions.findLast(
+          (e) => e.graphId === id && e.taskId === task.id && e.purpose !== "mail",
+        );
+        if (
+          recovering &&
+          completed?.status === "completed" &&
+          completed.submissionId
+        ) {
+          const unit = task.units.find((u) => u.id === completed.unitId)!;
+          task.status = "awaiting";
+          void this.advance(graph, task, unit, completed, {
+            status: "completed",
+            text: "",
+          }).finally(() => this.schedule(graph));
+        }
       }
-      const recovering = task.blockReason?.startsWith("恢复检查：");
-      for (const unit of task.units) {
-        if (unit.sessionId) this.ensureStopped(this.session(unit.sessionId));
-        unit.reportRetries = 0;
+      graph.error = undefined;
+      if (graph.status === "blocked") graph.status = "running";
+      this.record("graph.resolve", "请求重新检查阻塞条件", { graphId: id });
+      if (!graph.workspace) {
+        if (graph.status === "paused") return graph;
+        graph.status = "draft";
+        return this.runGraph(id);
       }
-      task.status = "waiting";
-      task.blockReason = undefined;
-      task.nextUnit = task.nextUnit || task.type.start[0];
-      const completed = this.state.executions.findLast(
-        (e) => e.graphId === id && e.taskId === task.id && e.purpose !== "mail",
-      );
-      if (
-        recovering &&
-        completed?.status === "completed" &&
-        completed.submissionId
-      ) {
-        const unit = task.units.find((u) => u.id === completed.unitId)!;
-        task.status = "awaiting";
-        void this.advance(graph, task, unit, completed, {
-          status: "completed",
-          text: "",
-        }).finally(() => this.schedule(graph));
-      }
-    }
-    graph.error = undefined;
-    if (graph.status === "blocked") graph.status = "running";
-    this.record("graph.resolve", "请求重新检查阻塞条件", { graphId: id });
-    if (!graph.workspace) {
-      if (graph.status === "paused") return graph;
-      graph.status = "draft";
-      return this.runGraph(id);
-    }
-    this.schedule(graph);
-    return graph;
+      this.schedule(graph);
+      return graph;
+    });
+  }
+  private controlGraph(graph: Graph, action: () => Promise<Graph>): Promise<Graph> {
+    if (this.closing || this.graphControls.has(graph.id))
+      throw new Error("Graph lifecycle operation is already settling");
+    const operation = action().finally(() => {
+      this.graphControls.delete(graph.id);
+      this.settlePause(graph);
+    });
+    this.graphControls.set(graph.id, operation);
+    return operation;
   }
   private schedule(graph: Graph) {
     if (graph.status === "running" && !this.closing)
@@ -1205,6 +1226,10 @@ export class HarnessEngine {
       this.ensureValidatorStopped(delivery);
       if (delivery.state.status === "superseded") continue;
       const receipt = await this.git.integrationReceipt(graph.workspace!, delivery.id);
+      if (delivery.state.status === "published" && !receipt)
+        throw new Error(`Published delivery receipt is missing for Task ${delivery.taskId}`);
+      if (receipt && (receipt.sourceSha !== delivery.sourceSha || receipt.operationId !== delivery.id))
+        throw new Error(`Integration receipt changed for Task ${delivery.taskId}`);
       if (receipt && delivery.state.status !== "published") this.publishDelivery(graph, delivery, receipt);
       if (delivery.state.status === "blocked") delivery.state.reconcileRequired = false;
     }
@@ -2749,13 +2774,14 @@ export class HarnessEngine {
   async shutdown() {
     this.closing = true;
     for (const graph of this.state.graphs)
-      if (["running", "blocked", "pausing"].includes(graph.status)) {
+      if (["running", "blocked", "pausing"].includes(graph.status) || this.graphControls.has(graph.id)) {
         graph.status = "pausing";
         graph.pauseMode = "hard";
       }
     await Promise.all([...this.validators.values()].map((handle) => handle.interrupt()));
     await Promise.all([...this.jobs.keys()].map((id) => this.interrupt(id)));
     await Promise.all(this.integrations.values());
+    await Promise.allSettled(this.graphControls.values());
     while (this.preparing.size || this.pumping.size || this.agentOperations.size)
       await new Promise((resolve) => setTimeout(resolve, 20));
     for (const graph of this.state.graphs) this.settlePause(graph);

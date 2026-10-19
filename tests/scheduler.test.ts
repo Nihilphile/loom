@@ -151,6 +151,53 @@ class HeldIntegration extends GitWorkspaces {
   }
 }
 
+class HeldIntegrationHead extends GitWorkspaces {
+  hold = false;
+  entered = false;
+  release?: () => void;
+  override async integrationHead(workspace: Parameters<GitWorkspaces["integrationHead"]>[0]) {
+    if (this.hold) {
+      this.hold = false;
+      this.entered = true;
+      await new Promise<void>((resolve) => { this.release = resolve; });
+    }
+    return super.integrationHead(workspace);
+  }
+}
+
+for (const action of ["resume", "resolve", "close"] as const) {
+  test(`pending ${action === "resolve" ? "resolve" : "resume"} cannot override concurrent ${action === "close" ? "close" : "hard pause"} or permit edits`, async () => {
+    const adapter = new HeldIntegrationHead();
+    const f = await fixture(adapter);
+    try {
+      const graph = f.app.engine!.createGraph({ name: "lifecycle race", tasks: [
+        { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
+      ] });
+      await f.app.engine!.runGraph(graph.id);
+      await waitFor(() => f.runtime.turns.length === 1, "initial worker");
+      if (action === "resolve") {
+        await f.report(0, "blocked"); f.runtime.turns[0].finish();
+        await waitFor(() => graph.status === "blocked", "blocked work");
+      } else await f.app.engine!.pauseGraph(graph.id, "hard");
+      adapter.hold = true;
+      const control = action === "resolve" ? f.app.engine!.resolveGraph(graph.id) : f.app.engine!.resumeGraph(graph.id);
+      await waitFor(() => adapter.entered, "reconciliation held");
+      assert.equal(f.app.engine!.busy, true);
+      assert.throws(() => f.app.engine!.editTask(graph.id, "A", { goal: "unsafe edit" }), /等待当前执行结束/);
+      const stopping = action === "close" ? f.app.close() : f.app.engine!.pauseGraph(graph.id, "hard");
+      assert.equal(graph.status, "pausing");
+      adapter.release!();
+      await Promise.all([control, stopping]);
+      assert.equal(graph.status, "paused");
+      assert.equal(f.runtime.turns.length, 1);
+      assert.equal(f.app.engine!.busy, false);
+    } finally {
+      adapter.release?.();
+      if (f.app.server.listening) await f.app.close();
+    }
+  });
+}
+
 test("accepted work frees slots, dependent waits for both publications and later launch includes unrelated delivery", async () => {
   const adapter = new HeldIntegration();
   const f = await fixture(adapter);
@@ -330,6 +377,13 @@ test("startup pauses and reconciles a committed receipt before dispatch without 
     assert.equal(restored.integration!.headSha, published);
     assert.equal(restored.integration!.deliveries.length, 1);
     assert.equal(await adapter.integrationHead(restored.workspace!), published);
+    await reopened.engine!.pauseGraph(graph.id, "hard");
+    const refs = (await exec("git", ["for-each-ref", "--format=%(refname) %(objecttype)", "refs/newharness/ops"], { cwd: f.root })).stdout;
+    const receiptRef = refs.split("\n").find((line) => line.endsWith(" blob"))!.split(" ")[0];
+    await exec("git", ["update-ref", "-d", receiptRef], { cwd: f.root });
+    await assert.rejects(reopened.engine!.resumeGraph(graph.id), /Published delivery receipt is missing/);
+    assert.equal(runtime.turns.length, 1);
+    assert.equal(restored.status, "paused");
   } finally {
     adapter.release?.();
     if (reopened) await reopened.close();

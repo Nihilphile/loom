@@ -19,6 +19,7 @@ interface Manifest {
   workspace: Workspace;
   dependencies: string[];
   prepared: boolean;
+  candidateSha?: string;
 }
 
 const metadata = [".newharness"];
@@ -543,12 +544,21 @@ export class GitWorkspaces implements GitAdapter {
         await saveManifest(candidateManifest);
       }
       const candidate = await ensureWorktree(candidateManifest);
-      await merge(candidate, [sourceSha]);
-      let integratedSha = await git(path, ["rev-parse", "HEAD"]);
-      if (integratedSha === baseSha) {
-        const tree = await git(path, ["rev-parse", "HEAD^{tree}"]);
-        integratedSha = await git(path, ["commit-tree", tree, "-p", baseSha], `Task delivery ${operationId}\n`);
-        await git(path, ["checkout", "--detach", integratedSha]);
+      let integratedSha = candidateManifest.candidateSha;
+      if (integratedSha) {
+        if ((await git(path, ["rev-parse", "HEAD"])) !== integratedSha ||
+            await git(path, ["status", "--porcelain", "--untracked-files=all", "--", ...codePaths]))
+          throw new GitBlockedError(candidate, `Validation candidate changed; restore the exact clean candidate ${integratedSha} before retry`);
+      } else {
+        await merge(candidate, [sourceSha]);
+        integratedSha = await git(path, ["rev-parse", "HEAD"]);
+        if (integratedSha === baseSha) {
+          const tree = await git(path, ["rev-parse", "HEAD^{tree}"]);
+          integratedSha = await git(path, ["commit-tree", tree, "-p", baseSha], `Task delivery ${operationId}\n`);
+          await git(path, ["checkout", "--detach", integratedSha]);
+        }
+        candidateManifest.candidateSha = integratedSha;
+        await saveManifest(candidateManifest);
       }
       let validation: IntegrationValidation;
       try {

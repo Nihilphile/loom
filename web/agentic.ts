@@ -3,6 +3,10 @@ import { summarize } from "./statistics.ts";
 
 const esc = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
 
+export function sessionError(session: Session) {
+  return session.error ? `<div class="notice amber">${esc(session.error)}</div>` : "";
+}
+
 export function sessionSubtree(sessions: Session[], rootId: string): Set<string> {
   const ids = new Set([rootId]);
   let changed = true;

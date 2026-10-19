@@ -9,6 +9,7 @@ import { Catalog } from "../src/server/catalog.ts";
 import { GitWorkspaces } from "../src/server/git.ts";
 import { createHttpServer } from "../src/server/http.ts";
 import { controllerCommandSchema } from "../src/shared/controller.ts";
+import { sessionError } from "../web/agentic.ts";
 import type { Runtime, RuntimeInput, RuntimeEvent, RuntimeResult } from "../src/shared/types.ts";
 
 const key = "fixture-controller-key-01234567890123456789";
@@ -19,16 +20,20 @@ class ControllerRuntime implements Runtime {
   injections: string[] = [];
   uncertain = false;
   rejected = false;
+  rejectionReason = "native turn rejected";
+  eventThreadId?: string;
+  receiptThreadId?: string;
+  resultThreadId?: string;
   finish: (() => void)[] = [];
   discoverOptions = async (_cwd: string) => ({ models: [{ id: "fixture", name: "fixture", reasoning: [] }], skills: [], warnings: [] });
   async start(input: RuntimeInput, emit: (event: RuntimeEvent) => void) {
     this.starts.push(input);
     const threadId = input.fork ? `fork-${this.starts.length}` : input.threadId ?? "native";
-    emit({ type: "thread.started", threadId });
+    emit({ type: "thread.started", threadId: this.eventThreadId ?? threadId });
     let finish!: () => void;
-    const done = new Promise<RuntimeResult>((resolve) => { finish = () => resolve({ status: "completed", text: "done", threadId }); });
+    const done = new Promise<RuntimeResult>((resolve) => { finish = () => resolve({ status: "completed", text: "done", threadId: this.resultThreadId ?? threadId }); });
     this.finish.push(finish);
-    return { accepted: Promise.resolve(this.rejected ? { status: "rejected" as const, reason: "native turn rejected" } : this.uncertain ? { status: "uncertain" as const, reason: "lost native acknowledgement" } : { status: "accepted" as const, threadId, turnId: "checkpoint" }), done,
+    return { accepted: Promise.resolve(this.rejected ? { status: "rejected" as const, reason: this.rejectionReason } : this.uncertain ? { status: "uncertain" as const, reason: "lost native acknowledgement" } : { status: "accepted" as const, threadId: this.receiptThreadId ?? threadId, turnId: "checkpoint" }), done,
       inject: async (text: string) => { this.injections.push(text); return true; }, interrupt: async () => { finish(); } };
   }
 }
@@ -52,12 +57,94 @@ function fixture(t: TestContext) {
 const graphInput = (requestId: string) => ({ op: "graph_create", requestId, name: requestId,
   tasks: [{ id: "A", title: "A", goal: "fixture", deps: [], taskTypeId: "direct" }] });
 
+test("controller identity rejects active, idle and historical native thread aliases without partial binding", async (t) => {
+  for (const history of ["active", "idle", "execution-only"]) {
+    const f = fixture(t), original = f.engine.createSession({ title: history }), alias = randomUUID();
+    await f.engine.sendMessage(original.id, "normal Loom execution");
+    const threadId = original.threadId!;
+    if (history !== "active") { f.runtime.finish[0](); await until(() => !f.engine.busy); }
+    if (history === "execution-only") original.threadId = undefined;
+    await assert.rejects(f.call(alias, { op: "connect", create: true, threadId }), /native thread.*another session/i);
+    assert.equal(f.engine.state.sessions.some((s) => s.id === alias), false);
+    assert.equal(f.engine.state.controllerAccess?.some((a) => a.sessionId === alias) ?? false, false);
+    const empty = f.engine.createSession({ title: "existing empty target" });
+    await assert.rejects(f.call(empty.id, { op: "connect", threadId }), /native thread.*another session/i);
+    assert.notEqual(empty.executionOwner?.kind, "external");
+    if (history === "active") { f.runtime.finish[0](); await until(() => !f.engine.busy); }
+    original.threadId = threadId;
+    await f.call(original.id, { op: "connect" });
+    assert.equal(original.executionOwner?.kind, "external");
+    assert.equal(original.threadId, threadId);
+    await f.call(original.id, { op: "connect", threadId });
+  }
+});
+
+test("unique external native identities reconnect and block legacy aliases at Loom execution entries", async (t) => {
+  const f = fixture(t), id = randomUUID(), threadId = "desktop-unique-native";
+  await f.call(id, { op: "connect", create: true, threadId });
+  f.restart();
+  await f.call(id, { op: "connect", threadId });
+  const alias = f.engine.createSession({ title: "legacy alias" }); alias.threadId = threadId;
+  await assert.rejects(f.engine.sendMessage(alias.id, "must not resume Desktop"), /managed by Desktop/);
+  assert.throws(() => f.engine.continueQueue(alias.id), /managed by Desktop/);
+  assert.equal(f.runtime.starts.length, 0);
+  await assert.rejects(f.call(randomUUID(), { op: "connect", create: true, threadId }), /native thread.*another session/i);
+});
+
+test("native identity updates cannot assign a Desktop thread through events, receipts, results or preparation resolution", async (t) => {
+  for (const channel of ["eventThreadId", "receiptThreadId", "resultThreadId"] as const) {
+    const f = fixture(t), external = randomUUID(), threadId = "desktop-protected-native";
+    await f.call(external, { op: "connect", create: true, threadId });
+    f.runtime[channel] = threadId;
+    const internal = f.engine.createSession({ title: channel });
+    await f.engine.sendMessage(internal.id, "new independent execution");
+    await until(() => f.runtime.starts.length === 1);
+    f.runtime.finish[0]?.(); await until(() => !f.engine.busy);
+    assert.equal(internal.status, "failed");
+    assert.notEqual(internal.threadId, threadId);
+    assert.equal(f.engine.session(external).threadId, threadId);
+    assert.notEqual(f.runtime.starts[0].threadId, threadId);
+  }
+  const f = fixture(t), internal = f.engine.createSession({ title: "uncertain" });
+  f.runtime.uncertain = true;
+  await f.engine.sendMessage(internal.id, "uncertain execution");
+  f.runtime.finish[0](); await until(() => !f.engine.busy);
+  await f.call(randomUUID(), { op: "connect", create: true, threadId: "desktop-resolve-native" });
+  const preparation = f.engine.state.preparations.find((p) => p.sessionId === internal.id)!;
+  assert.throws(() => f.engine.resolvePreparation(internal.id, preparation.id,
+    { accepted: true, threadId: "desktop-resolve-native", turnId: "turn" }), /managed by Desktop/);
+  assert.equal(preparation.receipt.status, "uncertain");
+  assert.notEqual(internal.threadId, "desktop-resolve-native");
+});
+
+test("failed session takeover clears its current warning and preserves historical execution failure", async (t) => {
+  const f = fixture(t), session = f.engine.createSession({ title: "Desktop takeover after writer conflict" });
+  f.runtime.rejected = true; f.runtime.rejectionReason = "already has an active writer";
+  await f.engine.sendMessage(session.id, "reproduce rejected writer");
+  f.runtime.finish[0](); await until(() => !f.engine.busy);
+  assert.match(sessionError(session), /already has an active writer/);
+  f.restart();
+  const before = f.engine.view(); assert.ok(before.executions);
+  const execution = structuredClone(before.executions.find((e) => e.sessionId === session.id)!);
+  assert.equal(execution.status, "failed");
+  await f.call(session.id, { op: "connect" });
+  f.restart();
+  const view = f.engine.view(), current = view.sessions.find((s) => s.id === session.id)!;
+  assert.ok(view.executions);
+  assert.equal(current.status, "idle");
+  assert.equal(current.executionOwner?.kind, "external");
+  assert.equal(current.error, undefined);
+  assert.equal(sessionError(current), "");
+  assert.deepEqual(view.executions.find((e) => e.id === execution.id), execution);
+  assert.equal(execution.error, "already has an active writer");
+});
+
 test("observer rejected acceptance cannot fork an externally owned source on retry or cross binding while pending", async (t) => {
   const f = fixture(t);
   f.runtime.rejected = true;
   for (const pending of [false, true]) {
     const source = f.engine.createSession({ title: "source before Desktop takeover" });
-    source.threadId = "source-native"; source.lastCompletedTurnId = "checkpoint";
+    source.threadId = `source-native-${pending}`; source.lastCompletedTurnId = "checkpoint";
     const observer = f.engine.createSidechat(source.id);
     await f.engine.sendMessage(observer.id, "first fork");
     const index = f.runtime.starts.length - 1;

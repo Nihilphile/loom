@@ -251,11 +251,24 @@ export class HarnessEngine {
   private forkSource(session: Session) {
     return session.acceptedConfig ? undefined : session.source;
   }
+  private requireLoomThread(threadId?: string) {
+    if (threadId && this.state.sessions.some((s) => s.threadId === threadId && s.executionOwner?.kind === "external"))
+      throw new ControllerError("EXTERNAL_SESSION", "This native thread is managed by Desktop; use its controller inbox");
+  }
+  private requireControllerThread(sessionId: string, threadId?: string) {
+    if (threadId && (this.state.sessions.some((s) => s.id !== sessionId && s.threadId === threadId) ||
+      this.state.executions.some((e) => e.sessionId !== sessionId && e.threadId === threadId)))
+      throw new ControllerError("OWNERSHIP_CONFLICT", "Native thread belongs to another session; connect using its original session UUID");
+  }
   private requireLoom(session: Session) {
     if (session.executionOwner?.kind === "external")
       throw new ControllerError("EXTERNAL_SESSION", "This free session is managed by Desktop; use its controller inbox");
+    this.requireLoomThread(session.threadId);
     const source = this.forkSource(session);
-    if (source) this.requireLoom(this.session(source.sessionId));
+    if (source) {
+      this.requireLoomThread(source.threadId);
+      this.requireLoom(this.session(source.sessionId));
+    }
   }
   private controllerSession(id: string, key: string) {
     if (typeof key !== "string" || key.length < 32 || key.length > 512)
@@ -299,6 +312,7 @@ export class HarnessEngine {
       this.controllerSession(id, key);
       if (input.threadId && session.threadId !== input.threadId)
         throw new ControllerError("OWNERSHIP_CONFLICT", "The connected native thread identity cannot change");
+      this.requireControllerThread(id, session.threadId);
       return { sessionId: id, executionOwner: session.executionOwner, threadId: session.threadId };
     }
     if (session) {
@@ -323,6 +337,9 @@ export class HarnessEngine {
         throw new ControllerError("OWNERSHIP_CONFLICT", "Native thread identity does not match session history");
     } else {
       if (!input.create) throw new ControllerError("NOT_FOUND", "Session not found; explicit create is required", 404);
+    }
+    this.requireControllerThread(id, session?.threadId ?? input.threadId);
+    if (!session) {
       session = { id, title: input.title ?? "Desktop controller", kind: "free", status: "idle", messages: [], metrics: emptyMetrics(), turns: 0 };
       this.state.sessions.push(session);
     }
@@ -330,6 +347,7 @@ export class HarnessEngine {
     session.threadId ??= input.threadId;
     session.queuePaused = true;
     session.status = "idle";
+    session.error = undefined;
     (this.state.controllerAccess ??= []).push({ sessionId: id, keyHash: hash(key), requests: [] });
     this.record("controller.connected", "Desktop owns this free session", { sessionId: id });
     return { sessionId: id, executionOwner: session.executionOwner, threadId: session.threadId };
@@ -634,6 +652,7 @@ export class HarnessEngine {
           turnId: text(input.turnId, "turnId"),
         }
       : { status: "rejected" as const, reason: "用户检查运行历史后确认未接收" };
+    if (receipt.status === "accepted") this.requireLoomThread(receipt.threadId);
     this.inputs.accept(session, preparation, receipt);
     if (receipt.status === "accepted") this.acceptLetters(session, preparation);
     this.record("preparation.resolved", "用户已核对输入接收结果", {
@@ -2086,6 +2105,7 @@ export class HarnessEngine {
           sessionId: session.id,
         });
         const source = this.forkSource(session);
+        this.requireLoom(session);
         const handle =
           context?.unit.kind === "command"
             ? this.command(context.unit.command!, cwd, onEvent)
@@ -2138,6 +2158,7 @@ export class HarnessEngine {
         execution.status = "running";
         const acceptance = handle.accepted.then((receipt) => {
           const priorConfig = session.acceptedConfig;
+          if (receipt.status === "accepted") this.requireLoomThread(receipt.threadId);
           this.inputs.accept(session, preparation, receipt);
           if (
             receipt.status === "accepted" &&
@@ -2179,6 +2200,7 @@ export class HarnessEngine {
           };
         if (completion[1].status === "rejected") throw completion[1].reason;
         result = completion[1].value;
+        this.requireLoomThread(result.threadId);
         if (result.status !== "interrupted" && !inputAccepted(preparation))
           result = {
             ...result,
@@ -2311,6 +2333,7 @@ export class HarnessEngine {
     event: RuntimeEvent,
     unit?: Unit,
   ) {
+    this.requireLoomThread(event.threadId);
     if (event.usage) {
       execution.metrics!.usage = structuredClone(event.usage);
       execution.usageKnown = true;

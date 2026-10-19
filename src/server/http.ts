@@ -1,4 +1,4 @@
-import { createServer, type ServerResponse } from "node:http";
+import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
@@ -24,6 +24,11 @@ import type {
   InterviewSettings,
 } from "../shared/types.ts";
 
+type StateStream = {
+  send: (message: () => string) => void;
+  close: () => void;
+};
+
 export async function createHttpServer(options: {
   runtime: Runtime;
   git: GitAdapter;
@@ -40,7 +45,7 @@ export async function createHttpServer(options: {
         : undefined),
   );
   const engines = new Map<string, HarnessEngine>();
-  const streams = new Map<string, Set<ServerResponse>>();
+  const streams = new Map<string, Set<StateStream>>();
   let defaultProjectId: string | undefined;
   let endpoint = "";
   let closing = false;
@@ -57,10 +62,12 @@ export async function createHttpServer(options: {
         capabilities: options.runtime.capabilities,
       },
     };
+  const stateMessage = (id: string) =>
+    "event: state\ndata: " + JSON.stringify(view(engines.get(id))) + "\n\n";
   const broadcast = (id: string) => {
-    const message =
-      "event: state\ndata: " + JSON.stringify(view(engines.get(id))) + "\n\n";
-    for (const stream of streams.get(id) || []) stream.write(message);
+    let message: string | undefined;
+    const latest = () => (message ??= stateMessage(id));
+    for (const stream of streams.get(id) || []) stream.send(latest);
   };
   const open = (id: string): HarnessEngine => {
     const existing = engines.get(id);
@@ -172,13 +179,42 @@ export async function createHttpServer(options: {
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
         });
-        res.write(
-          "event: state\ndata: " + JSON.stringify(view(engine)) + "\n\n",
-        );
-        const subscribers = streams.get(projectId) || new Set<ServerResponse>();
-        streams.set(projectId, subscribers);
-        subscribers.add(res);
-        req.on("close", () => subscribers.delete(res));
+        const id = projectId;
+        const subscribers = streams.get(id) || new Set<StateStream>();
+        let state: "ready" | "blocked" | "pending" | "closed" = "ready";
+        const send = (message: () => string) => {
+          if (state === "closed") return;
+          if (state !== "ready") {
+            state = "pending";
+            return;
+          }
+          if (!res.write(message())) state = "blocked";
+        };
+        const drain = () => {
+          if (state === "closed") return;
+          const pending = state === "pending";
+          state = "ready";
+          if (pending) send(() => stateMessage(id));
+        };
+        const cleanup = () => {
+          state = "closed";
+          res.off("drain", drain);
+          res.off("close", cleanup);
+          subscribers.delete(stream);
+          if (!subscribers.size) streams.delete(id);
+        };
+        const stream: StateStream = {
+          send,
+          close: () => {
+            cleanup();
+            res.end();
+          },
+        };
+        streams.set(id, subscribers);
+        subscribers.add(stream);
+        res.on("drain", drain);
+        res.once("close", cleanup);
+        send(() => stateMessage(id));
         return;
       }
       if (req.method === "GET" && path === "/api/state") {
@@ -531,7 +567,7 @@ export async function createHttpServer(options: {
       closing = true;
       await Promise.all([...engines.values()].map((e) => e.shutdown()));
       for (const subscribers of streams.values())
-        for (const s of subscribers) s.end();
+        for (const s of subscribers) s.close();
       await new Promise<void>((resolve, reject) =>
         server.close((e) => (e ? reject(e) : resolve())),
       );

@@ -468,6 +468,8 @@ export class CodexRuntime implements Runtime {
         prompt: `The project to review is ${input.cwd}. The execution directory is ${reportCwd}. Only the report directories are writable. Inspect the project using its absolute path.\n\n${input.prompt}`,
       };
     const args = ["app-server", "--listen", "stdio://"];
+    if (input.delegation || input.child || input.observer)
+      args.push("-c", "mcp_servers.loom.enabled=false");
     if (input.observer)
       for (const [key, value] of Object.entries(observerConfig))
         args.push("-c", `${key}=${JSON.stringify(value)}`);
@@ -619,6 +621,8 @@ class CodexExecution {
       "shell_environment_policy.inherit": "all",
       "shell_environment_policy.set": this.input.env ?? {},
     };
+    if (this.input.delegation || this.input.child || this.input.observer)
+      config["mcp_servers.loom.enabled"] = false;
     if (this.input.delegation || this.input.child)
       config["agents.enabled"] = false;
     if (this.input.child) {
@@ -656,6 +660,7 @@ class CodexExecution {
       const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
       config.mcp_servers = {
         ...servers,
+        loom: { enabled: false },
         loom_observer: {
           command: process.execPath,
           args: [

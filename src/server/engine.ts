@@ -47,6 +47,7 @@ import type {
   IntegrationReceipt,
 } from "../shared/types.ts";
 import { SessionInputs, contextItem } from "./session-inputs.ts";
+import { ControllerError, contentWindow, controllerPage, type ControllerCommand } from "../shared/controller.ts";
 import { emptyMetrics, defaultInterviews } from "../shared/types.ts";
 import { resolveAttachments } from "./attachments.ts";
 import { ProjectStore } from "./store.ts";
@@ -140,6 +141,7 @@ export class HarnessEngine {
       }
     }
     for (const session of this.state.sessions) {
+      session.executionOwner ??= { kind: "loom" };
       for (const receipt of session.agentReceipts ?? []) {
         if (receipt.status === "pending") {
           receipt.status = "failed";
@@ -246,12 +248,217 @@ export class HarnessEngine {
     this.record("session.created", "创建自由会话", { sessionId: session.id });
     return session;
   }
+  private forkSource(session: Session) {
+    return session.acceptedConfig ? undefined : session.source;
+  }
+  private requireLoomThread(threadId?: string) {
+    if (threadId && this.state.sessions.some((s) => s.threadId === threadId && s.executionOwner?.kind === "external"))
+      throw new ControllerError("EXTERNAL_SESSION", "This native thread is managed by Desktop; use its controller inbox");
+  }
+  private requireControllerThread(sessionId: string, threadId?: string) {
+    if (threadId && (this.state.sessions.some((s) => s.id !== sessionId && s.threadId === threadId) ||
+      this.state.executions.some((e) => e.sessionId !== sessionId && e.threadId === threadId)))
+      throw new ControllerError("OWNERSHIP_CONFLICT", "Native thread belongs to another session; connect using its original session UUID");
+  }
+  private requireLoom(session: Session) {
+    if (session.executionOwner?.kind === "external")
+      throw new ControllerError("EXTERNAL_SESSION", "This free session is managed by Desktop; use its controller inbox");
+    this.requireLoomThread(session.threadId);
+    const source = this.forkSource(session);
+    if (source) {
+      this.requireLoomThread(source.threadId);
+      this.requireLoom(this.session(source.sessionId));
+    }
+  }
+  private controllerSession(id: string, key: string) {
+    if (typeof key !== "string" || key.length < 32 || key.length > 512)
+      throw new ControllerError("UNAUTHORIZED", "A dedicated controller key is required", 401);
+    const access = this.state.controllerAccess?.find((a) => a.sessionId === id);
+    const session = this.state.sessions.find((s) => s.id === id);
+    if (!access || access.keyHash !== hash(key) || session?.kind !== "free" || session.executionOwner?.kind !== "external")
+      throw new ControllerError("FORBIDDEN", "Controller identity is not connected or belongs to another principal", 403);
+    return { session, access };
+  }
+  private controllerGraph(sessionId: string, graphId: string) {
+    const graph = this.state.graphs.find((g) => g.id === graphId && g.controllerSessionId === sessionId);
+    if (!graph) throw new ControllerError("FORBIDDEN", "Graph does not belong to this controller", 403);
+    return graph;
+  }
+  private controllerGraphView(graph: Graph) {
+    return {
+      id: graph.id, name: graph.name, status: graph.status, error: graph.error, pauseMode: graph.pauseMode,
+      subscription: graph.subscription, finalSha: graph.finalSha,
+      tasks: graph.tasks.map((task) => ({ id: task.id, title: task.title, deps: task.deps, status: task.status,
+        taskTypeId: task.type.id, blockReason: task.blockReason, deliverySha: task.deliverySha,
+        units: task.units.map((unit) => ({ id: unit.id, name: unit.name, kind: unit.kind, status: unit.status })),
+        reports: task.submissions.map((report) => ({ id: report.id, unitId: report.unitId, outcome: report.outcome, at: report.at })),
+      })),
+      deliveries: graph.integration?.deliveries.map((delivery) => ({ id: delivery.id, taskId: delivery.taskId,
+        sourceSha: delivery.sourceSha, status: delivery.state.status,
+        error: delivery.state.status === "blocked" ? delivery.state.error : undefined,
+        receipt: delivery.state.status === "published" ? {
+          operationId: delivery.state.receipt.operationId, integratedSha: delivery.state.receipt.integratedSha,
+          baseSha: delivery.state.receipt.baseSha, sourceSha: delivery.state.receipt.sourceSha,
+          validation: delivery.state.receipt.validation.status,
+        } : undefined,
+      })),
+    };
+  }
+  private connectController(id: string, key: string, input: Extract<ControllerCommand, { op: "connect" }>) {
+    if (typeof key !== "string" || key.length < 32 || key.length > 512)
+      throw new ControllerError("UNAUTHORIZED", "A dedicated controller key is required", 401);
+    let session = this.state.sessions.find((s) => s.id === id);
+    if (session?.executionOwner?.kind === "external") {
+      this.controllerSession(id, key);
+      if (input.threadId && session.threadId !== input.threadId)
+        throw new ControllerError("OWNERSHIP_CONFLICT", "The connected native thread identity cannot change");
+      this.requireControllerThread(id, session.threadId);
+      return { sessionId: id, executionOwner: session.executionOwner, threadId: session.threadId };
+    }
+    if (session) {
+      const observerPending = this.state.sessions.some((s) => this.forkSource(s)?.sessionId === id &&
+        (this.jobs.has(s.id) || this.turnOperations.has(s.id) || s.status === "running" ||
+          this.state.feedback.some((f) => f.sessionId === s.id && ["pending", "running"].includes(f.status))));
+      if (session.kind !== "free" || session.source || session.child || session.graphId || session.taskId || session.unitId ||
+        !["idle", "failed"].includes(session.status) || this.jobs.has(id) || this.handles.has(id) ||
+        this.turnOperations.has(id) || this.delivering.has(id) || observerPending ||
+        this.state.executions.some((e) => e.sessionId === id && activeExecution(e)) ||
+        this.state.preparations.some((p) => p.sessionId === id && ["uncertain", "dispatching"].includes(p.receipt.status)))
+        throw new ControllerError("OWNERSHIP_CONFLICT", "Only an idle or failed free session without pending Loom work can be bound");
+      this.ensureStopped(session);
+      const last = this.state.executions.findLast((e) => e.sessionId === id);
+      if (last?.pid) {
+        let alive = true;
+        try { process.kill(last.pid, 0); }
+        catch (error) { if (error instanceof Error && "code" in error && error.code === "ESRCH") alive = false; else throw error; }
+        if (alive) throw new ControllerError("OWNERSHIP_CONFLICT", "The previous Loom process is still alive");
+      }
+      if (input.threadId && session.threadId && input.threadId !== session.threadId)
+        throw new ControllerError("OWNERSHIP_CONFLICT", "Native thread identity does not match session history");
+    } else {
+      if (!input.create) throw new ControllerError("NOT_FOUND", "Session not found; explicit create is required", 404);
+    }
+    this.requireControllerThread(id, session?.threadId ?? input.threadId);
+    if (!session) {
+      session = { id, title: input.title ?? "Desktop controller", kind: "free", status: "idle", messages: [], metrics: emptyMetrics(), turns: 0 };
+      this.state.sessions.push(session);
+    }
+    session.executionOwner = { kind: "external", client: "desktop" };
+    session.threadId ??= input.threadId;
+    session.queuePaused = true;
+    session.status = "idle";
+    session.error = undefined;
+    (this.state.controllerAccess ??= []).push({ sessionId: id, keyHash: hash(key), requests: [] });
+    this.record("controller.connected", "Desktop owns this free session", { sessionId: id });
+    return { sessionId: id, executionOwner: session.executionOwner, threadId: session.threadId };
+  }
+  async controllerCommand(sessionId: string, key: string, command: ControllerCommand): Promise<unknown> {
+    if (this.closing) throw new ControllerError("UNAVAILABLE", "Engine is closing", 503);
+    if (command.op === "connect") return this.connectController(sessionId, key, command);
+    const { session, access } = this.controllerSession(sessionId, key);
+    const owned = () => this.state.graphs.filter((g) => g.controllerSessionId === sessionId);
+    const graph = "graphId" in command && command.graphId ? this.controllerGraph(sessionId, command.graphId) : undefined;
+    const receipt = (input: Extract<ControllerCommand, { op: "graph_create" | "send_feedback" }>) => {
+      const fingerprint = hash(JSON.stringify(input));
+      const prior = access.requests.find((r) => r.op === input.op && r.requestId === input.requestId);
+      if (prior && prior.fingerprint !== fingerprint)
+        throw new ControllerError("REQUEST_CONFLICT", "requestId was already used with different arguments");
+      return { fingerprint, prior };
+    };
+    switch (command.op) {
+      case "state":
+        if (graph) return this.controllerGraphView(graph);
+        return { session: { id: session.id, title: session.title, executionOwner: session.executionOwner,
+          threadId: session.threadId, frozenQueuedTurns: session.queue?.length ?? 0 },
+          ...controllerPage(owned().map((g) => ({ id: g.id, name: g.name, status: g.status, createdAt: g.createdAt })), command.after, command.limit) };
+      case "task_types":
+        return controllerPage(this.catalog.taskTypes.map((type) => ({ id: type.id, name: type.name, version: type.version,
+          units: type.units.map((u) => ({ id: u.id, name: u.name, kind: u.kind, readOnly: u.readOnly })),
+          start: type.start, rules: type.rules, maxRounds: type.maxRounds, maxReportRetries: type.maxReportRetries })), command.after, command.limit);
+      case "graph_create": {
+        const { fingerprint, prior } = receipt(command);
+        if (prior) return { graphId: prior.resultId };
+        const created = this.makeGraph(command);
+        created.controllerSessionId = sessionId;
+        created.subscription = command.subscription;
+        this.state.graphs.push(created);
+        access.requests.push({ op: command.op, requestId: command.requestId, fingerprint, resultId: created.id });
+        this.record("controller.graph_created", "Created controller graph", { sessionId, graphId: created.id });
+        return { graphId: created.id };
+      }
+      case "graph_control": {
+        const target = graph!;
+        if ((command.mode && command.action !== "pause") || (command.taskId && command.action !== "resolve"))
+          throw new ControllerError("INVALID_ARGUMENT", "mode is only for pause; taskId is only for resolve", 400);
+        if (command.action === "run") await this.runGraph(target.id);
+        else if (command.action === "pause") await this.pauseGraph(target.id, command.mode ?? "soft");
+        else if (command.action === "resume") await this.resumeGraph(target.id);
+        else await this.resolveGraph(target.id, command.taskId);
+        return { graphId: target.id, status: target.status };
+      }
+      case "reports": {
+        const reports = graph!.tasks.flatMap((t) => t.submissions);
+        if (command.reportId) {
+          const report = reports.find((r) => r.id === command.reportId);
+          if (!report) throw new ControllerError("NOT_FOUND", "Report is outside this graph", 404);
+          return { id: report.id, graphId: graph!.id, taskId: report.taskId, unitId: report.unitId,
+            outcome: report.outcome, digest: report.digest, ...contentWindow(report.content, command.offset) };
+        }
+        return controllerPage(reports.map((r) => ({ id: r.id, taskId: r.taskId, unitId: r.unitId, outcome: r.outcome, digest: r.digest, at: r.at })), command.after, command.limit);
+      }
+      case "inbox": {
+        const letters = this.state.letters.filter((letter) => owned().some((g) => g.id === letter.graphId) &&
+          (!graph || letter.graphId === graph.id) && letter.deliveries.some((d) => d.to === `session/${sessionId}`));
+        if (command.letterId) {
+          const letter = letters.find((l) => l.id === command.letterId);
+          if (!letter) throw new ControllerError("NOT_FOUND", "Letter is outside this controller inbox", 404);
+          return { id: letter.id, graphId: letter.graphId, from: letter.from, title: letter.title, digest: letter.digest,
+            ...contentWindow(letter.content, command.offset) };
+        }
+        const page = controllerPage(letters, command.after, command.limit,
+          (l) => command.includeAcknowledged || l.deliveries.some((d) => d.to === `session/${sessionId}` && d.status !== "acknowledged" && d.status !== "injected"));
+        return { ...page, items: page.items.map((l) => ({ id: l.id, graphId: l.graphId, from: l.from, title: l.title,
+          digest: l.digest, createdAt: l.createdAt, delivery: l.deliveries.find((d) => d.to === `session/${sessionId}`) })) };
+      }
+      case "ack": {
+        const letter = this.state.letters.find((l) => l.id === command.letterId && l.graphId === graph!.id);
+        const delivery = letter?.deliveries.find((d) => d.to === `session/${sessionId}`);
+        if (!delivery) throw new ControllerError("NOT_FOUND", "Letter is outside this graph and recipient", 404);
+        if (delivery.status !== "acknowledged") {
+          delivery.status = "acknowledged"; delivery.at = now(); delivery.sessionId = sessionId;
+          this.record("controller.acknowledged", "Controller acknowledged Letter", { sessionId, graphId: graph!.id, detail: { letterId: letter!.id } });
+        }
+        return { letterId: letter!.id, graphId: graph!.id, status: delivery.status, acknowledgedAt: delivery.at };
+      }
+      case "send_feedback": {
+        const { fingerprint, prior } = receipt(command);
+        if (prior) return { letterId: prior.resultId, graphId: graph!.id };
+        const task = this.task(graph!, command.taskId);
+        const unit = task.units.find((u) => u.id === command.unitId && u.kind === "agent");
+        if (!unit) throw new ControllerError("INVALID_RECIPIENT", "Feedback requires an agent Unit in this graph", 400);
+        if (command.mode === "steer" && !this.runtime.capabilities.inject)
+          throw new ControllerError("UNSUPPORTED", "Runtime does not support steering", 400);
+        const id = hash(`${sessionId}/${command.op}/${command.requestId}`);
+        const path = join(this.store.root, ".newharness", "reports", `controller-${id}.md`);
+        writeFileSync(path, command.content);
+        const letter = this.makeLetter({ graphId: graph!.id, from: `session/${sessionId}`,
+          to: [`${graph!.id}/${task.id}/${unit.id}`], title: command.title, path, mode: command.mode },
+          { path, content: command.content, digest: hash(command.content) });
+        this.state.letters.push(letter);
+        access.requests.push({ op: command.op, requestId: command.requestId, fingerprint, resultId: letter.id });
+        this.record("letter.sent", letter.title, { graphId: graph!.id, sessionId, detail: { letterId: letter.id } });
+        if (unit.sessionId && !["paused", "pausing", "draft"].includes(graph!.status)) void this.deliverWaiting(this.session(unit.sessionId));
+        return { letterId: letter.id, graphId: graph!.id };
+      }
+    }
+  }
   createSidechat(
     id: string,
     input: { title?: string } = {},
     kind: "sidechat" | "interview" = "sidechat",
   ): Session {
     const source = this.session(id);
+    this.requireLoom(source);
     if (source.source) throw new Error("不能从侧聊或访谈递归创建访谈");
     if (!this.runtime.capabilities.fork)
       throw new Error("当前 Runtime 不支持隔离只读分叉");
@@ -317,6 +524,7 @@ export class HarnessEngine {
     eventKey: string = randomUUID(),
   ): Promise<Feedback> {
     const source = this.session(id);
+    this.requireLoom(source);
     if (source.source) throw new Error("访谈不能再次触发访谈");
     const key = `${eventKey}/${id}`;
     const existing = this.state.feedback.find((f) => f.eventKey === key);
@@ -444,6 +652,7 @@ export class HarnessEngine {
           turnId: text(input.turnId, "turnId"),
         }
       : { status: "rejected" as const, reason: "用户检查运行历史后确认未接收" };
+    if (receipt.status === "accepted") this.requireLoomThread(receipt.threadId);
     this.inputs.accept(session, preparation, receipt);
     if (receipt.status === "accepted") this.acceptLetters(session, preparation);
     this.record("preparation.resolved", "用户已核对输入接收结果", {
@@ -456,6 +665,7 @@ export class HarnessEngine {
       typeof message === "string" ? { text: message } : message,
     );
     const session = this.session(id);
+    this.requireLoom(session);
     const target = this.state.executions.find(
       (e) => e.sessionId === id && activeExecution(e),
     );
@@ -463,6 +673,7 @@ export class HarnessEngine {
     const operation = previous
       .catch(() => {})
       .then(async () => {
+        this.requireLoom(session);
         if (this.closing) throw new Error("Engine is closing");
         if (session.kind === "task")
           throw new Error("Task sessions require Mailbox messages");
@@ -634,6 +845,7 @@ export class HarnessEngine {
   }
   continueQueue(id: string): Session {
     const session = this.session(id);
+    this.requireLoom(session);
     if (session.kind === "task")
       throw new Error("Task sessions require scheduler control");
     this.ensureStopped(session);
@@ -668,6 +880,7 @@ export class HarnessEngine {
   }
   private drainQueue(session: Session) {
     if (
+      session.executionOwner?.kind === "external" ||
       this.closing ||
       session.queuePaused ||
       this.jobs.has(session.id) ||
@@ -752,7 +965,7 @@ export class HarnessEngine {
       nextUnit: type.start[0],
     };
   }
-  createGraph(input: GraphInput) {
+  private makeGraph(input: GraphInput) {
     text(input.name, "Graph 名称");
     if (!Array.isArray(input.tasks) || !input.tasks.length)
       throw new Error("Graph 至少需要一个 Task");
@@ -771,6 +984,10 @@ export class HarnessEngine {
       subscription: "blocked",
     };
     validateDag(graph.tasks);
+    return graph;
+  }
+  createGraph(input: GraphInput) {
+    const graph = this.makeGraph(input);
     this.state.graphs.push(graph);
     this.record("graph.created", "创建任务图", { graphId: graph.id });
     return graph;
@@ -783,6 +1000,9 @@ export class HarnessEngine {
     },
   ) {
     const graph = this.graph(id);
+    if (input.controllerSessionId !== undefined && graph.controllerSessionId &&
+      graph.controllerSessionId !== input.controllerSessionId && this.session(graph.controllerSessionId).executionOwner?.kind === "external")
+      throw new ControllerError("OWNERSHIP_CONFLICT", "An external graph controller cannot be reassigned");
     if (input.subscription !== undefined) {
       if (!["blocked", "completed", "review"].includes(input.subscription))
         throw new Error("无效订阅等级");
@@ -1549,7 +1769,7 @@ export class HarnessEngine {
     this.childNotice(session, execution);
   }
   private async continueFromChildren(session: Session) {
-    if (this.closing || this.jobs.has(session.id) || session.status === "running" ||
+    if (session.executionOwner?.kind === "external" || this.closing || this.jobs.has(session.id) || session.status === "running" ||
       !session.childNotices?.some((n) => !n.consumed) || !session.graphId) return;
     const graph = this.graph(session.graphId);
     if (graph.status !== "running") return;
@@ -1735,6 +1955,7 @@ export class HarnessEngine {
     turnInput?: Pick<RuntimeInput, "attachments" | "skills">,
     queued = false,
   ) {
+    this.requireLoom(session);
     this.ensureStopped(session);
     if (context?.unit.kind === "command") session.metrics.costUsd = 0;
     const token = randomBytes(32).toString("hex");
@@ -1883,6 +2104,8 @@ export class HarnessEngine {
         this.record("preparation.dispatching", "输入已组装，等待运行时接收", {
           sessionId: session.id,
         });
+        const source = this.forkSource(session);
+        this.requireLoom(session);
         const handle =
           context?.unit.kind === "command"
             ? this.command(context.unit.command!, cwd, onEvent)
@@ -1904,10 +2127,10 @@ export class HarnessEngine {
                         catch (error) { return { error: errorText(error).replaceAll(token, "[execution credential]") }; }
                       } : undefined,
                   fork:
-                    session.source && !session.acceptedConfig
+                    source
                       ? {
-                          threadId: session.source.threadId,
-                          turnId: session.source.turnId,
+                          threadId: source.threadId,
+                          turnId: source.turnId,
                         }
                       : undefined,
                   writableRoots:
@@ -1935,6 +2158,7 @@ export class HarnessEngine {
         execution.status = "running";
         const acceptance = handle.accepted.then((receipt) => {
           const priorConfig = session.acceptedConfig;
+          if (receipt.status === "accepted") this.requireLoomThread(receipt.threadId);
           this.inputs.accept(session, preparation, receipt);
           if (
             receipt.status === "accepted" &&
@@ -1976,6 +2200,7 @@ export class HarnessEngine {
           };
         if (completion[1].status === "rejected") throw completion[1].reason;
         result = completion[1].value;
+        this.requireLoomThread(result.threadId);
         if (result.status !== "interrupted" && !inputAccepted(preparation))
           result = {
             ...result,
@@ -2108,6 +2333,7 @@ export class HarnessEngine {
     event: RuntimeEvent,
     unit?: Unit,
   ) {
+    this.requireLoomThread(event.threadId);
     if (event.usage) {
       execution.metrics!.usage = structuredClone(event.usage);
       execution.usageKnown = true;
@@ -2452,6 +2678,7 @@ export class HarnessEngine {
   }
   async interrupt(id: string, expectedExecutionId?: string) {
     const session = this.session(id);
+    this.requireLoom(session);
     const execution = this.state.executions.find(
       (e) => e.sessionId === id && activeExecution(e),
     );
@@ -2534,6 +2761,20 @@ export class HarnessEngine {
       roots = [this.task(graph, execution.taskId!).workspace!.path];
     } else this.recipient(graph, input.from);
     const file = this.readBoundFile(input.path, roots);
+    const letter = this.makeLetter(input, file);
+    this.state.letters.push(letter);
+    this.record("letter.sent", letter.title, {
+      graphId: graph.id,
+      detail: { letterId: letter.id },
+    });
+    if (!["paused", "pausing", "draft"].includes(graph.status))
+      for (const to of letter.to) {
+        const target = this.recipient(graph, to);
+        if (target.session) void this.deliverWaiting(target.session);
+      }
+    return letter;
+  }
+  private makeLetter(input: LetterInput, file: { path: string; content: string; digest: string }) {
     const letter: Letter = {
       ...input,
       to: [...new Set(input.to)],
@@ -2548,16 +2789,6 @@ export class HarnessEngine {
         status: "queued",
       })),
     };
-    this.state.letters.push(letter);
-    this.record("letter.sent", letter.title, {
-      graphId: graph.id,
-      detail: { letterId: letter.id },
-    });
-    if (!["paused", "pausing", "draft"].includes(graph.status))
-      for (const to of letter.to) {
-        const target = this.recipient(graph, to);
-        if (target.session) void this.deliverWaiting(target.session);
-      }
     return letter;
   }
   private pendingLetters(session: Session) {
@@ -2604,7 +2835,7 @@ export class HarnessEngine {
   }
   private delivering = new Set<string>();
   private async deliverWaiting(session: Session) {
-    if (session.source || this.delivering.has(session.id) || this.closing)
+    if (session.executionOwner?.kind === "external" || session.source || this.delivering.has(session.id) || this.closing)
       return;
     this.delivering.add(session.id);
     try {

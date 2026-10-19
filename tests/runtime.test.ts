@@ -29,6 +29,30 @@ createInterface({input:process.stdin}).on('line', line => {
 });
 `;
 
+test("Task and child start/resume disable only registered desktop loom at process and thread boundaries", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "loom-runtime-controller-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, "app-server"), server(`
+    if (!process.argv.includes('mcp_servers.loom.enabled=false')) process.exit(21);
+    if (r.method === 'thread/start' || r.method === 'thread/resume') {
+      const c = r.params.config;
+      if (c['mcp_servers.loom.enabled'] !== false || c.mcp_servers || c.plugins || c.hooks || c['agents.enabled'] !== false) process.exit(22);
+      return reply(r,{thread:{id:'fixture-thread'}});
+    }
+    if (r.method === 'turn/start') {
+      reply(r,{turn:{id:'fixture-turn'}});
+      notify('turn/completed',{threadId:'fixture-thread',turn:{id:'fixture-turn',status:'completed'}});
+    }
+  `));
+  const runtime = new CodexRuntime({ executable: process.execPath, shutdownTimeoutMs: 300, requestTimeoutMs: 2000 });
+  t.after(() => runtime.close());
+  for (const child of [false, true]) for (const threadId of [undefined, "fixture-thread"]) {
+    const handle = await runtime.start({ cwd: root, prompt: "fixture", delegation: "disabled", child, threadId }, () => {});
+    assert.equal((await handle.accepted).status, "accepted");
+    assert.equal((await handle.done).status, "completed");
+  }
+});
+
 function fake(body: string) {
   return new CodexRuntime({
     executable: process.execPath,
@@ -164,13 +188,13 @@ test("observer can read absolute task worktree files and task reports without ex
 
 test("observer forks a checkpoint into a separate native thread and resumes only its own identity", async () => {
   const runtime = fake(`
-    if(r.method === 'config/read') return reply(r,{config:{mcp_servers:{remote:{},local:{},'remote.with.dots':{}},plugins:{'plugin@vendor':{enabled:true}},hooks:{Stop:[{command:'forbidden'}]}}});
+    if(r.method === 'config/read') return reply(r,{config:{mcp_servers:{loom:{enabled:true},remote:{},local:{},'remote.with.dots':{}},plugins:{'plugin@vendor':{enabled:true}},hooks:{Stop:[{command:'forbidden'}]}}});
     if(r.method === 'mcpServerStatus/list') return reply(r,{data:[{name:'remote',runtimeStatus:'disabled'},{name:'loom_observer',runtimeStatus:'connected'}]});
     if(r.method === 'thread/fork' || r.method === 'thread/resume') {
       const p=r.params;
       if(r.method === 'thread/fork' && (p.threadId!=='source' || p.lastTurnId!=='checkpoint' || p.deferGoalContinuation!==true)) process.exit(9);
       if(r.method === 'thread/resume' && p.threadId!=='side-thread') process.exit(10);
-      if(p.sandbox!=='read-only' || p.config.mcp_servers.remote.enabled!==false || p.config.mcp_servers.local.enabled!==false || !p.config.mcp_servers.loom_observer.enabled || p.config['features.shell_tool']!==false) process.exit(11);
+      if(p.sandbox!=='read-only' || p.config.mcp_servers.remote.enabled!==false || p.config.mcp_servers.local.enabled!==false || !p.config.mcp_servers.loom_observer.enabled || p.config['features.shell_tool']!==false || p.config['mcp_servers.loom.enabled']!==false || p.config.mcp_servers.loom.enabled!==false) process.exit(11);
       if(p.config.mcp_servers['remote.with.dots'].enabled!==false || p.config.plugins['plugin@vendor'].enabled!==false || p.config['hooks.Stop'].length!==0) process.exit(14);
       if(process.env.HARNESS_TEST_TOKEN || process.env.LOOM_CALLBACK_TOKEN) process.exit(12);
       return reply(r,{thread:{id:'side-thread',turns:[{id:'checkpoint'}]},sandbox:{type:'readOnly',networkAccess:false}});

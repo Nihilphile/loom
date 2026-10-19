@@ -1,0 +1,3 @@
+phase	decision	reason	evidence	result
+ground	Engine owns external controller state	Existing ProjectStore single writer and HTTP adapter	engine.ts/store.ts/http.ts	Design exploration pending
+frame	Two read-only Loom candidates	User requires structural alternatives and one writer	loom_agent design-a/design-b	Inherited gpt-6.1-sol; reduced diversity

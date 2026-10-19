@@ -6,6 +6,8 @@ import { HarnessEngine } from "./engine.ts";
 import { Catalog } from "./catalog.ts";
 import { ProjectRegistry } from "./projects.ts";
 import { resolveAttachments, saveAttachment } from "./attachments.ts";
+import { z } from "zod/v4";
+import { ControllerError, controllerCommandSchema } from "../shared/controller.ts";
 import type {
   Runtime,
   GitAdapter,
@@ -81,6 +83,7 @@ export async function createHttpServer(options: {
     open(defaultProjectId);
   }
   const server = createServer(async (req, res) => {
+    const controllerRequest = /^\/api\/(?:projects\/[^/]+\/)?controller\//.test(req.url || "");
     const json = (status: number, value: unknown) => {
       res.writeHead(status, {
         "Content-Type": "application/json; charset=utf-8",
@@ -109,6 +112,10 @@ export async function createHttpServer(options: {
       const scoped = /^\/api\/projects\/([^/]+)(\/.*)$/.exec(url.pathname);
       const path = scoped ? "/api" + scoped[2] : url.pathname;
       const token = (req.headers.authorization || "").replace(/^Bearer /, "");
+      const controllerRoute = /^\/api\/controller\/([^/]+)$/.exec(path);
+      const controllerKey = req.headers["x-loom-controller-key"];
+      if ((controllerRoute && (req.headers.authorization || !scoped)) || (controllerKey && !controllerRoute))
+        throw new ControllerError("FORBIDDEN", "Controller credentials require an explicit project controller route; Unit credentials are not accepted", 403);
       let projectId = scoped ? decodeURIComponent(scoped[1]) : defaultProjectId;
       if (!scoped && token) {
         const digest = createHash("sha256").update(token).digest("hex");
@@ -216,6 +223,15 @@ export async function createHttpServer(options: {
         }
         const parts = path.split("/").filter(Boolean).map(decodeURIComponent),
           method = req.method;
+        if (controllerRoute) {
+          if (method !== "POST") throw new ControllerError("METHOD_NOT_ALLOWED", "Controller operations require POST", 405);
+          const sessionId = z.uuid().safeParse(decodeURIComponent(controllerRoute[1]));
+          const command = controllerCommandSchema.safeParse(body);
+          if (!sessionId.success || !command.success)
+            throw new ControllerError("INVALID_ARGUMENT", "Invalid controller operation or arguments", 400);
+          json(200, await engine.controllerCommand(sessionId.data, typeof controllerKey === "string" ? controllerKey : "", command.data));
+          return;
+        }
         if (method === "PUT" && path === "/api/developer/interviews") {
           json(
             200,
@@ -485,6 +501,14 @@ export async function createHttpServer(options: {
         res.end("Run npm run build to prepare the Web UI.");
       }
     } catch (error) {
+      if (error instanceof ControllerError) {
+        json(error.status, { error: { code: error.code, message: error.message } });
+        return;
+      }
+      if (controllerRequest) {
+        json(400, { error: { code: "OPERATION_FAILED", message: error instanceof Error ? error.message : "Controller operation failed" } });
+        return;
+      }
       json(400, {
         error: error instanceof Error ? error.message : String(error),
       });

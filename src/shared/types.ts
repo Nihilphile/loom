@@ -149,6 +149,7 @@ export interface Session {
   id: string;
   title: string;
   kind: "free" | "task" | "sidechat" | "interview";
+  executionOwner?: { kind: "loom" } | { kind: "external"; client: "desktop" };
   source?: ObserverSource;
   child?: ChildSession;
   agentReceipts?: AgentReceipt[];
@@ -302,7 +303,7 @@ export interface Letter extends LetterInput {
   createdAt: string;
   deliveries: {
     to: string;
-    status: "queued" | "injected" | "failed";
+    status: "queued" | "injected" | "failed" | "acknowledged";
     at?: string;
     sessionId?: string;
     error?: string;
@@ -352,6 +353,11 @@ export interface ProjectState {
   preparations: Preparation[];
   interviews: InterviewSettings;
   feedback: Feedback[];
+  controllerAccess?: {
+    sessionId: string;
+    keyHash: string;
+    requests: { op: "graph_create" | "send_feedback"; requestId: string; fingerprint: string; resultId: string }[];
+  }[];
 }
 export interface AppState {
   project: ProjectState["project"] | null;

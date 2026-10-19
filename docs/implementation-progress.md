@@ -8,7 +8,7 @@ The current contract uses a Graph integration branch and a persisted per-Graph d
 
 The synchronized specification is in [SPEC.md](SPEC.md), with data and Git operation ownership in [architecture.md](architecture.md). [DESIGN-NOTES.md](../DESIGN-NOTES.md) replaces the obsolete dependency-only workspace proposal and records future rework and revert decisions separately. Full reopening, inverse delivery and downstream reassessment remain outside this implementation slice. The product choice between squash and merge commits remains open.
 
-This documentation update does not supply new runtime or browser acceptance evidence. Reports below retain their original date, commit and scope. The original Git, scheduler and first acceptance reports describe the replaced workspace preparation and final merge behavior. Their banners link to the current contract.
+Current verification is recorded in [Graph integration queue acceptance](reports/integration-queue-acceptance.md), including the full-suite checkpoint, review fixes, focused regressions, and browser execution with real Git. Reports below retain their original date, commit and scope. The original Git, scheduler and first acceptance reports describe the replaced workspace preparation and final merge behavior. Their banners link to the current contract.
 
 ## Historical first implementation
 

@@ -90,12 +90,18 @@ export class ProjectStore {
     }
   }
   events(
-    filter: { sessionId?: string; graphId?: string; after?: number } = {},
+    filter: { sessionId?: string; graphId?: string; after?: number; kind?: "invocations";
+      workspace?: { id: string; sessionIds: string[]; graphIds: string[] } } = {},
   ): HarnessEvent[] {
-    const ascending = !!filter.after;
+    const ascending = filter.after !== undefined;
     const rows = this.db
       .prepare(
-        `SELECT id,value FROM events WHERE id>? AND (? IS NULL OR json_extract(value,'$.sessionId')=?) AND (? IS NULL OR json_extract(value,'$.graphId')=?) ORDER BY id ${ascending ? "ASC" : "DESC"} LIMIT 2000`,
+        `SELECT id,value FROM events WHERE id>? AND (? IS NULL OR json_extract(value,'$.sessionId')=?) AND (? IS NULL OR json_extract(value,'$.graphId')=?)
+         AND (? IS NULL OR json_extract(value,'$.detail.workspaceId')=?
+           OR json_extract(value,'$.sessionId') IN (SELECT value FROM json_each(?))
+           OR json_extract(value,'$.graphId') IN (SELECT value FROM json_each(?)))
+${filter.kind === "invocations" ? " AND (json_extract(value,'$.type') GLOB 'runtime.tool.*' OR json_extract(value,'$.type') GLOB 'runtime.skill.*' OR json_extract(value,'$.type') GLOB 'runtime.mcp.*')" : ""}
+         ORDER BY id ${ascending ? "ASC" : "DESC"} LIMIT 2000`,
       )
       .all(
         filter.after || 0,
@@ -103,6 +109,10 @@ export class ProjectStore {
         filter.sessionId ?? null,
         filter.graphId ?? null,
         filter.graphId ?? null,
+        filter.workspace?.id ?? null,
+        filter.workspace?.id ?? null,
+        JSON.stringify(filter.workspace?.sessionIds ?? []),
+        JSON.stringify(filter.workspace?.graphIds ?? []),
       );
     if (!ascending) rows.reverse();
     return rows.map(

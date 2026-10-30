@@ -5,6 +5,8 @@ dist/
 .task-graph/cache/
 .playwright-cli/
 output/
+temp/
+.audit/
 .env
 .env.*
 !.env.example

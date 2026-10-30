@@ -25,21 +25,24 @@ createInterface({input:process.stdin}).on('line', line => {
  const r = JSON.parse(line);
  ${body}
  if (r.method === 'initialize') return reply(r, {});
+ if (r.method === 'config/read') return reply(r, {config:{sandbox_mode:'workspace-write'}});
  if (r.method === 'thread/start' || r.method === 'thread/resume') return reply(r, {thread:{id:r.params.threadId || 'thread-one'}});
 });
 `;
 
 test("Task and child start/resume disable only registered desktop loom at process and thread boundaries", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "loom-runtime-controller-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(async () => { await runtime.close(); await rm(root, { recursive: true, force: true }); });
   await writeFile(join(root, "app-server"), server(`
     if (!process.argv.includes('mcp_servers.loom.enabled=false')) process.exit(21);
     if (r.method === 'thread/start' || r.method === 'thread/resume') {
       const c = r.params.config;
       if (c['mcp_servers.loom.enabled'] !== false || c.mcp_servers || c.plugins || c.hooks || c['agents.enabled'] !== false) process.exit(22);
+      if (r.params.sandbox !== 'workspace-write') process.exit(23);
       return reply(r,{thread:{id:'fixture-thread'}});
     }
     if (r.method === 'turn/start') {
+      if (r.params.sandboxPolicy.type !== 'workspaceWrite') process.exit(24);
       reply(r,{turn:{id:'fixture-turn'}});
       notify('turn/completed',{threadId:'fixture-thread',turn:{id:'fixture-turn',status:'completed'}});
     }
@@ -53,14 +56,133 @@ test("Task and child start/resume disable only registered desktop loom at proces
   }
 });
 
-function fake(body: string) {
+function fake(body: string, idleTimeoutMs?: number) {
   return new CodexRuntime({
     executable: process.execPath,
     args: ["--input-type=module", "-e", server(body)],
     shutdownTimeoutMs: 300,
     requestTimeoutMs: 1000,
+    idleTimeoutMs,
   });
 }
+
+async function waitFor(check: () => boolean | Promise<boolean>) {
+  const deadline = Date.now() + 10000;
+  while (!await check()) {
+    assert(Date.now() < deadline, "Runtime reached the expected state");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
+
+test("session turns reuse one backend without sharing output or usage, and other sessions stay isolated", async (t) => {
+  const runtime = fake(`
+    if (r.method === 'initialize') globalThis.initialized = (globalThis.initialized || 0) + 1;
+    if (r.method === 'turn/start') {
+      if (globalThis.initialized !== 1) process.exit(21);
+      globalThis.turn = (globalThis.turn || 0) + 1;
+      const n = globalThis.turn, id = 'turn-' + n;
+      reply(r, {turn:{id}});
+      if (n > 1) notify('item/agentMessage/delta',{threadId:r.params.threadId,turnId:'turn-1',itemId:'old',delta:'stale'});
+      notify('item/completed',{threadId:r.params.threadId,turnId:id,item:{id:'answer-'+n,type:'agentMessage',text:'answer-'+n}});
+      notify('thread/tokenUsage/updated',{threadId:r.params.threadId,turnId:id,tokenUsage:{total:{inputTokens:n*12,cachedInputTokens:n*3,outputTokens:n*5}}});
+      notify('turn/completed',{threadId:r.params.threadId,turn:{id,status:'completed'}});
+    }
+  `);
+  t.after(() => runtime.close());
+  const input = { ownerId: "first", cwd: process.cwd(), prompt: "go" };
+  const first = await runtime.start(input, () => {});
+  const one = await first.done;
+  assert.equal(one.text, "answer-1");
+  const events: RuntimeEvent[] = [];
+  const second = await runtime.start({ ...input, threadId: one.threadId }, event => events.push(event));
+  const two = await second.done;
+  assert.equal(second.pid, first.pid);
+  assert.equal(two.text, "answer-2");
+  assert.deepEqual(two.usage, one.usage);
+  assert(!events.some(event => event.text?.includes("stale")));
+  const other = await runtime.start({ ...input, ownerId: "second" }, () => {});
+  assert.equal((await other.done).text, "answer-1");
+  assert.notEqual(other.pid, first.pid);
+  await runtime.closeSession("first");
+  assert.throws(() => process.kill(first.pid!, 0));
+  assert.doesNotThrow(() => process.kill(other.pid!, 0));
+});
+
+test("changing session launch credentials retires the old backend before reuse", async (t) => {
+  const runtime = fake(`
+    if (r.method === 'thread/start' || r.method === 'thread/resume') {
+      if (r.params.config['shell_environment_policy.set'].HARNESS_TOKEN !== process.env.HARNESS_TOKEN) process.exit(21);
+    }
+    if (r.method === 'turn/start') {
+      reply(r,{turn:{id:'active'}});
+      notify('turn/completed',{threadId:r.params.threadId,turn:{id:'active',status:'completed'}});
+    }
+  `);
+  t.after(() => runtime.close());
+  const input = { ownerId: "credentials", cwd: process.cwd(), prompt: "go" };
+  const first = await runtime.start({ ...input, env: { HARNESS_TOKEN: "first" } }, () => {});
+  const result = await first.done;
+  const second = await runtime.start({ ...input, threadId: result.threadId, env: { HARNESS_TOKEN: "second" } }, () => {});
+  assert.equal((await second.done).status, "completed");
+  assert.notEqual(second.pid, first.pid);
+  assert.throws(() => process.kill(first.pid!, 0));
+});
+
+test("interrupt reaches a terminal turn when Codex never acknowledges and resources close independently", async (t) => {
+  const runtime = fake(`if (r.method === 'turn/start') reply(r,{turn:{id:'active'}});`);
+  t.after(() => runtime.close());
+  const handle = await runtime.start({ ownerId: "interrupt-owner", cwd: process.cwd(), prompt: "go" }, () => {});
+  await handle.accepted;
+  await handle.interrupt();
+  assert.equal((await handle.done).status, "interrupted");
+  await runtime.closeSession("interrupt-owner");
+  assert.throws(() => process.kill(handle.pid!, 0));
+  assert.equal((await runtime.resources("interrupt-owner")).state, "closed");
+});
+
+test("idle expiry releases session resources after turn completion", async (t) => {
+  const runtime = new CodexRuntime({ executable: process.execPath, args: ["--input-type=module", "-e", server(`
+    if (r.method === 'turn/start') {
+      reply(r,{turn:{id:'active'}});
+      notify('turn/completed',{threadId:r.params.threadId,turn:{id:'active',status:'completed'}});
+    }
+  `)], idleTimeoutMs: 30, shutdownTimeoutMs: 100, requestTimeoutMs: 1000 });
+  t.after(() => runtime.close());
+  const handle = await runtime.start({ ownerId: "idle-owner", cwd: process.cwd(), prompt: "go" }, () => {});
+  assert.equal((await handle.done).status, "completed");
+  await waitFor(async () => (await runtime.resources("idle-owner")).state === "closed");
+  assert.throws(() => process.kill(handle.pid!, 0));
+});
+
+test("free execution permission mode inherits effective Codex permissions on start and resume", async (t) => {
+  const configurations = [
+    { config: { sandbox_mode: "danger-full-access" }, selection: { sandbox: "danger-full-access" } },
+    { config: { sandbox_mode: "workspace-write" }, selection: { sandbox: "workspace-write" } },
+    { config: { default_permissions: "developer-session", sandbox_mode: "workspace-write" }, selection: { permissions: "developer-session" } },
+  ];
+  for (const { config, selection } of configurations) for (const threadId of [undefined, "saved-thread"]) {
+    const runtime = fake(`
+      if (r.method === 'config/read') return reply(r, {config:${JSON.stringify(config)}});
+      if (r.method === 'thread/start' || r.method === 'thread/resume') {
+        const expected = ${JSON.stringify(selection)};
+        for (const [key, value] of Object.entries(expected)) if (r.params[key] !== value) process.exit(21);
+        if ('permissions' in expected ? 'sandbox' in r.params : 'permissions' in r.params) process.exit(22);
+        return reply(r, {thread:{id:r.params.threadId || 'thread-one'}});
+      }
+      if (r.method === 'turn/start') {
+        if ('sandboxPolicy' in r.params || 'permissions' in r.params) process.exit(23);
+        reply(r, {turn:{id:'configured-turn'}});
+        notify('turn/completed', {threadId:r.params.threadId,turn:{id:'configured-turn',status:'completed'}});
+      }
+    `);
+    t.after(() => runtime.close());
+    const handle = await runtime.start({ cwd: process.cwd(), prompt: "go", permissionMode: "inherit", threadId }, () => {});
+    assert.equal((await handle.accepted).status, "accepted");
+    const result = await handle.done;
+    assert.equal(result.status, "completed", result.error);
+    await runtime.close();
+  }
+});
 
 test("acceptance receipts distinguish native rejection, lost acknowledgement, and confirmed start", async () => {
   for (const [action, expected] of [
@@ -431,7 +553,7 @@ test("missing native context data remains unknown despite cumulative tokens", as
   );
 });
 
-test("normalizes a real subprocess stream and waits for exit after completion", async () => {
+test("normalizes a real subprocess stream independently of resource cleanup", async () => {
   const runtime = fake(`
     if(r.method === 'turn/start') {
       setTimeout(()=>{},150);
@@ -470,8 +592,8 @@ test("normalizes a real subprocess stream and waits for exit after completion", 
     events.find((event) => event.type === "assistant.delta")?.text,
     "hello",
   );
-  assert.throws(() => process.kill(handle.pid!, 0));
   await runtime.close();
+  assert.throws(() => process.kill(handle.pid!, 0));
 });
 
 test("resumes the requested thread, steers only the current turn, and interrupts before done", async () => {
@@ -510,6 +632,7 @@ test("resumes the requested thread, steers only the current turn, and interrupts
   assert.equal(result.threadId, "saved-thread");
   assert.equal(result.text, "new instruction");
   assert.equal(await handle.inject("late"), false);
+  await runtime.close();
   assert.throws(() => process.kill(handle.pid!, 0));
 });
 
@@ -525,9 +648,54 @@ test("fails on RPC errors and unexpected process exit", async () => {
     );
     const result = await handle.done;
     assert.equal(result.status, "failed");
-    assert.match(result.error!, /invalid model|exited before turn completion/);
-    assert.throws(() => process.kill(handle.pid!, 0));
+    assert.match(result.error!, /invalid model|backend exited/);
+    await runtime.close();
+  assert.throws(() => process.kill(handle.pid!, 0));
   }
+});
+
+test("nonterminal runtime failures retire the backend before the next session turn", async (t) => {
+  for (const failure of ["timeout", "invalid-json", "consumer"]) {
+    const runtime = fake(`
+      if (r.method === 'turn/start') {
+        if (r.params.input[0].text === 'fail') {
+          if ('${failure}' === 'invalid-json') process.stdout.write('invalid JSON\\n');
+          if ('${failure}' === 'consumer') notify('item/agentMessage/delta',{threadId:r.params.threadId,turnId:'old-turn',itemId:'old',delta:'old output'});
+          setTimeout(() => notify('turn/started',{threadId:r.params.threadId,turn:{id:'old-turn'}}),1500);
+          return;
+        }
+        reply(r,{turn:{id:'new-turn'}});
+        notify('item/completed',{threadId:r.params.threadId,turnId:'new-turn',item:{id:'new',type:'agentMessage',text:'new output'}});
+        notify('turn/completed',{threadId:r.params.threadId,turn:{id:'new-turn',status:'completed'}});
+      }
+    `);
+    t.after(() => runtime.close());
+    const input = { ownerId: failure, cwd: process.cwd(), prompt: "fail" };
+    const first = await runtime.start(input, event => { if (failure === "consumer" && event.type === "assistant.delta") throw new Error("consumer failed"); });
+    assert.equal((await first.done).status, "failed");
+    const next = await runtime.start({ ...input, prompt: "succeed" }, () => {});
+    assert.notEqual(next.pid, first.pid);
+    assert.throws(() => process.kill(first.pid!, 0));
+    assert.equal((await next.done).text, "new output");
+  }
+});
+
+test("a native failed terminal turn can reuse its session backend", async (t) => {
+  const runtime = fake(`
+    if (r.method === 'turn/start') {
+      const fail = r.params.input[0].text === 'fail', id = fail ? 'first' : 'second';
+      reply(r,{turn:{id}});
+      notify('turn/completed',{threadId:r.params.threadId,turn:{id,status:fail?'failed':'completed'}});
+    }
+  `);
+  t.after(() => runtime.close());
+  const input = { ownerId: "terminal-failure", cwd: process.cwd(), prompt: "fail" };
+  const first = await runtime.start(input, () => {});
+  const failed = await first.done;
+  assert.equal(failed.status, "failed");
+  const next = await runtime.start({ ...input, prompt: "succeed", threadId: failed.threadId }, () => {});
+  assert.equal(next.pid, first.pid);
+  assert.equal((await next.done).status, "completed");
 });
 
 test("reports only the current turn usage when resume totals arrive after its response", async () => {
@@ -554,21 +722,55 @@ test("reports only the current turn usage when resume totals arrive after its re
   });
 });
 
-test("does not accept turn completion when its process cannot shut down", async () => {
+test("preserves a completed turn while its session backend stays alive", async () => {
   const runtime = fake(`
     if(r.method === 'turn/start') {
       reply(r,{turn:{id:'active'}});
+      notify('item/completed',{threadId:'thread-one',turnId:'active',item:{id:'message',type:'agentMessage',text:'finished answer'}});
+      notify('thread/tokenUsage/updated',{threadId:'thread-one',turnId:'active',tokenUsage:{total:{inputTokens:12,cachedInputTokens:3,outputTokens:5}}});
       setInterval(()=>{},1000);
       notify('turn/completed',{threadId:'thread-one',turn:{id:'active',status:'completed'}});
     }
   `);
   const handle = await runtime.start(
-    { cwd: process.cwd(), prompt: "go" },
+    { ownerId: "completion-owner", cwd: process.cwd(), prompt: "go" },
     () => {},
   );
   const result = await handle.done;
-  assert.equal(result.status, "failed");
-  assert.match(result.error!, /did not exit/);
+  assert.equal(result.status, "completed");
+  assert.equal(result.error, undefined);
+  assert.equal(result.text, "finished answer");
+  assert.equal(result.completedTurnId, "active");
+  assert.deepEqual(result.usage, {
+    inputTokens: 12,
+    cachedInputTokens: 3,
+    outputTokens: 5,
+  });
+  assert.doesNotThrow(() => process.kill(handle.pid!, 0));
+  assert.equal((await runtime.resources("completion-owner")).state, "idle");
+  await runtime.close();
+  assert.throws(() => process.kill(handle.pid!, 0));
+});
+
+test("keeps turn completion when the session backend later exits abnormally", async () => {
+  const runtime = fake(`
+    if(r.method === 'turn/start') {
+      reply(r,{turn:{id:'active'}});
+      notify('turn/completed',{threadId:'thread-one',turn:{id:'active',status:'completed'}});
+      setImmediate(()=>process.exit(7));
+    }
+  `, 700);
+  const handle = await runtime.start(
+    { ownerId: "completion-owner", cwd: process.cwd(), prompt: "go" },
+    () => {},
+  );
+  const result = await handle.done;
+  assert.equal(result.status, "completed");
+  await waitFor(async () => (await runtime.resources("completion-owner")).state === "failed");
+  assert.match((await runtime.resources("completion-owner")).error!, /exited \(7\)/);
+  assert.equal((await handle.done).status, "completed");
+  await waitFor(async () => (await runtime.resources("completion-owner")).state === "closed");
+  await runtime.close();
   assert.throws(() => process.kill(handle.pid!, 0));
 });
 
@@ -585,8 +787,8 @@ test("interrupt during initialization kills an unresponsive child before resolvi
   );
   await handle.interrupt();
   assert.equal((await handle.done).status, "interrupted");
-  assert.throws(() => process.kill(handle.pid!, 0));
   await runtime.close();
+  assert.throws(() => process.kill(handle.pid!, 0));
   await assert.rejects(
     runtime.start({ cwd: process.cwd(), prompt: "go" }, () => {}),
     /closed/,
@@ -833,7 +1035,8 @@ test(
       );
       await handle.interrupt();
       assert.equal((await handle.done).status, "interrupted");
-      assert.throws(() => process.kill(handle.pid!, 0));
+      await runtime.close();
+  assert.throws(() => process.kill(handle.pid!, 0));
       const stoppedPid = commandPid;
       assert.ok(stoppedPid);
       assert.throws(() => process.kill(stoppedPid, 0));
@@ -963,6 +1166,7 @@ test("interrupt settles a pending agent reply without waiting for its callback",
   assert.equal((await handle.done).status, "interrupted");
   reject(new Error("late callback failure"));
   await new Promise((resolve) => setImmediate(resolve));
+  await runtime.close();
   assert.throws(() => process.kill(handle.pid!, 0));
 });
 

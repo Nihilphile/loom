@@ -77,6 +77,12 @@ Reviewer 首版可用只读模式；仅在实际权限接口验证后才开放�
 
 ## Graph 集成队列
 
+Workspaces 替换原 Sessions 与 Task graphs 导航，使用项目全量状态生成 `Workspace → 对话或 Graph → Task → Agent` 树。各工作区在聊天及 Graph 详情旁同时可见。点击对话时选择其固定归属，直接在右侧发消息；各工作区的创建入口在打开表单时固定归属。当前工作区是选中内容的上下文，不是进入对话前必须执行的切换步骤。前端在接收状态时规范化工作区归属；旧服务未提供 `workspaces` 时保留所有会话和图在主工作区，继续支持原有操作，并禁用新建工作区、提示重启服务。
+
+项目工作区由 `ProjectWorkspace` 持久记录，`Session.workspaceId` 和 `Graph.workspaceId` 固定归属。`Workspace` 仍是底层 Git 执行目录描述。POST `/api/workspaces` 接收 `{name,sourceWorkspaceId?}` 并立即创建功能分支和代码目录。POST `/api/sessions` 及 `/api/graphs` 接收 `workspaceId`，省略时使用主工作区。GET `/api/runtime/options?workspaceId=...` 查询该目录的模型和 Skills。SSE 保留项目全量状态，浏览器独立保存每项目当前工作区，创建表单固定打开时的工作区，不依赖服务器全局选择。CLI 继承 `HARNESS_WORKSPACE_ID`。
+
+新 Graph 的 detached 镜像关联目标工作区路径和分支。`integrateTask` 按目标路径串行，在隔离目录验证合并候选。验证后检查目标分支、干净状态及基线未变，持久保存 `pendingPublication` 回执，再在可编辑工作区 fast-forward 到已验证提交并登记回执。`integrationReceipt` 可依据目标分支的真实祖先关系补记已发布的待定回执。原 Graph 镜像仍单独刷新，Task 分支以 Graph 身份区分，避免同一工作区多个图重用 Task ID 时碰撞。Engine 在发布期间拒绝启动自由写轮次，在自由写轮次执行时阻塞该次交付。下文专用分支的原子引用事务保留用于已有历史 Graph。
+
 Engine 拥有队列和全部状态写事务，Git 适配器负责真实工作区与发布效果。队列不增加新的调度 Agent 或通用作业系统。每个 Graph 同时最多一次集成，等待交付不占用 Agent 并发名额。
 
 | 数据 | 含义 |

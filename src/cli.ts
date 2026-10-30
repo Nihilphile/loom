@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
 import { readFileSync } from "node:fs";
+import { controlService } from "./server/service-command.ts";
 
 const args = process.argv.slice(2);
 const help = `Loom CLI
+  stop|restart [--port <port>] [--timeout <milliseconds>]
   unit report --outcome ready|approved|changes_requested|blocked --report <file> [--key <id>]
   letter send --graph <id> --to <graph/task/unit[,address]> --title <20 chars> --file <path> [--steer|--followup]
   state
+  workspace create --name <name> [--from <workspace-id>]
   graph create --file <graph.json>
   graph run|resume|resolve --id <graph-id>
   graph pause --id <graph-id> [--hard]
@@ -27,10 +30,23 @@ async function main() {
   const option = (name: string, required = true) => {
     const index = args.indexOf("--" + name);
     const value = index >= 0 ? args[index + 1] : undefined;
-    if (required && (!value || value.startsWith("--")))
+    if ((required || index >= 0) && (!value || value.startsWith("--")))
       throw new Error("Missing --" + name);
     return value;
   };
+  if (args[0] === "stop" || args[0] === "restart") {
+    for (let i = 1; i < args.length; i += 2)
+      if (!["--port", "--timeout"].includes(args[i])) throw new Error("Unknown service option: " + args[i]);
+    const port = option("port", false);
+    if (port !== undefined) {
+      if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) throw new Error("Invalid --port");
+      url.port = port;
+    }
+    const timeoutMs = Number(option("timeout", false) ?? 120000);
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error("Invalid --timeout");
+    await controlService(args[0], url, timeoutMs);
+    return;
+  }
   let path: string, body: unknown;
   if (args[0] === "unit" && args[1] === "report") {
     if (!process.env.HARNESS_TOKEN)
@@ -62,7 +78,11 @@ async function main() {
   } else if (args[0] === "graph") {
     if (args[1] === "create") {
       path = "/api/graphs";
-      body = JSON.parse(readFileSync(resolve(option("file")!), "utf8"));
+      const input: unknown = JSON.parse(readFileSync(resolve(option("file")!), "utf8"));
+      if (typeof input !== "object" || input === null || Array.isArray(input)) throw new Error("Graph file must contain an object");
+      if (process.env.HARNESS_WORKSPACE_ID && "workspaceId" in input && input.workspaceId !== process.env.HARNESS_WORKSPACE_ID)
+        throw new Error("Graph workspace is fixed by the launching session");
+      body = { workspaceId: process.env.HARNESS_WORKSPACE_ID, ...input };
     } else if (args[1] === "add-task") {
       path = `/api/graphs/${encodeURIComponent(option("id")!)}/tasks`;
       body = JSON.parse(readFileSync(resolve(option("file")!), "utf8"));
@@ -73,6 +93,9 @@ async function main() {
           ? { mode: args.includes("--hard") ? "hard" : "soft" }
           : {};
     } else throw new Error(help);
+  } else if (args[0] === "workspace" && args[1] === "create") {
+    path = "/api/workspaces";
+    body = { name: option("name"), sourceWorkspaceId: option("from", false) ?? process.env.HARNESS_WORKSPACE_ID };
   } else if (args[0] === "state") {
     path = "/api/state";
   } else throw new Error(help);

@@ -8,7 +8,10 @@
 用户通过 harness 开展工作的本地项目，包含项目文件，以及属于该项目的 agent 会话和任务图。
 
 **会话（Agent session）**：
-通过 harness 在某个项目中运行的 agent 会话。会话是需要保留记录的工作过程。
+通过 harness 在某个项目的工作区中运行的 agent 会话。会话固定归属工作区，切换界面不改变执行目录。会话是需要保留记录的工作过程。
+
+**工作区（Project workspace）**：
+一个功能的持久开发环境，拥有代码目录、自由会话和任务图。主工作区使用项目原目录；新工作区从选定工作区的已提交版本立即创建独立分支和 Git worktree。不同工作区代码隔离，同一工作区的自由会话共享代码。它区别于 Task、子会话和集成验证使用的临时执行工作树。
 
 **任务图（Task graph）**：
 由任务节点及其依赖关系组成的有向无环图，可由 agent 创建。用户启动任务图后，harness 根据依赖关系自动派发 agent 执行任务。
@@ -17,7 +20,7 @@
 任务图中的一个工作节点。所有前置 Task 成功集成后才能启动，从固定的 Graph 当前集成 HEAD 创建独立执行工作区。工作流验收后还需排队集成，成功发布才完成。
 
 **集成分支（Integration branch）**：
-Graph 专用的 Git 分支，首次运行固定项目已提交 HEAD 为初始起点，每次 Task 集成验证通过后推进。它可以包含无 DAG 依赖关系的已交付成果，不自动更新项目原分支。
+新 Graph 使用所属工作区的 Git 分支，每次 Task 集成验证通过后推进并同步可编辑目录。同一工作区的图共享该分支，Task 执行起点读取当前权威 HEAD。旧 Graph 保留原专用分支及独立历史工作区，不自动改写旧执行目标。
 
 **执行起点（Start commit）**：
 Task 创建工作区之前固定的 Graph 集成 HEAD，保存在 `Task.startCommit`。活动工作区不随 Graph 集成分支推进。
@@ -29,7 +32,7 @@ Task 创建工作区之前固定的 Graph 集成 HEAD，保存在 `Task.startCom
 将已验收候选合并、验证并发布到 Graph 集成分支的操作及持久记录。`TaskDelivery` 关联固定源提交、验证证据和发布回执；Task 只有发布成功才完成。`Task.deliverySha` 记录源提交，实际集成提交由发布回执标识。暂停后编辑未交付 Task 会把旧记录标为 `superseded` 并保留历史，新候选产生新交付。
 
 **交付队列（Integration queue）**：
-每个 Graph 串行处理候选的持久队列。Task 使用 `merge_queued` 和 `integrating` 表示等待与处理中，追加 Task 的 `queued` 仍表示追加屏障。一次交付失败不阻塞独立队列项。
+每个 Graph 保存候选的持久队列，同一工作区的多个 Graph 串行发布。Task 使用 `merge_queued` 和 `integrating` 表示等待与处理中，追加 Task 的 `queued` 仍表示追加屏障。一次交付失败不阻塞独立队列项。
 
 **集成验证（Integration validation）**：
 在隔离工作区的真实合并结果上执行 Graph 创建时配置的命令。通过后才发布，未配置命令也明确记录。TaskType 的 Command Unit 检查属于工作流验收，不代替此验证。

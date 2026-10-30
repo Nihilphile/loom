@@ -9,6 +9,7 @@ import type { AgentCommand, GitAdapter, Runtime, RuntimeInput, RuntimeResult } f
 
 class ManualRuntime implements Runtime {
   name = "agentic lifecycle";
+  closeSession?: Runtime["closeSession"];
   capabilities = { inject: true, interrupt: true, readOnly: true };
   turns: { input: RuntimeInput; finish: (value?: Partial<RuntimeResult>) => void }[] = [];
   async discoverOptions() {
@@ -270,6 +271,24 @@ test("failed writable snapshots still block delivery until explicit discard", as
   assert.throws(() => report(f, 0), /descendants/);
   await call(f, 0, { op: "discard", requestId: "discard", sessionId: child.sessionId, executionId: output.resultExecutionId! });
   report(f, 0);
+});
+
+test("cleanup failure preserves the child result and makes its notice consumable by the parent", async (t) => {
+  const f = fixture(t); await begin(f);
+  const child = await call(f, 0, { op: "spawn", requestId: "writer", title: "writer", prompt: "write", access: "write" });
+  f.runtime.closeSession = async () => { throw new Error("cleanup failed"); };
+  f.runtime.turns[1].finish({ text: "completed child output" }); await flush();
+  const session = f.engine.session(child.sessionId);
+  const execution = f.engine.state.executions.find(e => e.id === session.child!.resultExecutionId)!;
+  assert.equal(execution.status, "completed");
+  assert.equal(session.child!.state, "failed");
+  const parent = f.engine.session(session.child!.parentSessionId);
+  assert.equal(parent.childNotices!.find(n => n.executionId === execution.id)!.consumed, undefined);
+  const result = await f.runtime.turns[0].input.agentTool!({ op: "wait", sessionIds: [child.sessionId] }) as { children: { executionId: string; result: string }[] };
+  assert.equal(result.children[0].executionId, execution.id);
+  assert.equal(result.children[0].result, "completed child output");
+  assert.equal(parent.childNotices!.find(n => n.executionId === execution.id)!.consumed, true);
+  assert.throws(() => report(f, 0), /descendants/);
 });
 
 test("failed workspace creation cannot continue a child inside the parent's workspace", async (t) => {

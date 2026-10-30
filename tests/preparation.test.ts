@@ -18,6 +18,7 @@ import type {
 
 class ManualRuntime implements Runtime {
   name = "manual";
+  closeSession?: Runtime["closeSession"];
   discoverOptions?: Runtime["discoverOptions"];
   capabilities = { inject: true, interrupt: true, readOnly: true, fork: true };
   turns: {
@@ -95,7 +96,7 @@ function fixture(t: { after: (fn: () => Promise<void>) => void }) {
     engine.close();
     rmSync(root, { recursive: true, force: true });
   });
-  return { root, runtime, engine, catalog };
+  return { root, runtime, engine, catalog, git };
 }
 function submit(
   f: ReturnType<typeof fixture>,
@@ -108,6 +109,49 @@ function submit(
   writeFileSync(path, content);
   f.engine.submit(input.env!.HARNESS_TOKEN, { outcome, report: path });
 }
+
+test("task publication waits for resource cleanup while keeping the completed turn terminal", async (t) => {
+  const f = fixture(t);
+  let cleaned!: () => void;
+  const cleanup = new Promise<void>(resolve => { cleaned = resolve; });
+  f.runtime.closeSession = () => cleanup;
+  let snapshots = 0;
+  f.git.snapshot = async () => { snapshots++; return "snapshot"; };
+  const graph = f.engine.createGraph({ name: "cleanup", tasks: [{ title: "task", goal: "goal", deps: [], taskTypeId: "reviewed" }] });
+  await f.engine.runGraph(graph.id);
+  await flush();
+  f.runtime.confirm(0);
+  await flush();
+  submit(f, 0, "ready", "report");
+  f.runtime.turns[0].finish();
+  await flush();
+  assert.equal(f.engine.state.executions[0].status, "completed");
+  assert.equal(snapshots, 0);
+  assert.equal(f.runtime.turns.length, 1);
+  cleaned();
+  await flush();
+  assert.equal(snapshots, 1);
+  assert.equal(f.runtime.turns.length, 2);
+});
+
+test("resource cleanup failure blocks task publication without rewriting the completed turn", async (t) => {
+  const f = fixture(t);
+  f.runtime.closeSession = async () => { throw new Error("owner cleanup unavailable"); };
+  let snapshots = 0;
+  f.git.snapshot = async () => { snapshots++; return "snapshot"; };
+  const graph = f.engine.createGraph({ name: "cleanup", tasks: [{ title: "task", goal: "goal", deps: [], taskTypeId: "reviewed" }] });
+  await f.engine.runGraph(graph.id);
+  await flush();
+  f.runtime.confirm(0);
+  await flush();
+  submit(f, 0, "ready", "report");
+  f.runtime.turns[0].finish();
+  await flush();
+  assert.equal(f.engine.state.executions[0].status, "completed");
+  assert.equal(graph.tasks[0].status, "blocked");
+  assert.match(graph.tasks[0].blockReason!, /owner cleanup unavailable/);
+  assert.equal(snapshots, 0);
+});
 
 test("initialization requires acceptance and reviewer return injects only incremental materials", async (t) => {
   const f = fixture(t);

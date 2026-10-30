@@ -95,6 +95,7 @@ async function fixture(git = new GitWorkspaces()) {
     projectRoot: root,
     catalogPath: join(root, "catalog.json"),
   });
+  const workspace = await app.engine!.createWorkspace({ name: "Scheduler feature" });
   await new Promise<void>((r) => app.server.listen(0, "127.0.0.1", r));
   const address = app.server.address();
   assert(address && typeof address !== "string");
@@ -105,6 +106,8 @@ async function fixture(git = new GitWorkspaces()) {
     token?: string,
     method = body ? "POST" : "GET",
   ) {
+    if (body && typeof body === "object" && ["/api/graphs", "/api/sessions"].includes(path))
+      body = { workspaceId: workspace.id, ...body };
     const response = await fetch(url + path, {
       method,
       headers: {
@@ -135,7 +138,7 @@ async function fixture(git = new GitWorkspaces()) {
     assert.equal(result.status, 200, JSON.stringify(result.data));
     return { path, data: result.data };
   }
-  return { root, runtime, app, url, request, report };
+  return { root, workspace, runtime, app, url, request, report };
 }
 
 class HeldIntegration extends GitWorkspaces {
@@ -200,7 +203,7 @@ for (const action of ["resume", "resolve", "close"] as const) {
     const adapter = new HeldIntegrationHead();
     const f = await fixture(adapter);
     try {
-      const graph = f.app.engine!.createGraph({ name: "lifecycle race", tasks: [
+      const graph = f.app.engine!.createGraph({ workspaceId: f.workspace.id, name: "lifecycle race", tasks: [
         { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
       ] });
       await f.app.engine!.runGraph(graph.id);
@@ -232,7 +235,7 @@ test("accepted work frees slots, dependent waits for both publications and later
   const adapter = new HeldIntegration();
   const f = await fixture(adapter);
   try {
-    const graph = f.app.engine!.createGraph({ name: "queue", concurrency: 3, tasks: [
+    const graph = f.app.engine!.createGraph({ workspaceId: f.workspace.id, name: "queue", concurrency: 3, tasks: [
       { id: "D", title: "unrelated", goal: "d", deps: [], taskTypeId: "direct" },
       { id: "B", title: "first", goal: "b", deps: [], taskTypeId: "direct" },
       { id: "C", title: "second", goal: "c", deps: [], taskTypeId: "direct" },
@@ -274,7 +277,7 @@ test("soft pause drains active publication while queued edit supersedes source w
   const adapter = new HeldIntegration();
   const f = await fixture(adapter);
   try {
-    const graph = f.app.engine!.createGraph({ name: "edit queue", tasks: [
+    const graph = f.app.engine!.createGraph({ workspaceId: f.workspace.id, name: "edit queue", tasks: [
       { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
       { id: "B", title: "b", goal: "b", deps: [], taskTypeId: "direct" },
     ] });
@@ -308,7 +311,7 @@ test("hard pause waits for integration and retry delivers accepted source withou
   const adapter = new HeldIntegration();
   const f = await fixture(adapter);
   try {
-    const graph = f.app.engine!.createGraph({ name: "hard queue", tasks: [
+    const graph = f.app.engine!.createGraph({ workspaceId: f.workspace.id, name: "hard queue", tasks: [
       { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
     ] });
     await f.app.engine!.runGraph(graph.id);
@@ -338,7 +341,7 @@ test("failed integration command blocks dependents while independent delivery pr
   const f = await fixture();
   try {
     const allow = join(f.root, ".newharness", "allow").replaceAll("\\", "/");
-    const graph = f.app.engine!.createGraph({ name: "validation queue", concurrency: 2,
+    const graph = f.app.engine!.createGraph({ workspaceId: f.workspace.id, name: "validation queue", concurrency: 2,
       integrationCommand: `node -e "if(require('fs').existsSync('A.txt')&&!require('fs').existsSync('${allow}'))process.exit(7);console.log('candidate verified')"`, tasks: [
         { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
         { id: "B", title: "b", goal: "b", deps: [], taskTypeId: "direct" },
@@ -377,7 +380,7 @@ test("startup pauses and reconciles a committed receipt before dispatch without 
   const f = await fixture(adapter);
   let reopened: Awaited<ReturnType<typeof createHttpServer>> | undefined;
   try {
-    const graph = f.app.engine!.createGraph({ name: "receipt recovery", tasks: [
+    const graph = f.app.engine!.createGraph({ workspaceId: f.workspace.id, name: "receipt recovery", tasks: [
       { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
       { id: "B", title: "b", goal: "b", deps: ["A"], taskTypeId: "direct" },
     ] });
@@ -424,7 +427,7 @@ test("startup pauses and reconciles a committed receipt before dispatch without 
 test("hard pause terminates the real integration validator before publishing", async () => {
   const f = await fixture();
   try {
-    const graph = f.app.engine!.createGraph({ name: "validator cancellation", integrationCommand: 'node -e "setTimeout(()=>{},60000)"', tasks: [
+    const graph = f.app.engine!.createGraph({ workspaceId: f.workspace.id, name: "validator cancellation", integrationCommand: 'node -e "setTimeout(()=>{},60000)"', tasks: [
       { id: "A", title: "a", goal: "a", deps: [], taskTypeId: "direct" },
     ] });
     await f.app.engine!.runGraph(graph.id);

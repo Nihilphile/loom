@@ -5,6 +5,7 @@ import type {
   Task,
   TaskInput,
   Session,
+  SessionResources,
   Metrics,
   HarnessEvent,
   ProjectEntry,
@@ -16,9 +17,12 @@ import type {
   Preparation,
   Feedback,
   InterviewSettings,
+  ProjectWorkspace,
+  WorkspaceStatus,
 } from "../src/shared/types.ts";
 import { defaultInterviews } from "../src/shared/types.ts";
 import { statistics, summarize, type StatsFilters } from "./statistics.ts";
+import { deriveInvocations, eventLabel, invocationStatistics, sessionTimeline, type Invocation, type InvocationStatus } from "./invocations.ts";
 import { agenticSession, delegationFields, delegationLabel, readDelegation, sessionTree, sessionError } from "./agentic.ts";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -28,10 +32,82 @@ let state: AppState | null = null;
 let projects: ProjectEntry[] = [];
 let projectId = sessionStorage.getItem("harness.project") ?? "";
 let projectGeneration = 0;
+let workspaceId = sessionStorage.getItem(`harness.workspace.${projectId}`) ?? "main";
+let workspaceGeneration = 0;
+let workspaceStatus: WorkspaceStatus | undefined;
+let supportsWorkspaces = false;
 let stream: EventSource | undefined;
+let selectingText = false;
+let pendingRender = false;
+function selectionInApp() {
+  const selection = window.getSelection();
+  return !!selection && !selection.isCollapsed &&
+    (app.contains(selection.anchorNode) || app.contains(selection.focusNode));
+}
+function flushPendingRender() {
+  if (pendingRender && !selectingText && !selectionInApp()) render();
+}
+app.addEventListener("pointerdown", (event) => {
+  if (event.button === 0) selectingText = true;
+});
+document.addEventListener("pointerup", () => {
+  selectingText = false;
+  setTimeout(flushPendingRender, 0);
+});
+document.addEventListener("selectionchange", flushPendingRender);
 let options: RuntimeOptions = { models: [], skills: [], warnings: [] };
 let optionsLoading = false;
 const drafts = new Map<string, ChatDraft>();
+const collapsedWorkspaceNodes = new Set<string>();
+try {
+  const saved: unknown = JSON.parse(localStorage.getItem("harness.workspace-tree.collapsed") ?? "[]");
+  if (Array.isArray(saved)) {
+    for (const key of saved) if (typeof key === "string") collapsedWorkspaceNodes.add(key);
+  }
+} catch {}
+type WorkspaceTreeKind = "workspace" | "graph" | "task" | "session";
+const workspaceTreeKey = (kind: WorkspaceTreeKind, ...ids: string[]) => JSON.stringify([projectId, kind, ...ids]);
+const workspaceTreeContentId = (key: string) => `workspace-tree-${encodeURIComponent(key)}`;
+function saveWorkspaceTree() {
+  try {
+    localStorage.setItem("harness.workspace-tree.collapsed", JSON.stringify([...collapsedWorkspaceNodes]));
+  } catch {}
+}
+function workspaceTreeToggle(key: string, label: string) {
+  const expanded = !collapsedWorkspaceNodes.has(key);
+  return `<button type="button" class="workspace-tree-toggle" data-tree-toggle="${esc(key)}" aria-expanded="${expanded}" aria-controls="${esc(workspaceTreeContentId(key))}" aria-label="${expanded ? "折叠" : "展开"} ${esc(label)}"><span aria-hidden="true">${expanded ? "▾" : "▸"}</span></button>`;
+}
+function workspaceTreeContent(key: string) {
+  return `id="${esc(workspaceTreeContentId(key))}"${collapsedWorkspaceNodes.has(key) ? " hidden" : ""}`;
+}
+function workspaceSessionParent(s: Session) {
+  const parentId = s.source?.sessionId ?? s.child?.parentSessionId;
+  return state?.sessions.find((parent) => parent.id === parentId && parent.id !== s.id && parent.workspaceId === s.workspaceId);
+}
+function revealWorkspaceSelection() {
+  const keys = new Set<string>();
+  const revealGraph = (id: string, tid?: string) => {
+    const g = state?.graphs.find((candidate) => candidate.id === id);
+    if (!g) return;
+    keys.add(workspaceTreeKey("workspace", g.workspaceId ?? "main"));
+    keys.add(workspaceTreeKey("graph", g.id));
+    if (tid) keys.add(workspaceTreeKey("task", g.id, tid));
+  };
+  if (page === "sessions") {
+    let selected = session();
+    const visited = new Set<string>();
+    while (selected && !visited.has(selected.id)) {
+      visited.add(selected.id);
+      keys.add(workspaceTreeKey("workspace", selected.workspaceId ?? "main"));
+      const parent = workspaceSessionParent(selected);
+      if (parent) keys.add(workspaceTreeKey("session", parent.id));
+      else if (selected.kind === "task" && selected.graphId) revealGraph(selected.graphId, selected.taskId);
+      selected = parent;
+    }
+  } else if (page === "graphs") revealGraph(graphId, taskId);
+  for (const key of keys) collapsedWorkspaceNodes.delete(key);
+  saveWorkspaceTree();
+}
 interface ChatDraft {
   text: string;
   attachments: Attachment[];
@@ -78,7 +154,7 @@ function draft(s = session()): ChatDraft {
   }
   return saved;
 }
-let page = "graphs";
+let page = "workspaces";
 let graphId = "";
 let taskId = "";
 let sessionId = "";
@@ -86,6 +162,18 @@ let inspectTab = "members";
 let mailAddress = "";
 let mailDirection = "inbox";
 let events: HarnessEvent[] = [];
+let eventsSelection = "";
+let traceTab: "events" | "statistics" = "events";
+const invocationPages = new Map<string, { events: HarnessEvent[]; cursor: number }>();
+const pendingEventLoads = new Map<string, Promise<void>>();
+interface SessionResourceView {
+  open: boolean;
+  snapshot?: SessionResources;
+  pending?: "refresh" | "stop" | "close";
+  error?: string;
+  updatedAt?: number;
+}
+const sessionResourceViews = new Map<string, SessionResourceView>();
 let connected = false;
 let composing = false;
 let requestPending = false;
@@ -145,9 +233,15 @@ const time = (value: string) =>
     minute: "2-digit",
     second: "2-digit",
   });
-const graph = () => state?.graphs.find((g) => g.id === graphId);
+const workspace = () => state?.workspaces?.find((w) => w.id === workspaceId);
+const workspaceGraphs = () => state?.graphs.filter((g) => (g.workspaceId ?? "main") === workspaceId) ?? [];
+const workspaceSessions = () => state?.sessions.filter((s) => (s.workspaceId ?? "main") === workspaceId) ?? [];
+const workspaceLetters = () => state?.letters.filter((l) => workspaceGraphs().some((g) => g.id === l.graphId) ||
+  workspaceSessions().some((s) => l.from === `session/${s.id}` || l.to.includes(`session/${s.id}`))) ?? [];
+const workspaceFeedback = () => state?.feedback?.filter((f) => workspaceSessions().some((s) => s.id === f.source.sessionId)) ?? [];
+const graph = () => workspaceGraphs().find((g) => g.id === graphId);
 const task = () => graph()?.tasks.find((t) => t.id === taskId);
-const session = () => state?.sessions.find((s) => s.id === sessionId);
+const session = () => workspaceSessions().find((s) => s.id === sessionId);
 const empty = (title: string, text: string, action = "") =>
   `<div class="empty"><div class="symbol">◇</div><h2>${esc(title)}</h2><p>${esc(text)}</p>${action}</div>`;
 const field = (name: string, label: string, value = "", options = "") =>
@@ -183,6 +277,38 @@ async function api<T>(
     throw new Error(payload.error || `请求失败 (${response.status})`);
   return payload;
 }
+function resourceView(sid = sessionId, owner = projectId) {
+  const key = draftKey(sid, owner);
+  let view = sessionResourceViews.get(key);
+  if (!view) {
+    view = { open: false };
+    sessionResourceViews.set(key, view);
+  }
+  return view;
+}
+async function updateSessionResources(operation: "refresh" | "stop" | "close", resourceId?: string) {
+  const sid = sessionId;
+  const owner = projectId;
+  if (!session()) return;
+  const view = resourceView(sid, owner);
+  if (view.pending) return;
+  view.pending = operation;
+  view.error = undefined;
+  render();
+  try {
+    const path = `/api/sessions/${enc(sid)}/resources${operation === "refresh" ? "" : `/${operation}`}`;
+    view.snapshot = await api<SessionResources>(path, operation === "refresh" ? "GET" : "POST",
+      operation === "refresh" ? undefined : operation === "stop" ? { resourceId } : {}, owner, true);
+    view.updatedAt = Date.now();
+    if (operation !== "refresh" && owner === projectId && sid === sessionId) await refresh();
+  } catch (error) {
+    if (!(error instanceof StaleProjectResponse))
+      view.error = error instanceof Error ? error.message : String(error);
+  } finally {
+    view.pending = undefined;
+    if (owner === projectId && sid === sessionId) render();
+  }
+}
 function toast(message: string, error = false) {
   clearTimeout(noticeTimer);
   notice.textContent = message;
@@ -200,7 +326,8 @@ async function refresh() {
   if (!projectId) return;
   const next = await api<AppState>("/api/state");
   if (next.project?.id !== projectId) return;
-  state = next;
+  supportsWorkspaces = Array.isArray(next.workspaces);
+  state = workspaceState(next);
   render();
 }
 async function mutate(path: string, body: unknown = {}, method = "POST") {
@@ -228,9 +355,34 @@ function acceptState(next: AppState) {
     sessionId = "";
     events = [];
   }
-  state = next;
+  supportsWorkspaces = Array.isArray(next.workspaces);
+  state = workspaceState(next);
   render();
   scheduleEvents();
+}
+function workspaceState(next: AppState): AppState {
+  if (!next.project) return next;
+  const workspaces: ProjectWorkspace[] = [...(next.workspaces ?? [])];
+  if (!workspaces.some((w) => w.id === "main")) workspaces.unshift({
+    id: "main", name: "主工作区", kind: "main", path: next.project.path,
+    createdAt: projects.find((p) => p.id === next.project?.id)?.createdAt ?? "",
+  });
+  const valid = new Set(workspaces.map((w) => w.id));
+  const graphs = next.graphs.map((g) => ({ ...g, workspaceId: valid.has(g.workspaceId ?? "") ? g.workspaceId : "main" }));
+  const owners = new Map<string, string>();
+  const owner = (s: Session, visited = new Set<string>()): string => {
+    const saved = owners.get(s.id);
+    if (saved) return saved;
+    if (visited.has(s.id)) return "main";
+    visited.add(s.id);
+    const parent = s.child && next.sessions.find((p) => p.id === s.child?.parentSessionId);
+    const id = s.workspaceId && valid.has(s.workspaceId) ? s.workspaceId
+      : parent ? owner(parent, visited)
+      : graphs.find((g) => g.id === s.graphId)?.workspaceId ?? "main";
+    owners.set(s.id, id);
+    return id;
+  };
+  return { ...next, workspaces, graphs, sessions: next.sessions.map((s) => ({ ...s, workspaceId: owner(s) })) };
 }
 function scheduleEvents() {
   if (eventTimer) return;
@@ -239,47 +391,95 @@ function scheduleEvents() {
     void loadEvents().catch(showError);
   }, 200);
 }
-async function loadEvents() {
-  const generation = ++eventGeneration;
-  const selection = [page, graphId, sessionId].join("/");
+function loadEvents(): Promise<void> {
+  const selection = eventSelection();
+  const pending = pendingEventLoads.get(selection);
+  if (pending) return pending;
+  const loading = loadSelectedEvents(selection).finally(() => {
+    if (pendingEventLoads.get(selection) === loading) pendingEventLoads.delete(selection);
+  });
+  pendingEventLoads.set(selection, loading);
+  return loading;
+}
+async function loadSelectedEvents(selection: string) {
+  const generation = eventGeneration;
   if (!state?.project) return;
   const query = new URLSearchParams();
+  if (supportsWorkspaces) query.set("workspaceId", workspaceId);
   if (page === "sessions" && sessionId) query.set("sessionId", sessionId);
   else if (page === "graphs" && graphId) query.set("graphId", graphId);
   const loaded = await api<HarnessEvent[]>(`/api/events?${query}`);
+  const saved = invocationPages.get(selection);
+  const calls = [...(saved?.events ?? [])];
+  let cursor = saved?.cursor ?? 0;
+  query.set("kind", "invocations");
+  let more = true;
+  while (more) {
+    query.set("after", String(cursor));
+    const batch = await api<HarnessEvent[]>(`/api/events?${query}`);
+    if (generation !== eventGeneration || selection !== eventSelection()) return;
+    calls.push(...batch);
+    if (batch.length) cursor = batch[batch.length - 1].id;
+    more = batch.length === 2000;
+  }
   if (
     generation !== eventGeneration ||
-    selection !== [page, graphId, sessionId].join("/")
+    selection !== eventSelection()
   )
     return;
   events = loaded;
+  eventsSelection = selection;
+  invocationPages.set(selection, { events: calls, cursor });
+  if (selectingText || selectionInApp()) {
+    pendingRender = true;
+    return;
+  }
   const target = document.querySelector("#trace");
   if (target) {
     const top = target.scrollTop;
     target.innerHTML = traceBody(page === "logs");
     target.scrollTop = top;
   }
-  const tools = document.querySelector("#chat-tools");
-  if (tools) {
+  const messages = document.querySelector<HTMLElement>("#chat-timeline");
+  const s = session();
+  if (messages && s) {
+    const top = messages.scrollTop;
+    const bottom = messages.scrollHeight - top - messages.clientHeight < 45;
     const open = new Set(
-      [...tools.querySelectorAll<HTMLDetailsElement>("details[open]")].map(
+      [...messages.querySelectorAll<HTMLDetailsElement>("details[open]")].map(
         (el) => el.dataset.detail,
       ),
     );
-    tools.innerHTML = chatTools();
-    tools.querySelectorAll<HTMLDetailsElement>("details").forEach((el) => {
+    messages.innerHTML = chatTimeline(s);
+    messages.querySelectorAll<HTMLDetailsElement>("details").forEach((el) => {
       el.open = open.has(el.dataset.detail);
     });
+    messages.scrollTop = bottom ? messages.scrollHeight : top;
   }
+}
+function eventSelection() {
+  return JSON.stringify([projectId, workspaceId, page, page === "sessions" ? sessionId : page === "graphs" ? graphId : ""]);
+}
+function currentEvents() {
+  return eventsSelection === eventSelection() ? events : [];
+}
+function currentInvocations() {
+  return deriveInvocations(invocationPages.get(eventSelection())?.events ?? [], state?.executions ?? []);
 }
 function navigate(next: string) {
   page = next;
+  revealWorkspaceSelection();
   render(false);
   scheduleEvents();
 }
 
 function render(preserve = true) {
   if (composing) return;
+  if (preserve && (selectingText || selectionInApp())) {
+    pendingRender = true;
+    return;
+  }
+  pendingRender = false;
   const controls = new Map<string, { value: string; checked?: boolean }>();
   let focused = "";
   let selectionStart: number | null = null;
@@ -319,18 +519,22 @@ function render(preserve = true) {
       ...app.querySelectorAll<HTMLDetailsElement>("details[open][data-detail]"),
     ].map((el) => el.dataset.detail),
   );
-  if (state && !graph()) graphId = state.graphs[0]?.id ?? "";
+  if (state?.workspaces?.length && !workspace()) {
+    workspaceId = state.workspaces[0].id;
+    sessionStorage.setItem(`harness.workspace.${projectId}`, workspaceId);
+  }
+  if (state && !graph()) graphId = workspaceGraphs()[0]?.id ?? "";
   if (graph() && !task()) taskId = graph()?.tasks[0]?.id ?? "";
   if (state && !session())
     sessionId =
-      state.sessions.find((s) => s.kind === "free")?.id ??
-      state.sessions[0]?.id ??
+      workspaceSessions().find((s) => s.kind === "free")?.id ??
+      workspaceSessions()[0]?.id ??
       "";
   if (!state) {
     app.innerHTML = '<div class="boot">正在连接本地工作区…</div>';
     return;
   }
-  app.innerHTML = `<div class="app">${sidebar()}<main><header class="topbar"><div class="crumb">WORKSPACE &nbsp; / &nbsp; <strong>${esc(state.project?.name ?? "打开项目")}</strong></div><div class="row"><span class="connection ${connected ? "" : "offline"}">${connected ? "● 已连接" : "○ 正在重连"}</span><span class="runtime">${esc(state.runtime.name)} · 本地运行</span></div></header><div class="page">${!state.project && !["templates", "types"].includes(page) ? welcome() : content()}</div></main></div>`;
+  app.innerHTML = `<div class="app">${sidebar()}<main><header class="topbar"><div class="crumb">WORKSPACE &nbsp; / &nbsp; <strong>${esc(state.project?.name ?? "打开项目")}</strong>${workspace() ? ` &nbsp; / &nbsp; <strong>${esc(workspace()!.name)}</strong>` : ""}</div><div class="row"><span class="connection ${connected ? "" : "offline"}">${connected ? "● 已连接" : "○ 正在重连"}</span><span class="runtime">${esc(state.runtime.name)} · 本地运行</span></div></header><div class="page">${!state.project && !["templates", "types"].includes(page) ? welcome() : content()}</div></main></div>`;
   if (preserve) {
     const interviewModel = controls.get("interview-model");
     const interviewReasoning = app.querySelector<HTMLSelectElement>(
@@ -380,25 +584,26 @@ function render(preserve = true) {
 function sidebar() {
   if (!state) return "";
   const items = [
-    ["graphs", "◇", "Task graphs", state.graphs.length],
-    ["sessions", "◷", "Sessions", state.sessions.length],
-    ["mailbox", "✉", "Mailbox", state.letters.length],
+    ["workspaces", "▧", "Workspaces", state.workspaces?.length ?? 0],
+    ["mailbox", "✉", "Mailbox", workspaceLetters().length],
     ["logs", "≋", "运行记录", ""],
     ["stats", "▤", "统计", ""],
-    ["feedback", "▣", "意见箱", state.feedback?.length ?? 0],
+    ["feedback", "▣", "意见箱", workspaceFeedback().length],
     ["developer", "⚙", "开发者选项", ""],
     ["types", "◈", "Task types", state.taskTypes.length],
     ["templates", "⊞", "Agent templates", state.agentTemplates.length],
   ];
-  return `<aside class="sidebar"><div class="brand"><span class="brandmark">⌘</span>Loom</div><div class="project"><strong>▧ &nbsp; ${esc(state.project?.name ?? "尚未打开项目")}</strong><div class="path mono">${esc(state.project?.path ?? "选择本地 Git 项目")}</div><button data-action="project">${state.project ? "切换项目 ↗" : "打开项目 ↗"}</button></div><div class="navlabel">WORKSPACE</div>${items.map(([id, icon, label, count]) => `${id === "types" ? '<div class="navlabel">PERSONAL · 跨项目</div>' : ""}<button class="navbtn ${page === id ? "active" : ""}" data-page="${id}"><span class="navicon">${icon}</span>${label}${count !== "" ? `<span class="count">${count}</span>` : ""}</button>`).join("")}<div class="sidebarfoot"><div class="online">● &nbsp; Local workspace</div><div>${esc(state.runtime.name)}</div><div>运行记录保存在项目内</div></div></aside>`;
+  return `<aside class="sidebar"><div class="brand"><span class="brandmark">⌘</span>Loom</div><div class="project"><strong>▧ &nbsp; ${esc(state.project?.name ?? "尚未打开项目")}</strong><div class="path mono">${esc(state.project?.path ?? "选择本地 Git 项目")}</div><button data-action="project">${state.project ? "切换项目 ↗" : "打开项目 ↗"}</button></div><div class="navlabel">项目</div>${items.map(([id, icon, label, count]) => `${id === "types" ? '<div class="navlabel">PERSONAL · 跨项目</div>' : ""}<button class="navbtn ${(id === "workspaces" ? ["workspaces", "sessions", "graphs"].includes(page) : page === id) ? "active" : ""}" data-page="${id}"><span class="navicon">${icon}</span>${label}${count !== "" ? `<span class="count">${count}</span>` : ""}</button>`).join("")}<div class="sidebarfoot"><div class="online">● &nbsp; Local workspace</div><div>${esc(state.runtime.name)}</div><div>运行记录保存在项目内</div></div></aside>`;
 }
 function welcome() {
-  return `<section class="welcome"><div class="eyebrow">LOCAL FIRST / REAL EXECUTION</div><h1>让任务有序发生。</h1><p class="muted">打开本地项目，与 Codex 独立对话，或把工作拆成有依赖关系的任务。每次执行、工具调用与交付都有记录。</p><form data-form="project"><input name="path" aria-label="项目目录" placeholder="输入本地项目的绝对路径" required><button class="btn primary" type="submit">打开项目 →</button></form><div class="notice spaced">路径不存在时自动创建目录并初始化 Git。Task graph 使用独立 Git 工作区，成果汇总到 Graph 基线。</div></section>`;
+  return `<section class="welcome"><div class="eyebrow">LOCAL FIRST / REAL EXECUTION</div><h1>让任务有序发生。</h1><p class="muted">打开本地项目，与 Codex 独立对话，或把工作拆成有依赖关系的任务。每次执行、工具调用与交付都有记录。</p><form data-form="project"><input name="path" aria-label="项目目录" placeholder="输入本地项目的绝对路径" required><button class="btn primary" type="submit">打开项目 →</button></form><div class="notice spaced">路径不存在时自动创建目录并初始化 Git。Workspace 为功能提供独立代码目录，对话和任务图固定归属其中。Task 成果验证通过后交付到所属 Workspace。</div></section>`;
 }
 function content() {
   switch (page) {
+    case "workspaces":
     case "sessions":
-      return sessionsPage();
+    case "graphs":
+      return workspacesPage();
     case "mailbox":
       return mailboxPage();
     case "logs":
@@ -414,7 +619,7 @@ function content() {
     case "types":
       return typesPage();
     default:
-      return graphsPage();
+      return workspacesPage();
   }
 }
 function intro(
@@ -460,7 +665,7 @@ function graphsPage() {
   );
   return (
     output +
-    `<div class="workspace"><div class="stack"><section class="panel"><div class="panelhead"><div class="row"><strong>任务依赖图</strong>${badge(g.status, g.status === "done" ? "已完成" : undefined)}</div><div class="row"><select class="graphchoice" id="graph-choice" aria-label="选择任务图">${state?.graphs.map((x) => `<option value="${esc(x.id)}" ${x.id === g.id ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select>${btn("new-task", "＋ Task", "small", g.status === "done")}</div></div><div class="toolbar"><span>并行上限 ${g.concurrency}</span><span>·</span><span>${g.tasks.length} 个任务</span><span class="grow"></span><span>点击节点查看成员</span></div>${graphCanvas(g)}<div class="canvasfoot">连线表示前置依赖；所有前置通过合并验证并发布后，下游才能启动。</div></section>${integrationPanel(g)}${g.error ? `<div class="notice amber">${esc(g.error)}</div>` : ""}${g.status === "pausing" ? '<div class="notice">正在等待活动执行结束。完全暂停后可编辑任务。</div>' : ""}${subscription(g)}${trace()}</div><aside class="panel">${inspector()}</aside></div>`
+    `<div class="workspace"><div class="stack"><section class="panel"><div class="panelhead"><div class="row"><strong>任务依赖图</strong>${badge(g.status, g.status === "done" ? "已完成" : undefined)}</div><div class="row">${btn("new-task", "＋ Task", "small", g.status === "done")}</div></div><div class="toolbar"><span>并行上限 ${g.concurrency}</span><span>·</span><span>${g.tasks.length} 个任务</span><span class="grow"></span><span>点击节点查看成员</span></div>${graphCanvas(g)}<div class="canvasfoot">连线表示前置依赖；所有前置通过合并验证并发布后，下游才能启动。</div></section>${integrationPanel(g)}${g.error ? `<div class="notice amber">${esc(g.error)}</div>` : ""}${g.status === "pausing" ? '<div class="notice">正在等待活动执行结束。完全暂停后可编辑任务。</div>' : ""}${subscription(g)}${trace()}</div><aside class="panel">${inspector()}</aside></div>`
   );
 }
 function integrationPanel(g: Graph) {
@@ -584,6 +789,7 @@ function subscription(g: Graph) {
     .join(
       "",
     )}</select><select name="controllerSessionId" aria-label="主控会话"><option value="">选择主控自由会话</option>${state?.sessions
+    .filter((s) => s.workspaceId === workspaceId || s.id === g.controllerSessionId)
     .filter((s) => s.kind === "free")
     .map(
       (s) =>
@@ -594,19 +800,32 @@ function subscription(g: Graph) {
     )}</select><button class="btn small" type="submit">保存订阅</button></form></section>`;
 }
 function trace(full = false) {
-  return `<section class="panel ${full ? "full-log" : ""}"><div class="panelhead"><strong>运行轨迹 <span class="tiny muted">EVENTS & TOOLS</span></strong>${btn("refresh-events", "↻ 刷新", "small")}</div><div class="tracebody" id="trace" data-scroll="trace">${traceBody(full)}</div></section>`;
+  return `<section class="panel ${full ? "full-log" : ""}"><div class="panelhead"><strong>运行轨迹</strong><div class="row"><span class="tiny muted">${page === "sessions" ? "当前会话" : page === "graphs" ? "当前任务图" : supportsWorkspaces ? "当前工作区" : "当前项目"}</span>${btn("refresh-events", "↻ 刷新", "small")}</div></div><div class="tabs trace-tabs" role="tablist" aria-label="运行轨迹"><button role="tab" aria-selected="${traceTab === "events"}" data-trace-tab="events" class="${traceTab === "events" ? "active" : ""}">事件流</button><button role="tab" aria-selected="${traceTab === "statistics"}" data-trace-tab="statistics" class="${traceTab === "statistics" ? "active" : ""}">调用统计</button></div><div class="tracebody" id="trace" data-scroll="trace">${traceBody(full)}</div></section>`;
 }
 function traceBody(full: boolean) {
-  const list = (full ? events : events.slice(-12)).slice().reverse();
+  if (traceTab === "statistics") return invocationStats();
+  const scoped = currentEvents();
+  const list = (full ? scoped : scoped.slice(-12)).slice().reverse();
+  const calls = currentInvocations();
   return (
     list
-      .map(
-        (e) =>
-          `<button class="traceitem" data-event="${e.id}"><span class="mono muted">${esc(time(e.at))}</span><code>${esc([e.taskId, e.unitId].filter(Boolean).join("/") || e.type)}</code><span class="msg">${esc(e.message)}<br><span class="muted">${esc(e.type)}</span></span></button>`,
-      )
+      .map((e) => {
+        const call = calls.find((c) => c.events.some((item) => item.id === e.id));
+        const label = call?.name ?? eventLabel(e);
+        const phase = e.type.endsWith(".started") ? "运行中" : call ? invocationLabels[call.status] : e.type;
+        return `<button class="traceitem" data-event="${e.id}"><span class="mono muted">${esc(time(e.at))}</span><code>${esc([e.taskId, e.unitId].filter(Boolean).join("/") || (call ? invocationKinds[call.kind] : e.type))}</code><span class="msg">${esc(label)}<br><span class="muted">${esc(phase)}</span></span></button>`;
+      })
       .join("") ||
     empty("暂无运行记录", "真实执行发生后，事件与工具记录会显示在这里。")
   );
+}
+const invocationLabels: Record<InvocationStatus, string> = { running: "运行中", completed: "已完成", failed: "失败", interrupted: "已中断", unknown: "结果未知" };
+const invocationKinds = { tool: "工具", mcp: "MCP", skill: "Skill" };
+function invocationStats() {
+  const rows = invocationStatistics(currentInvocations());
+  const extras: InvocationStatus[] = ["running", "interrupted", "unknown"];
+  const columns = extras.filter((status) => rows.some((r) => r.counts[status]));
+  return `<div class="invocation-statistics">${!invocationPages.has(eventSelection()) ? '<p class="hint">正在读取调用记录…</p>' : rows.length ? `<table><thead><tr><th>类型</th><th>名称</th><th>成功</th><th>失败</th>${columns.map((status) => `<th>${invocationLabels[status]}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr><td>${invocationKinds[r.kind]}</td><td><code>${esc(r.name)}</code></td><td>${r.counts.completed}</td><td>${r.counts.failed}</td>${columns.map((status) => `<td>${r.counts[status]}</td>`).join("")}</tr>`).join("")}</tbody></table>` : '<p class="hint">暂无工具调用记录。</p>'}${!rows.some((r) => r.kind === "skill") ? '<p class="hint">当前记录未提供可统计的 Skill 调用及执行结果。</p>' : ""}</div>`;
 }
 
 const commands = [
@@ -614,6 +833,8 @@ const commands = [
   { name: "model", description: "选择模型和推理强度" },
   { name: "skills", description: "选择本项目可用的技能" },
   { name: "status", description: "查看当前会话和上下文状态" },
+  { name: "sidechat", description: "从最近完整轮次开启只读侧聊，原会话继续运行" },
+  { name: "interview", description: "访谈这个 Agent，收集开发反馈" },
   { name: "help", description: "查看命令与输入说明" },
   { name: "stop", description: "中断当前执行" },
 ];
@@ -622,10 +843,13 @@ function suggestions() {
   if (/^\/[^\s]*$/.test(text))
     return commands
       .filter((c) => c.name.startsWith(text.slice(1)))
-      .map(
-        (c) =>
-          `<button type="button" data-command="${c.name}"><strong>/${c.name}</strong><span>${c.description}</span></button>`,
-      )
+      .filter((c) => session()?.kind !== "task" || !["model", "skills"].includes(c.name))
+      .map((c) => {
+        const reason = c.name === "sidechat" || c.name === "interview"
+          ? observerUnavailable(session())
+          : "";
+        return `<button type="button" data-command="${c.name}" ${reason || requestPending ? "disabled" : ""}><strong>/${c.name}</strong><span>${esc(reason || c.description)}</span></button>`;
+      })
       .join("");
   const match = text.match(/(?:^|\s)\$([^\s$]*)$/);
   if (!match) return "";
@@ -653,22 +877,29 @@ function attachmentView(a: Attachment) {
   const url = projectUrl(`/api/attachments/${enc(a.id)}`);
   return `<a class="attachment" href="${esc(url)}" target="_blank" rel="noopener">${a.kind === "image" ? `<img src="${esc(url)}" alt="${esc(a.name)}" loading="lazy">` : "▧ "}<span>${esc(a.name)} <small>${fmt(a.size / 1024)} KB</small></span></a>`;
 }
-function chatTools() {
-  return events
-    .filter(
-      (e) =>
-        e.sessionId === sessionId && /tool\.|command\.|reasoning/.test(e.type),
-    )
-    .map(
-      (e) =>
-        `<details class="tool-detail" data-detail="tool-${e.id}"><summary><span>${esc(e.type)}</span> · ${esc(e.message.slice(0, 130))}</summary><pre>${json(e.detail ?? e.message)}</pre></details>`,
-    )
-    .join("");
+function invocationView(call: Invocation) {
+  return `<details class="tool-detail invocation ${call.status}" data-detail="call-${esc(call.key)}"><summary><code>${esc(call.name)}</code><span class="invocation-state">${invocationLabels[call.status]}</span></summary><pre>${json(call.detail)}</pre></details>`;
+}
+function chatTimeline(s: Session) {
+  const entries = sessionTimeline(s.messages, currentInvocations().filter((c) => c.sessionId === s.id), currentEvents());
+  const body = entries.map((entry) => {
+    if (entry.kind === "invocation") return invocationView(entry.invocation);
+    const m = entry.message;
+    return `<article class="message ${esc(m.role)}"><div class="messageheader">${esc(m.role === "user" ? "你" : m.role === "assistant" ? "Codex" : m.role === "mailbox" ? "Mailbox" : "系统")} · ${esc(time(m.at))}${m.delivery ? ` · ${m.delivery === "steer" ? "已引导" : "来自队列"}` : ""}</div><p>${esc(m.text)}</p><div class="message-attachments">${(m.attachments ?? []).map(attachmentView).join("")}</div>${(m.skills ?? []).map((skill) => `<span class="badge">$${esc(skill.name)}</span>`).join("")}</article>`;
+  }).join("");
+  return (body || (s.executionOwner?.kind === "external" ? empty("外部主控", "在 Codex Desktop 对话中操作，并主动读取 Loom 通知。") : empty("开始对话", "输入目标或问题，或用 / 查看命令。"))) + (s.status === "running" ? '<div class="stream-indicator"><span></span> Codex 正在工作…</div>' : "");
 }
 function composer(s: Session) {
   if (s.executionOwner?.kind === "external")
     return '<div class="notice" data-external-controller>外部主控 · Codex Desktop。请在桌面对话中操作。Loom 只保存通知供主控主动读取和确认，不会启动或恢复此对话。</div>';
   const d = draft(s);
+  if (s.kind === "task")
+    return `<form class="composer" data-form="chat" data-session-owner="${esc(s.id)}" data-project-owner="${esc(projectId)}">
+      <div class="notice">Task 会话由调度器管理。输入 / 执行本地命令，使用 /sidechat 开启只读侧聊。任务消息请通过成员收发件箱发送。</div>
+      <div id="composer-suggestions" class="suggestions" role="listbox" aria-label="命令">${suggestions()}</div>
+      <textarea id="chat-prompt-${esc(s.id)}" name="text" aria-label="命令" placeholder="/ 查看命令，/sidechat 开启只读侧聊">${esc(d.text)}</textarea>
+      <div class="composer-controls"><span class="tiny muted">Ctrl / ⌘ + Enter</span><button class="btn primary" type="submit" ${requestPending ? "disabled" : ""}>执行命令 ↑</button></div>
+    </form>`;
   const active = state?.executions?.find(
     (e) => e.sessionId === s.id && ["running", "starting"].includes(e.status),
   );
@@ -687,16 +918,13 @@ function composer(s: Session) {
 }
 const observer = (s: Session) =>
   s.kind === "sidechat" || s.kind === "interview";
-function observerActions(s?: Session) {
-  if (!s || observer(s) || s.executionOwner?.kind === "external") return "";
-  const available =
-    !!s.lastCompletedTurnId && !!state?.runtime.capabilities.fork;
-  const reason = !state?.runtime.capabilities.fork
-    ? "当前运行时不支持独立分叉"
-    : !s.lastCompletedTurnId
-      ? "首个完整轮次结束后可开启"
-      : "从最近已完成轮次创建独立只读会话";
-  return `<div class="observer-actions"><div class="row wrap"><button class="btn small" data-sidechat="${esc(s.id)}" ${available ? "" : "disabled"} title="${esc(reason)}">打开只读侧聊</button><button class="btn small" data-interview="${esc(s.id)}" ${available ? "" : "disabled"} title="${esc(reason)}">访谈这个 Agent</button></div><p class="tiny muted">${esc(reason)}。原会话继续运行。</p></div>`;
+function observerUnavailable(s?: Session) {
+  if (!s) return "请先选择来源会话";
+  if (observer(s)) return "侧聊和访谈会话不能再次创建分支";
+  if (s.executionOwner?.kind === "external") return "请在 Codex Desktop 原对话中操作";
+  if (!state?.runtime.capabilities.fork) return "当前运行时不支持独立分叉";
+  if (!s.lastCompletedTurnId) return "首个完整轮次结束后可开启";
+  return "";
 }
 function observerSource(s: Session) {
   const source = s.source;
@@ -736,7 +964,7 @@ function preparationHistory(sid: string) {
     .join("")}</div>`;
 }
 function feedbackPage() {
-  const feedback = state?.feedback ?? [];
+  const feedback = workspaceFeedback();
   const trigger = {
     manual: "手动访谈",
     completed: "任务完成",
@@ -770,22 +998,96 @@ function developerPage() {
   ];
   return `${intro("开发者选项", "自动访谈使用独立只读会话。原 Agent 的上下文、信件和调度状态保持独立。", '<button class="btn" data-page="feedback">打开意见箱</button>')}<section class="panel developer-settings"><div class="panelhead"><strong>自动访谈</strong>${badge(settings.enabled ? "running" : "idle", settings.enabled ? "已启用" : "已关闭")}</div><form class="panelbody" data-form="interviews"><label class="checkrow"><input type="checkbox" name="interview-enabled" ${settings.enabled ? "checked" : ""}>启用自动访谈</label><p class="hint">默认关闭。关闭后仍可手动访谈；不会中断已经发起的访谈。</p><div class="grid2"><label class="checkrow"><input type="checkbox" name="interview-completed" ${settings.onCompleted ? "checked" : ""}>Task 完工后访谈</label><label class="checkrow"><input type="checkbox" name="interview-blocked" ${settings.onBlocked ? "checked" : ""}>Task 阻塞后访谈</label></div>${area("interview-prompt", "访谈提示词", settings.prompt, "required rows=7")}<div class="grid2"><label class="field"><span>访谈模型</span><select name="interview-model" id="interview-model">${modelOptions(settings.model, "沿用来源 Agent")}</select></label><label class="field"><span>推理强度</span><select name="interview-reasoning" id="interview-reasoning">${nativeReasonOptions(settings.model, settings.reasoning, settings.model ? "模型默认强度" : "沿用来源 Agent")}</select></label></div><fieldset class="interview-skills"><legend>访谈 Skills</legend><p class="hint">仅加载到访谈会话，不会加载到源 Agent。</p>${skillCatalog.map((skill) => `<label class="checkrow"><input type="checkbox" name="interview-skill-${enc(skill.path)}" data-interview-skill="${esc(skill.path)}" data-skill-name="${esc(skill.name)}" ${settings.skills.some((s) => s.path === skill.path) ? "checked" : ""}><span><strong>$${esc(skill.name)}</strong><small>${esc(skill.description)}</small></span></label>`).join("") || `<p class="hint">${optionsLoading ? "正在加载可用 Skills…" : "未发现可用 Skills。"}</p>`}</fieldset><p class="notice spaced">只访谈已有完整轮次的 Agent。访谈失败不会阻塞或恢复源任务；访谈的耗时和 tokens 单独计为开发开销。</p>${options.warnings.map((warning) => `<p class="notice amber spaced">${esc(warning)}</p>`).join("")}<button type="submit" class="btn primary spaced">保存访谈设置</button></form></section>`;
 }
-function sessionsPage() {
+function sessionWorkspaceGroups() {
+  if (!state) return "";
+  const rendered = new Set<string>();
+  const entry = (s: Session): string => {
+    if (rendered.has(s.id)) return "";
+    rendered.add(s.id);
+    const children = state!.sessions.filter((child) => workspaceSessionParent(child)?.id === s.id && !rendered.has(child.id));
+    const key = workspaceTreeKey("session", s.id);
+    const label = s.kind === "sidechat" ? "侧聊" : s.kind === "interview" ? "访谈" : s.child ? s.child.access === "write" ? "可写 Agent" : "只读 Agent" : "";
+    return `<div class="workspace-session-node" data-tree-session="${esc(s.id)}"><div class="workspace-tree-row">${children.length ? workspaceTreeToggle(key, s.title) : '<span class="workspace-tree-spacer" aria-hidden="true"></span>'}<button class="sessionitem ${page === "sessions" && s.id === sessionId ? "active" : ""}" data-session="${esc(s.id)}"><div class="row between"><h3>${esc(s.title)}</h3>${badge(s.status, s.executionOwner?.kind === "external" ? "外部主控" : undefined)}</div><small>${label ? `${label} · ` : ""}${esc(s.model || "默认模型")} · ${s.turns} turns${s.queue?.length ? ` · ${s.queue.length} 条待发送` : ""}</small></button></div>${children.length ? `<div class="workspace-session-children" ${workspaceTreeContent(key)}>${children.map(entry).join("")}</div>` : ""}</div>`;
+  };
+  return (state.workspaces ?? []).map((w) => {
+    const sessions = state!.sessions.filter((s) => s.workspaceId === w.id);
+    const roots = sessions.filter((s) => !workspaceSessionParent(s));
+    const graphs = state!.graphs.filter((g) => g.workspaceId === w.id);
+    const free = roots.filter((s) => s.kind === "free").map(entry).join("");
+    const graphEntries = graphs.map((g) => {
+      const tasks = g.tasks.map((t) => {
+        const agents = t.units.map((u) => {
+          const s = sessions.find((s) => s.id === u.sessionId);
+          return s ? workspaceSessionParent(s) ? "" : entry(s) : `<div class="workspace-unit"><span>${esc(u.name)}</span>${badge(u.status)}</div>`;
+        }).join("");
+        const others = roots.filter((s) => s.kind === "task" && s.graphId === g.id && s.taskId === t.id).map(entry).join("");
+        const key = workspaceTreeKey("task", g.id, t.id);
+        return `<section class="workspace-task-group" data-tree-task="${esc(t.id)}"><div class="workspace-tree-row">${workspaceTreeToggle(key, `${t.id} ${t.title}`)}<button class="workspace-task-link" data-open-graph="${esc(g.id)}" data-open-task="${esc(t.id)}"><span>${esc(t.id)} · ${esc(t.title)}</span>${badge(t.status)}</button></div><div ${workspaceTreeContent(key)}>${agents}${others}</div></section>`;
+      }).join("");
+      const remaining = roots.filter((s) => s.kind === "task" && s.graphId === g.id).map(entry).join("");
+      const key = workspaceTreeKey("graph", g.id);
+      return `<section class="workspace-graph-group" data-tree-graph="${esc(g.id)}"><div class="workspace-tree-row">${workspaceTreeToggle(key, g.name)}<button class="workspace-graph-link ${page === "graphs" && graphId === g.id ? "active" : ""}" data-open-graph="${esc(g.id)}"><span>◇ ${esc(g.name)}</span>${badge(g.status)}</button></div><div ${workspaceTreeContent(key)}>${tasks}${remaining}</div></section>`;
+    }).join("");
+    const otherRoots = roots.map(entry).join("");
+    const remaining = sessions.map((s) => {
+      if (rendered.has(s.id)) return "";
+      const visited = new Set<string>([s.id]);
+      let root = s;
+      let parent = workspaceSessionParent(root);
+      while (parent && !visited.has(parent.id) && !rendered.has(parent.id)) {
+        visited.add(parent.id);
+        root = parent;
+        parent = workspaceSessionParent(root);
+      }
+      return entry(root);
+    }).join("");
+    const key = workspaceTreeKey("workspace", w.id);
+    return `<section class="workspace-session-group ${w.id === workspaceId ? "selected" : ""}" data-workspace-group="${esc(w.id)}"><header class="workspace-session-heading">${workspaceTreeToggle(key, w.name)}<button class="workspace-heading-link" data-workspace="${esc(w.id)}" title="${esc(w.path)}"><h3>${esc(w.name)}</h3><small>${w.kind === "main" ? "主工作区" : w.kind === "legacy" ? "历史工作区" : "独立工作区"}</small></button>${w.kind !== "legacy" ? `<div class="row"><button class="btn small" data-new-workspace-session="${esc(w.id)}" aria-label="在 ${esc(w.name)} 新建对话">＋ 对话</button><button class="btn small" data-new-workspace-graph="${esc(w.id)}" aria-label="在 ${esc(w.name)} 新建 Graph">＋ 图</button></div>` : ""}</header><div class="workspace-session-entries" ${workspaceTreeContent(key)}>${free}${graphEntries}${otherRoots || remaining ? `<div class="sessionsection">其他会话</div>${otherRoots}${remaining}` : ""}${!sessions.length && !graphs.length ? '<p class="workspace-session-empty">暂无对话或任务图</p>' : ""}</div></section>`;
+  }).join("");
+}
+function workspacesPage() {
+  const current = workspace();
+  const activeSessions = workspaceSessions().filter((s) => s.status === "running").length;
+  const activeGraphs = workspaceGraphs().filter((g) => g.status === "running" || g.status === "pausing").length;
+  const branch = workspaceStatus?.status === "ready" ? workspaceStatus.branch ?? "Detached HEAD"
+    : current && current.kind !== "main" ? current.branch : supportsWorkspaces ? "分支读取中" : "原项目目录";
+  const location = current ? `<div class="workspace-context"><div class="row wrap"><strong>${esc(current.name)}</strong><code>${esc(branch)}</code><span class="tiny muted">${workspaceStatus?.status === "ready" ? workspaceStatus.dirty ? "有未提交修改" : "工作目录干净" : workspaceStatus?.status === "unavailable" ? esc(workspaceStatus.error) : supportsWorkspaces ? "正在读取目录状态" : "重启服务后显示目录状态"}</span><span class="tiny muted">${activeSessions || activeGraphs ? `${activeSessions} 个会话 · ${activeGraphs} 个图运行中` : "空闲"}</span></div><small title="${esc(current.path)}">${esc(current.path)}</small></div>` : "";
+  const detail = page === "sessions" ? sessionContent() : page === "graphs" ? graphsPage() : current ?
+    `<section class="panel workspace-overview"><div class="panelhead"><strong>${esc(current.name)}</strong><span class="tiny muted">${current.kind === "legacy" ? "历史工作区" : "工作区"}</span></div><div class="panelbody"><p>选择左侧对话继续发送消息，或打开任务图查看进度。</p><p class="hint">${esc(current.path)}</p>${workspaceStatus?.status === "ready" ? `<p class="hint">${esc(workspaceStatus.branch ?? "Detached HEAD")}${workspaceStatus.dirty ? " · 有未提交修改" : ""}</p>` : ""}${current.kind === "legacy" ? '<p class="hint">此工作区由旧版任务图的独立工作目录迁移而来。展开左侧工作区可查看其中的任务图；新功能请创建独立 Workspace。</p>' : `<div class="row wrap spaced"><button class="btn" data-new-workspace-session="${esc(current.id)}">＋ 对话</button><button class="btn" data-new-workspace-graph="${esc(current.id)}">＋ Graph</button></div>`}</div></section>` : empty("创建工作区", "在工作区里组织对话和任务图。");
+  return `${intro("Workspaces", "按工作区组织对话和任务图。直接选择任意对话发送消息。", btn("new-workspace", "＋ Workspace", "primary", !supportsWorkspaces))}${!supportsWorkspaces ? '<div class="notice amber workspace-version-notice" role="status">当前服务尚未启用工作区。已有会话和任务图显示在主工作区，可继续使用；重启 Loom 服务后可创建独立 Workspace。</div>' : ""}<div class="sessionlayout workspaces-layout"><nav class="panel sessionlist workspace-tree" aria-label="工作区、对话与任务图" data-scroll="workspaces">${sessionWorkspaceGroups()}</nav><div class="workspace-detail">${location}${detail}</div></div>`;
+}
+const resourceStateNames: Record<SessionResources["state"], string> = {
+  unavailable: "不支持资源管理", starting: "启动中", active: "正在执行", idle: "空闲保留",
+  closing: "清理中", closed: "已关闭", failed: "异常",
+};
+function sessionResourcesPanel(s: Session) {
+  const view = resourceView(s.id);
+  const snapshot = view.snapshot;
+  const blocked = !!view.pending || snapshot?.state === "closing";
+  const execution = state?.executions?.filter((item) => item.sessionId === s.id).at(-1);
+  const canClose = !!snapshot && snapshot.state !== "unavailable" &&
+    (snapshot.state !== "closed" || snapshot.processes.length > 0);
+  return `<section class="session-resources">
+    <button type="button" class="resource-summary" data-action="toggle-resources" aria-expanded="${view.open}" aria-controls="session-resource-body"><span aria-hidden="true">${view.open ? "▾" : "▸"}</span>会话资源</button>
+    ${view.open ? `<div id="session-resource-body" class="resource-body" aria-busy="${!!view.pending}">
+      <div class="row wrap between"><div class="row wrap tiny"><span>本轮 ${execution ? badge(execution.status) : "未执行"}</span><span>资源状态 ${snapshot ? esc(resourceStateNames[snapshot.state]) : view.pending ? "正在查询" : "未读取"}</span></div>${btn("refresh-resources", view.pending === "refresh" ? "查询中…" : "刷新", "small", !!view.pending)}</div>
+      ${view.error ? `<p class="resource-error dangertext" role="alert">${esc(view.error)} · 可点击刷新重试。</p>` : ""}
+      ${snapshot?.error ? `<p class="resource-error dangertext" role="alert">${esc(snapshot.error)}</p>` : ""}
+      ${snapshot ? snapshot.state === "unavailable" ? '<p class="tiny muted">当前运行时无法提供会话进程管理。</p>' : `<ul class="resource-list">${snapshot.processes.map((process) => `<li><div class="grow"><strong class="resource-name">${esc(process.name)}</strong><div class="tiny muted"><span class="mono">PID ${process.pid}</span> · ${process.role === "backend" ? "Codex 后端" : "会话进程"} · ${fmt(process.memoryBytes / 1048576)} MiB</div></div>${process.role === "descendant" ? `<button type="button" class="btn small danger" data-stop-resource="${esc(process.id)}" ${blocked ? "disabled" : ""} aria-label="停止 ${esc(process.name)}，PID ${process.pid}">停止进程</button>` : ""}</li>`).join("") || `<li class="tiny muted">${snapshot.error ? "暂时无法确认进程列表。" : "当前没有受管理的进程。"}</li>`}</ul>
+      <p class="tiny muted">后台进程会跨轮保留，空闲后自动回收。列表按会话归属显示，尚未关联具体工具调用。</p>
+      <div class="resource-cleanup row wrap between"><p class="tiny muted grow">清理会关闭本会话的运行时和后台进程，并中断执行中的本轮。</p>${btn("close-resources", view.pending === "close" ? "正在清理…" : s.status === "running" ? "停止本轮并清理资源" : "清理全部资源", "small danger", blocked || !canClose)}</div>` : ""}
+      ${view.updatedAt ? `<p class="tiny muted resource-updated">上次读取 ${esc(new Date(view.updatedAt).toLocaleTimeString("zh-CN"))} · 展开时每 5 秒刷新</p>` : ""}
+    </div>` : ""}
+  </section>`;
+}
+function sessionContent() {
   const s = session();
-  const list = (kind: Session["kind"]) =>
-    state?.sessions
-      .filter((x) => x.kind === kind && !x.child)
-      .map(
-        (x) =>
-          `<button class="sessionitem ${x.id === sessionId ? "active" : ""}" data-session="${esc(x.id)}"><div class="row between"><h3>${esc(x.title)}</h3>${badge(x.status, x.executionOwner?.kind === "external" ? "外部主控" : undefined)}</div><small>${esc(x.model || "默认模型")} · ${x.turns} turns${x.queue?.length ? ` · ${x.queue.length} 条待发送` : ""}</small></button>`,
-      )
-      .join("") || '<div class="empty">暂无会话</div>';
   const queue = s?.queue ?? [];
-  return `${intro("Sessions", "对话、工具记录和待发送消息。切换项目后执行继续运行。", btn("new-session", "＋ 自由会话", "primary"))}<div class="sessionlayout"><section class="panel sessionlist" data-scroll="sessions"><div class="sessionsection">自由会话</div>${list("free")}<div class="sessionsection">TASK 会话</div>${state?.sessions.filter((item) => item.kind === "task" && !item.child).map((item) => sessionTree(state!, item.id)).join("") || empty("暂无 Task 会话", "启动任务后显示会话树") }<div class="sessionsection">只读侧聊</div>${list("sidechat")}<div class="sessionsection">开发者访谈</div>${list("interview")}</section><div class="stack">${s ? `<section class="panel chat-panel"><div class="chathead"><div class="row between"><h2>${esc(s.title)}</h2>${badge(s.status, s.executionOwner?.kind === "external" ? "外部主控" : undefined)}</div>${observerActions(s)}<div class="tiny muted">${esc(s.model || "运行时默认模型")} · ${esc(s.reasoning || "默认推理")} · ${s.turns} turns</div><div class="chat-usage">输入 ${fmt(s.metrics.usage.inputTokens)} <span>缓存 ${fmt(s.metrics.usage.cachedInputTokens)}</span> 输出 ${fmt(s.metrics.usage.outputTokens)} <span>${esc(contextLabel(s))}</span></div></div>${observerSource(s)}${agenticSession(state!, s)}<div class="messages" data-scroll="messages-${esc(s.id)}">${s.messages.length ? s.messages.map((m) => `<article class="message ${esc(m.role)}"><div class="messageheader">${esc(m.role === "user" ? "你" : m.role === "assistant" ? "Codex" : m.role === "mailbox" ? "Mailbox" : "系统")} · ${esc(time(m.at))}${m.delivery ? ` · ${m.delivery === "steer" ? "已引导" : "来自队列"}` : ""}</div><p>${esc(m.text)}</p><div class="message-attachments">${(m.attachments ?? []).map(attachmentView).join("")}</div>${(m.skills ?? []).map((skill) => `<span class="badge">$${esc(skill.name)}</span>`).join("")}</article>`).join("") : (s.executionOwner?.kind === "external" ? empty("外部主控", "在 Codex Desktop 对话中操作，并主动读取 Loom 通知。") : empty("开始对话", "输入目标或问题，或用 / 查看命令。"))}${s.status === "running" ? '<div class="stream-indicator"><span></span> Codex 正在工作…</div>' : ""}</div><div id="chat-tools" class="chat-tools">${chatTools()}</div>${sessionError(s)}${queue.length || s.queuePaused ? `<section class="queued-messages"><div class="row between"><strong>待发送 ${queue.length}${s.queuePaused ? " · 已暂停" : ""}</strong>${s.queuePaused && s.executionOwner?.kind !== "external" ? btn("continue-queue", "继续队列", "small", s.status === "running" || !queue.length) : ""}</div>${queue.map((q, i) => `<div class="queued-message"><span class="muted">${i + 1}</span><div class="grow"><p>${esc(q.input.text || "附件消息")}</p><small>${q.attachments.map((a) => esc(a.name)).join(" · ")}${q.input.skills?.map((skill) => ` $${esc(skill.name)}`).join("") ?? ""}</small></div><button class="btn small" data-cancel-queue="${esc(q.id)}">取消</button></div>`).join("")}</section>` : ""}${s.kind !== "task" ? composer(s) : '<div class="notice">Task 会话由调度器管理。请通过成员收发件箱发送报告文件，或在 Graph 中暂停和编辑任务。</div>'}<details class="session-context" data-detail="session-context-${esc(s.id)}"><summary>Context · 本次会话输入记录</summary>${preparationHistory(s.id)}</details></section>` : empty("创建一个自由会话", "自由会话不属于任务图，适合调查、讨论与临时工作。", btn("new-session", "＋ 创建自由会话", "primary"))}${trace()}</div></div>`;
+  return `<div class="stack">${s ? `<section class="panel chat-panel"><div class="chathead"><div class="row between"><h2>${esc(s.title)}</h2>${badge(s.status, s.executionOwner?.kind === "external" ? "外部主控" : undefined)}</div><div class="tiny muted">${esc(s.model || "运行时默认模型")} · ${esc(s.reasoning || "默认推理")} · ${s.turns} turns</div><div class="chat-usage">输入 ${fmt(s.metrics.usage.inputTokens)} <span>缓存 ${fmt(s.metrics.usage.cachedInputTokens)}</span> 输出 ${fmt(s.metrics.usage.outputTokens)} <span>${esc(contextLabel(s))}</span></div></div>${sessionResourcesPanel(s)}${observerSource(s)}${agenticSession(state!, s)}<div id="chat-timeline" class="messages" data-scroll="messages-${esc(s.id)}">${chatTimeline(s)}</div>${sessionError(s)}${queue.length || s.queuePaused ? `<section class="queued-messages"><div class="row between"><strong>待发送 ${queue.length}${s.queuePaused ? " · 已暂停" : ""}</strong>${s.queuePaused && s.executionOwner?.kind !== "external" ? btn("continue-queue", "继续队列", "small", s.status === "running" || !queue.length) : ""}</div>${queue.map((q, i) => `<div class="queued-message"><span class="muted">${i + 1}</span><div class="grow"><p>${esc(q.input.text || "附件消息")}</p><small>${q.attachments.map((a) => esc(a.name)).join(" · ")}${q.input.skills?.map((skill) => ` $${esc(skill.name)}`).join("") ?? ""}</small></div><button class="btn small" data-cancel-queue="${esc(q.id)}">取消</button></div>`).join("")}</section>` : ""}${composer(s)}<details class="session-context" data-detail="session-context-${esc(s.id)}"><summary>Context · 本次会话输入记录</summary>${preparationHistory(s.id)}</details></section>` : empty("创建一个自由会话", "自由会话不属于任务图，适合调查、讨论与临时工作。", btn("new-session", "＋ 创建自由会话", "primary"))}${trace()}</div>`;
 }
 function mailboxPage() {
   const letters =
-    state?.letters.filter(
+    workspaceLetters().filter(
       (l) =>
         !mailAddress ||
         (mailDirection === "sent"
@@ -809,7 +1111,10 @@ function mailboxPage() {
   }</section>`;
 }
 function statsPage() {
-  return state ? statistics(state, statsFilters) : "";
+  return state ? statistics({ ...state, graphs: workspaceGraphs(), sessions: workspaceSessions(),
+    letters: workspaceLetters(), feedback: workspaceFeedback(),
+    executions: state.executions?.filter((e) => workspaceSessions().some((s) => s.id === e.sessionId)),
+  }, statsFilters) : "";
 }
 function templatesPage() {
   return `${intro("Agent templates", "跨项目复用的成员配置。库更新不会回写已有任务的配置快照。", btn("new-template", "＋ 创建模板", "primary"), "PERSONAL LIBRARY / AGENTS")}<div class="grid3">${state?.agentTemplates.map((a) => `<article class="card"><span class="badge">v${a.version} · ${a.readOnly ? "只读" : "可写工作区"}</span><h2>${esc(a.name)}</h2><p>${esc(delegationLabel(a.delegation))}</p><p>${esc(a.model || "运行时默认模型")} · ${esc(a.reasoning || "默认推理")}</p><div class="librarymeta">${a.skills.map((s) => `<span class="badge">${esc(s)}</span>`).join("") || '<span class="tiny muted">未指定 skills</span>'}</div><p>${esc(a.prompt.slice(0, 150))}${a.prompt.length > 150 ? "…" : ""}</p><button class="btn" data-template="${esc(a.id)}">编辑模板 ↗</button></article>`).join("")}</div>`;
@@ -855,6 +1160,7 @@ function nativeReasonOptions(model = "", selected = "", defaultLabel?: string) {
   return `<option value="">${esc(defaultLabel ?? (catalog?.defaultReasoning ? "默认推理强度" : "沿用会话推理强度"))}</option>${(catalog?.reasoning ?? []).map((r) => `<option value="${esc(r)}" ${r === selected ? "selected" : ""}>${esc(r)}</option>`).join("")}${selected && !catalog?.reasoning.includes(selected as Reasoning) ? `<option value="${esc(selected)}" selected>${esc(selected)}（当前配置）</option>` : ""}`;
 }
 function sessionModal() {
+  if (workspace()?.kind === "legacy") throw new Error("请创建新的 Workspace 开发，历史工作区保留原 Graph 执行。");
   modal(
     "创建自由会话",
     field(
@@ -867,17 +1173,28 @@ function sessionModal() {
     "new-session",
     "创建会话",
   );
+  dialog.querySelector<HTMLFormElement>("form")!.dataset.workspaceOwner = workspaceId;
+  dialog.querySelector<HTMLFormElement>("form")!.dataset.workspaceGeneration = String(workspaceGeneration);
+}
+function workspaceModal() {
+  if (!supportsWorkspaces) throw new Error("重启 Loom 服务后可创建独立 Workspace。");
+  modal("创建 Workspace",
+    `${field("name", "工作区名称", "", 'required maxlength="120" placeholder="例如：登录功能"')}<label class="field"><span>从哪个工作区开始</span><select name="sourceWorkspaceId">${state?.workspaces?.map((w) => `<option value="${esc(w.id)}" ${w.id === workspaceId ? "selected" : ""}>${esc(w.name)}</option>`).join("")}</select></label><p class="hint">从所选工作区的已提交版本创建独立分支和代码目录。创建后，对话和任务图自动归属这里。</p>`,
+    "new-workspace", "创建 Workspace");
 }
 function taskFields(input: TaskInput, index: number, existing: Task[] = []) {
   return `<div class="taskrow" data-task-row><header><strong>Task ${index + 1}</strong><button type="button" class="btn small danger" data-remove-row>移除</button></header><div class="grid2">${field("id", "稳定 ID", input.id ?? `T${String(index + 1).padStart(2, "0")}`, 'required pattern="[A-Za-z0-9_\\-]+"')}${field("title", "任务名称", input.title, "required")}</div>${area("goal", "目标与验收要求", input.goal, "required")}<div class="grid2"><label class="field"><span>Task type</span><select name="taskTypeId">${state?.taskTypes.map((t) => `<option value="${esc(t.id)}" ${input.taskTypeId === t.id ? "selected" : ""}>${esc(t.name)} · v${t.version}</option>`).join("")}</select></label>${field("deps", "依赖任务 ID（逗号分隔）", input.deps.join(", "), `placeholder="${esc(existing.map((t) => t.id).join(", ") || "例如 T01, T02")}"`)}</div><label class="checkrow"><input name="newWorktree" type="checkbox" checked disabled>独立 worktree <span class="tiny muted">首版使用独立任务工作区</span></label></div>`;
 }
 function graphModal() {
+  if (workspace()?.kind === "legacy") throw new Error("请创建新的 Workspace 开发，历史工作区保留原 Graph 执行。");
   modal(
     "创建任务图",
     `<div class="grid2">${field("name", "Graph 名称", "", 'required placeholder="例如：认证流程改造"')}${field("concurrency", "并行任务上限", "2", 'type="number" min="1" max="8" required')}</div>${field("integrationCommand", "合并后验证命令（可选）", "", 'placeholder="例如 npm test"')}<p class="hint">在每个实际合并候选中运行；成功且代码未被改动才发布。留空表示未配置验证命令。</p><div id="task-rows">${taskFields({ title: "", goal: "", deps: [], taskTypeId: state?.taskTypes[0]?.id ?? "", newWorktree: true }, 0)}</div><button type="button" class="btn" data-action="add-row">＋ 添加任务</button><p class="hint">任务 ID 保持稳定；依赖必须存在且不能成环。创建后可先检查任务图，再启动执行。</p>`,
     "new-graph",
     "创建 Graph",
   );
+  dialog.querySelector<HTMLFormElement>("form")!.dataset.workspaceOwner = workspaceId;
+  dialog.querySelector<HTMLFormElement>("form")!.dataset.workspaceGeneration = String(workspaceGeneration);
 }
 function taskModal(edit: boolean) {
   const t = task();
@@ -925,7 +1242,7 @@ function unitModal(id: string) {
   const pending = !!accepted && accepted.revision < t.configRevision;
   modal(
     u.name,
-    `<div class="row between">${badge(u.status)}<span class="tiny muted">${u.kind === "command" ? "命令执行" : u.readOnly ? "只读 Agent" : "工作区可写 Agent"}</span><button class="btn small" data-unit="${esc(u.id)}">刷新详情</button></div><div class="rule">地址 <code>${esc(`${g.id}/${t.id}/${u.id}`)}</code></div><h3 class="spaced">Config</h3><div class="config-grid"><section><h4>声明配置 · v${t.configRevision}</h4><div class="rule">模型 ${esc(u.model || "运行时默认")} · 推理 ${esc(u.reasoning || "默认")}</div><div class="rule">Skills ${u.skills.map(esc).join("、") || "未指定"}</div><div class="rule">${esc(delegationLabel(u.delegation))}</div><div class="rule">权限 ${u.readOnly ? "只读" : "工作区可写"}</div><div class="rule">工作目录 ${esc(t.workspace?.path ?? "依赖交付后准备")}</div><p class="hint">返修、再审默认沿用原 session。</p>${u.command ? `<pre class="report">${esc(u.command)}</pre>` : ""}</section><section><h4>已接受配置${accepted ? ` · v${accepted.revision}` : ""}</h4>${accepted ? `<div class="rule">模型 ${esc(accepted.model || "运行时默认")} · 推理 ${esc(accepted.reasoning || "默认")}</div><div class="rule">Skills ${accepted.skills.map(esc).join("、") || "未指定"}</div><div class="rule">${esc(delegationLabel(accepted.delegation))}</div><div class="rule">权限 ${accepted.readOnly ? "只读" : "工作区可写"}</div><div class="rule">工作目录 ${esc(accepted.cwd)}</div>` : `<p class="hint">${u.kind === "command" ? "命令 Unit 不做模型会话初始化。" : "尚未收到运行时接收回执。"}</p>`}${pending ? '<p class="notice amber">声明配置已更新，等待下一次执行接受。当前 session 尚未应用此版本。</p>' : ""}</section></div><h3 class="spaced">Context</h3><details class="context-input"><summary>配置来源预览 · 尚不代表已注入</summary><h4 class="spaced">初始 prompt</h4><pre class="report">${esc(u.prompt || "未指定额外 prompt")}</pre><h4 class="spaced">上下文选择</h4><pre class="jsondetail">${json(u.context ?? {})}</pre></details>${u.sessionId ? preparationHistory(u.sessionId) : '<p class="hint">首次运行前会根据配置组装上下文。</p>'}${s?.error ? `<p class="notice amber">${esc(s.error)}</p>` : ""}<div class="spaced">${u.sessionId ? `<button class="btn primary" data-open-session="${esc(u.sessionId)}">查看会话 ↗</button>` : '<span class="muted">成员尚未创建会话</span>'}</div>${s ? agenticSession(state!, s) : ""}${observerActions(s)}`,
+    `<div class="row between">${badge(u.status)}<span class="tiny muted">${u.kind === "command" ? "命令执行" : u.readOnly ? "只读 Agent" : "工作区可写 Agent"}</span><button class="btn small" data-unit="${esc(u.id)}">刷新详情</button></div><div class="rule">地址 <code>${esc(`${g.id}/${t.id}/${u.id}`)}</code></div><h3 class="spaced">Config</h3><div class="config-grid"><section><h4>声明配置 · v${t.configRevision}</h4><div class="rule">模型 ${esc(u.model || "运行时默认")} · 推理 ${esc(u.reasoning || "默认")}</div><div class="rule">Skills ${u.skills.map(esc).join("、") || "未指定"}</div><div class="rule">${esc(delegationLabel(u.delegation))}</div><div class="rule">权限 ${u.readOnly ? "只读" : "工作区可写"}</div><div class="rule">工作目录 ${esc(t.workspace?.path ?? "依赖交付后准备")}</div><p class="hint">返修、再审默认沿用原 session。</p>${u.command ? `<pre class="report">${esc(u.command)}</pre>` : ""}</section><section><h4>已接受配置${accepted ? ` · v${accepted.revision}` : ""}</h4>${accepted ? `<div class="rule">模型 ${esc(accepted.model || "运行时默认")} · 推理 ${esc(accepted.reasoning || "默认")}</div><div class="rule">Skills ${accepted.skills.map(esc).join("、") || "未指定"}</div><div class="rule">${esc(delegationLabel(accepted.delegation))}</div><div class="rule">权限 ${accepted.readOnly ? "只读" : "工作区可写"}</div><div class="rule">工作目录 ${esc(accepted.cwd)}</div>` : `<p class="hint">${u.kind === "command" ? "命令 Unit 不做模型会话初始化。" : "尚未收到运行时接收回执。"}</p>`}${pending ? '<p class="notice amber">声明配置已更新，等待下一次执行接受。当前 session 尚未应用此版本。</p>' : ""}</section></div><h3 class="spaced">Context</h3><details class="context-input"><summary>配置来源预览 · 尚不代表已注入</summary><h4 class="spaced">初始 prompt</h4><pre class="report">${esc(u.prompt || "未指定额外 prompt")}</pre><h4 class="spaced">上下文选择</h4><pre class="jsondetail">${json(u.context ?? {})}</pre></details>${u.sessionId ? preparationHistory(u.sessionId) : '<p class="hint">首次运行前会根据配置组装上下文。</p>'}${s?.error ? `<p class="notice amber">${esc(s.error)}</p>` : ""}<div class="spaced">${u.sessionId ? `<button class="btn primary" data-open-session="${esc(u.sessionId)}">查看会话 ↗</button>` : '<span class="muted">成员尚未创建会话</span>'}</div>${s ? agenticSession(state!, s) : ""}`,
   );
 }
 function resolvePreparationModal(p: Preparation) {
@@ -939,7 +1256,7 @@ function resolvePreparationModal(p: Preparation) {
 function composeModal() {
   const g = graph();
   const addresses =
-    state?.graphs.flatMap((x) =>
+    workspaceGraphs().flatMap((x) =>
       x.tasks.flatMap((t) =>
         t.units
           .filter((u) => u.kind === "agent")
@@ -947,14 +1264,14 @@ function composeModal() {
       ),
     ) ?? [];
   const senders = [
-    ...(state?.sessions
+    ...(workspaceSessions()
       .filter((s) => s.kind === "free")
       .map((s) => `session/${s.id}`) ?? []),
     ...addresses,
   ];
   modal(
     "发送 Letter",
-    `<label class="field"><span>Graph</span><select name="graphId" required>${state?.graphs.map((x) => `<option value="${esc(x.id)}" ${x.id === g?.id ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></label><label class="field"><span>发送者地址</span><select name="from" required>${senders.map((a) => `<option ${a === mailAddress ? "selected" : ""}>${esc(a)}</option>`).join("")}</select></label>${area("to", "收件人地址（可多人，每行一个或逗号分隔）", mailDirection === "inbox" ? mailAddress : "", 'required placeholder="graph/task/unit 或 session/id"')}${field("title", "标题（最多 20 个 Unicode 字符）", "", "required")}${field("path", "报告文件路径", "", 'required placeholder="例如 reports/findings.md"')}<label class="field"><span>投递模式</span><select name="mode"><option value="auto">auto · 按收件状态选择</option><option value="steer" ${state?.runtime.capabilities.inject ? "" : "disabled"}>steer · 活动执行输入${state?.runtime.capabilities.inject ? "" : "（运行时不支持）"}</option><option value="followup">followup · 当前执行结束后续聊</option></select></label><div class="notice">文件必须已存在。服务将固定文件内容，并单独记录每位收件人的投递结果。</div>`,
+    `<label class="field"><span>Graph</span><select name="graphId" required>${workspaceGraphs().map((x) => `<option value="${esc(x.id)}" ${x.id === g?.id ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></label><label class="field"><span>发送者地址</span><select name="from" required>${senders.map((a) => `<option ${a === mailAddress ? "selected" : ""}>${esc(a)}</option>`).join("")}</select></label>${area("to", "收件人地址（可多人，每行一个或逗号分隔）", mailDirection === "inbox" ? mailAddress : "", 'required placeholder="graph/task/unit 或 session/id"')}${field("title", "标题（最多 20 个 Unicode 字符）", "", "required")}${field("path", "报告文件路径", "", 'required placeholder="例如 reports/findings.md"')}<label class="field"><span>投递模式</span><select name="mode"><option value="auto">auto · 按收件状态选择</option><option value="steer" ${state?.runtime.capabilities.inject ? "" : "disabled"}>steer · 活动执行输入${state?.runtime.capabilities.inject ? "" : "（运行时不支持）"}</option><option value="followup">followup · 当前执行结束后续聊</option></select></label><div class="notice">文件必须已存在。服务将固定文件内容，并单独记录每位收件人的投递结果。</div>`,
     "compose",
     "发送信件",
   );
@@ -1127,16 +1444,32 @@ async function submit(form: HTMLFormElement) {
     return;
   }
   if (kind === "new-session") {
+    const owner = form.dataset.workspaceOwner ?? workspaceId;
     const created = await api<Session>("/api/sessions", "POST", {
+      workspaceId: owner,
       title: value(form, "title"),
       model: value(form, "model") || undefined,
       reasoning: value(form, "reasoning") || undefined,
     });
+    if (workspaceId !== owner || Number(form.dataset.workspaceGeneration) !== workspaceGeneration) { await refresh(); return; }
     sessionId = created.id;
     dialog.close();
     page = "sessions";
     await refresh();
-    scheduleEvents();
+    navigate("sessions");
+    return;
+  }
+  if (kind === "new-workspace") {
+    const generation = workspaceGeneration;
+    const created = await api<ProjectWorkspace>("/api/workspaces", "POST", {
+      name: value(form, "name"), sourceWorkspaceId: value(form, "sourceWorkspaceId"),
+    });
+    await refresh();
+    if (generation !== workspaceGeneration) return;
+    dialog.close();
+    await selectWorkspace(created.id);
+    navigate("workspaces");
+    toast("Workspace 已创建");
     return;
   }
   if (kind === "chat-settings") {
@@ -1161,6 +1494,8 @@ async function submit(form: HTMLFormElement) {
       await runCommand(prompt);
       return;
     }
+    if (s.kind === "task")
+      throw new Error("Task 会话仅支持 / 命令。任务消息请通过成员收发件箱发送。");
     if (
       (!prompt && !d.attachments.length && !d.skills.length) ||
       d.uploading ||
@@ -1244,21 +1579,24 @@ async function submit(form: HTMLFormElement) {
     return;
   }
   if (kind === "new-graph") {
+    const owner = form.dataset.workspaceOwner ?? workspaceId;
     const tasks = [...form.querySelectorAll("[data-task-row]")].map(readTask);
     if (!tasks.length) throw new Error("请至少添加一个任务。");
     validateTasks(tasks);
     const created = await api<Graph>("/api/graphs", "POST", {
+      workspaceId: owner,
       name: value(form, "name"),
       concurrency: Number(value(form, "concurrency")),
       integrationCommand: value(form, "integrationCommand").trim() || undefined,
       tasks,
     });
+    if (workspaceId !== owner || Number(form.dataset.workspaceGeneration) !== workspaceGeneration) { await refresh(); return; }
     graphId = created.id;
     taskId = created.tasks[0]?.id ?? "";
     page = "graphs";
     dialog.close();
     await refresh();
-    scheduleEvents();
+    navigate("graphs");
     return;
   }
   if (kind === "new-task" || kind === "edit-task") {
@@ -1358,50 +1696,30 @@ document.addEventListener("click", (event) => {
   void click(el).catch(showError);
 });
 async function click(el: HTMLElement) {
+  if (el.dataset.treeToggle) {
+    const key = el.dataset.treeToggle;
+    if (collapsedWorkspaceNodes.has(key)) collapsedWorkspaceNodes.delete(key);
+    else collapsedWorkspaceNodes.add(key);
+    saveWorkspaceTree();
+    render();
+    app.querySelectorAll<HTMLButtonElement>("[data-tree-toggle]").forEach((toggle) => {
+      if (toggle.dataset.treeToggle === key) toggle.focus({ preventScroll: true });
+    });
+    return;
+  }
+  if (el.dataset.traceTab === "events" || el.dataset.traceTab === "statistics") {
+    traceTab = el.dataset.traceTab;
+    render();
+    return;
+  }
   if (el.dataset.sessionUnit) {
     const source = state?.sessions.find((s) => s.id === el.dataset.sessionUnit);
     if (source?.graphId && source.taskId && source.unitId) {
+      if (source.workspaceId !== workspaceId) await selectWorkspace(source.workspaceId ?? "main");
       graphId = source.graphId;
       taskId = source.taskId;
       navigate("graphs");
       unitModal(source.unitId);
-    }
-    return;
-  }
-  if (el.dataset.sidechat || el.dataset.interview) {
-    if (requestPending) return;
-    const source = el.dataset.sidechat ?? el.dataset.interview!;
-    const owner = projectId;
-    requestPending = true;
-    el.setAttribute("disabled", "");
-    try {
-      let createdId: string | undefined;
-      if (el.dataset.sidechat) {
-        const created = await api<Session>(
-          `/api/sessions/${enc(source)}/sidechats`,
-          "POST",
-          {},
-        );
-        createdId = created.id;
-      } else {
-        const feedback = await api<Feedback>(
-          `/api/sessions/${enc(source)}/interviews`,
-          "POST",
-          {},
-        );
-        createdId = feedback.sessionId;
-      }
-      dialog.close();
-      if (createdId) {
-        sessionId = createdId;
-        page = "sessions";
-      } else page = "feedback";
-      await refresh();
-      render(false);
-      scheduleEvents();
-    } finally {
-      requestPending = false;
-      if (owner === projectId) el.removeAttribute("disabled");
     }
     return;
   }
@@ -1414,6 +1732,26 @@ async function click(el: HTMLElement) {
   }
   if (el.dataset.project) {
     await selectProject(el.dataset.project);
+    return;
+  }
+  if (el.dataset.workspace) {
+    await selectWorkspace(el.dataset.workspace);
+    navigate("workspaces");
+    return;
+  }
+  if (el.dataset.newWorkspaceSession || el.dataset.newWorkspaceGraph) {
+    await selectWorkspace(el.dataset.newWorkspaceSession ?? el.dataset.newWorkspaceGraph!);
+    if (el.dataset.newWorkspaceSession) sessionModal();
+    else graphModal();
+    return;
+  }
+  if (el.dataset.openGraph) {
+    const target = state?.graphs.find((g) => g.id === el.dataset.openGraph);
+    if (!target) return;
+    if (target.workspaceId !== workspaceId) await selectWorkspace(target.workspaceId ?? "main");
+    graphId = target.id;
+    taskId = el.dataset.openTask ?? target.tasks[0]?.id ?? "";
+    navigate("graphs");
     return;
   }
   if (el.dataset.command) {
@@ -1449,6 +1787,10 @@ async function click(el: HTMLElement) {
     );
     return;
   }
+  if (el.dataset.stopResource) {
+    await updateSessionResources("stop", el.dataset.stopResource);
+    return;
+  }
   if (el.dataset.page) {
     navigate(el.dataset.page);
     return;
@@ -1464,7 +1806,10 @@ async function click(el: HTMLElement) {
     return;
   }
   if (el.dataset.session || el.dataset.openSession) {
-    sessionId = el.dataset.session ?? el.dataset.openSession ?? "";
+    const targetId = el.dataset.session ?? el.dataset.openSession ?? "";
+    const target = state?.sessions.find((s) => s.id === targetId);
+    if (target && target.workspaceId !== workspaceId) await selectWorkspace(target.workspaceId ?? "main");
+    sessionId = targetId;
     dialog.close();
     navigate("sessions");
     return;
@@ -1522,6 +1867,19 @@ async function click(el: HTMLElement) {
   const action = el.dataset.action;
   const g = graph();
   switch (action) {
+    case "toggle-resources": {
+      const view = resourceView();
+      view.open = !view.open;
+      render();
+      if (view.open) await updateSessionResources("refresh");
+      break;
+    }
+    case "refresh-resources":
+      await updateSessionResources("refresh");
+      break;
+    case "close-resources":
+      await updateSessionResources("close");
+      break;
     case "attach": {
       const owner = projectId;
       const s = session();
@@ -1567,6 +1925,9 @@ async function click(el: HTMLElement) {
       break;
     case "project":
       projectModal();
+      break;
+    case "new-workspace":
+      workspaceModal();
       break;
     case "new-session":
       sessionModal();
@@ -1665,6 +2026,41 @@ async function stopSession() {
     expectedExecutionId: active.id,
   });
 }
+async function openObserver(kind: "sidechat" | "interview", source: Session) {
+  if (requestPending) return;
+  const reason = observerUnavailable(source);
+  if (reason) throw new Error(reason);
+  const owner = projectId;
+  const selectionGeneration = workspaceGeneration;
+  requestPending = true;
+  render(false);
+  try {
+    let createdId: string | undefined;
+    if (kind === "sidechat") {
+      const created = await api<Session>(
+        `/api/sessions/${enc(source.id)}/sidechats`, "POST", {},
+      );
+      createdId = created.id;
+    } else {
+      const feedback = await api<Feedback>(
+        `/api/sessions/${enc(source.id)}/interviews`, "POST", {},
+      );
+      createdId = feedback.sessionId;
+    }
+    if (selectionGeneration !== workspaceGeneration) { await refresh(); return; }
+    dialog.close();
+    if (createdId) {
+      sessionId = createdId;
+      page = "sessions";
+    } else page = "feedback";
+    await refresh();
+    revealWorkspaceSelection();
+    scheduleEvents();
+  } finally {
+    requestPending = false;
+    if (owner === projectId) render(false);
+  }
+}
 async function runCommand(text: string) {
   const [name, ...args] = text.trim().slice(1).split(/\s+/);
   if (!commands.some((c) => c.name === name))
@@ -1672,17 +2068,23 @@ async function runCommand(text: string) {
   const s = session();
   if (!s) return;
   const d = draft(s);
+  if (name === "sidechat" || name === "interview")
+    await openObserver(name, s);
   if (name === "stop") await stopSession();
   if (name === "new") {
+    const owner = workspaceId;
+    const generation = workspaceGeneration;
     const next = await api<Session>("/api/sessions", "POST", {
+      workspaceId: owner,
       title: args.join(" ") || "新会话",
       model: d.model || undefined,
       reasoning: d.reasoning || undefined,
     });
+    if (owner !== workspaceId || generation !== workspaceGeneration) { await refresh(); return; }
     sessionId = next.id;
     page = "sessions";
     await refresh();
-    scheduleEvents();
+    navigate("sessions");
   }
   if (name === "model") {
     if (args.length) {
@@ -1810,13 +2212,6 @@ document.addEventListener("change", (event) => {
     render(false);
     return;
   }
-  if (el instanceof HTMLSelectElement && el.id === "graph-choice") {
-    graphId = el.value;
-    taskId = "";
-    events = [];
-    render(false);
-    scheduleEvents();
-  }
 });
 app.addEventListener("paste", (event) => {
   if (
@@ -1876,23 +2271,34 @@ dialog.addEventListener("click", (event) => {
 });
 async function loadOptions(owner: string) {
   const generation = projectGeneration;
+  const selectedWorkspace = workspaceId;
+  const selectionGeneration = workspaceGeneration;
   optionsLoading = true;
+  if (supportsWorkspaces) void api<WorkspaceStatus>(`/api/workspaces/${enc(selectedWorkspace)}/status`, "GET", undefined, owner)
+    .then((value) => {
+      if (owner === projectId && generation === projectGeneration && selectionGeneration === workspaceGeneration) {
+        workspaceStatus = value;
+        render();
+      }
+    }).catch(() => {});
   try {
-    options = await api<RuntimeOptions>(
-      "/api/runtime/options",
+    const discovered = await api<RuntimeOptions>(
+      supportsWorkspaces ? `/api/runtime/options?workspaceId=${enc(selectedWorkspace)}` : "/api/runtime/options",
       "GET",
       undefined,
       owner,
     );
+    if (selectedWorkspace !== workspaceId || selectionGeneration !== workspaceGeneration) return;
+    options = discovered;
   } catch (error) {
-    if (owner !== projectId || generation !== projectGeneration) return;
+    if (owner !== projectId || generation !== projectGeneration || selectionGeneration !== workspaceGeneration) return;
     options = {
       models: [],
       skills: [],
       warnings: [error instanceof Error ? error.message : String(error)],
     };
   } finally {
-    if (owner === projectId && generation === projectGeneration) {
+    if (owner === projectId && generation === projectGeneration && selectionGeneration === workspaceGeneration) {
       optionsLoading = false;
       const modelSelect =
         dialog.querySelector<HTMLSelectElement>("#new-session-model");
@@ -1912,10 +2318,35 @@ async function loadOptions(owner: string) {
     }
   }
 }
+async function selectWorkspace(id: string) {
+  if (!state?.workspaces?.some((w) => w.id === id)) throw new Error("工作区不存在");
+  const composer = app.querySelector<HTMLTextAreaElement>('.composer textarea[name="text"]');
+  if (composer && session()) draft().text = composer.value;
+  workspaceId = id;
+  workspaceStatus = undefined;
+  workspaceGeneration++;
+  sessionStorage.setItem(`harness.workspace.${projectId}`, id);
+  graphId = taskId = sessionId = mailAddress = "";
+  Object.assign(statsFilters, { graph: "", task: "", unit: "", session: "" });
+  events = [];
+  eventGeneration++;
+  pendingEventLoads.clear();
+  clearTimeout(eventTimer);
+  eventTimer = undefined;
+  composing = false;
+  dialog.close();
+  options = { models: [], skills: [], warnings: [] };
+  render(false);
+  void loadOptions(projectId);
+  scheduleEvents();
+}
 async function selectProject(id: string) {
   projectGeneration++;
   stream?.close();
   projectId = id;
+  workspaceId = sessionStorage.getItem(`harness.workspace.${id}`) ?? "main";
+  workspaceStatus = undefined;
+  workspaceGeneration++;
   sessionStorage.setItem("harness.project", id);
   graphId = taskId = sessionId = "";
   Object.assign(statsFilters, {
@@ -1933,17 +2364,19 @@ async function selectProject(id: string) {
   composing = false;
   events = [];
   eventGeneration++;
+  pendingEventLoads.clear();
   clearTimeout(eventTimer);
   eventTimer = undefined;
   connected = false;
   state = null;
+  supportsWorkspaces = false;
   options = { models: [], skills: [], warnings: [] };
   optionsLoading = true;
   dialog.close();
   render(false);
-  void loadOptions(id);
   await refresh();
   if (projectId !== id) return;
+  void loadOptions(id);
   const source = new EventSource(projectUrl("/api/stream", id));
   stream = source;
   source.addEventListener("open", () => {
@@ -1985,4 +2418,9 @@ async function start() {
       ?.addEventListener("click", () => void start());
   }
 }
+setInterval(() => {
+  if (document.hidden || page !== "sessions" || !session()) return;
+  const view = sessionResourceViews.get(draftKey());
+  if (view?.open && !view.pending) void updateSessionResources("refresh");
+}, 5000);
 void start();

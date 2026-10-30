@@ -12,6 +12,7 @@ const task = z.strictObject({
 
 export const controllerCommandSchema = z.discriminatedUnion("op", [
   z.strictObject({ op: z.literal("connect"), create: z.boolean().default(false),
+    workspaceId: z.string().min(1).max(100).optional(),
     title: z.string().trim().min(1).max(200).optional(),
     threadId: z.string().trim().min(1).max(200).optional() }),
   z.strictObject({ op: z.literal("state"), graphId: uuid.optional(), ...page }),

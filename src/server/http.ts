@@ -8,6 +8,7 @@ import { ProjectRegistry } from "./projects.ts";
 import { resolveAttachments, saveAttachment } from "./attachments.ts";
 import { z } from "zod/v4";
 import { ControllerError, controllerCommandSchema } from "../shared/controller.ts";
+import type { ServiceControl } from "./service.ts";
 import type {
   Runtime,
   GitAdapter,
@@ -22,6 +23,7 @@ import type {
   Session,
   TurnInput,
   InterviewSettings,
+  WorkspaceInput,
 } from "../shared/types.ts";
 
 type StateStream = {
@@ -36,6 +38,7 @@ export async function createHttpServer(options: {
   registryPath?: string;
   projectRoot?: string;
   staticDir?: string;
+  service?: ServiceControl;
 }) {
   const catalog = new Catalog(options.catalogPath);
   const registry = new ProjectRegistry(
@@ -49,9 +52,11 @@ export async function createHttpServer(options: {
   let defaultProjectId: string | undefined;
   let endpoint = "";
   let closing = false;
+  let closePromise: Promise<void> | undefined;
   const view = (engine?: HarnessEngine): AppState =>
     engine?.view() || {
       project: null,
+      workspaces: [],
       sessions: [],
       graphs: [],
       letters: [],
@@ -118,6 +123,27 @@ export async function createHttpServer(options: {
       const url = new URL(req.url || "/", `http://${host}`);
       const scoped = /^\/api\/projects\/([^/]+)(\/.*)$/.exec(url.pathname);
       const path = scoped ? "/api" + scoped[2] : url.pathname;
+      if (path === "/api/service" || path.startsWith("/api/service/")) {
+        const service = options.service;
+        if (scoped || req.headers.authorization || req.headers["x-loom-controller-key"]) {
+          json(403, { error: "服务控制不能使用项目或执行凭据" });
+          return;
+        }
+        if (!service) { json(404, { error: "此服务不支持终端管理" }); return; }
+        if (req.headers["x-loom-service-key"] !== service.token || req.headers["x-loom-service-instance"] !== service.info().instanceId) { json(403, { error: "服务管理凭据或实例身份无效" }); return; }
+        if (req.method === "GET" && path === "/api/service") {
+          json(200, service.info());
+          return;
+        }
+        const command = path === "/api/service/stop" ? "stop" : path === "/api/service/restart" ? "restart" : undefined;
+        if (req.method !== "POST" || !command) { json(404, { error: "未知服务操作" }); return; }
+        const accepted = service.accept(command);
+        if (accepted.operation !== command) { json(409, { error: "另一项服务操作正在进行" }); return; }
+        req.resume();
+        if (accepted.started) res.once("finish", () => { void service.run().catch((error) => process.stderr.write(String(error) + "\n")); });
+        json(202, service.info());
+        return;
+      }
       const token = (req.headers.authorization || "").replace(/^Bearer /, "");
       const controllerRoute = /^\/api\/controller\/([^/]+)$/.exec(path);
       const controllerKey = req.headers["x-loom-controller-key"];
@@ -259,6 +285,22 @@ export async function createHttpServer(options: {
         }
         const parts = path.split("/").filter(Boolean).map(decodeURIComponent),
           method = req.method;
+        if (parts[1] === "sessions" && parts[3] === "resources") {
+          if (method === "GET" && parts.length === 4) {
+            json(200, await engine.sessionResources(parts[2]));
+            return;
+          }
+          if (method === "POST" && parts.length === 5 && parts[4] === "stop") {
+            const { resourceId } = z.strictObject({ resourceId: z.string().min(1).max(300) }).parse(body);
+            json(200, await engine.stopSessionResource(parts[2], resourceId));
+            return;
+          }
+          if (method === "POST" && parts.length === 5 && parts[4] === "close") {
+            z.strictObject({}).parse(body);
+            json(200, await engine.closeSessionResources(parts[2]));
+            return;
+          }
+        }
         if (controllerRoute) {
           if (method !== "POST") throw new ControllerError("METHOD_NOT_ALLOWED", "Controller operations require POST", 405);
           const sessionId = z.uuid().safeParse(decodeURIComponent(controllerRoute[1]));
@@ -315,8 +357,18 @@ export async function createHttpServer(options: {
             throw new Error("当前 Runtime 不支持模型与 Skill 查询");
           json(
             200,
-            await options.runtime.discoverOptions(engine.state.project.path),
+            await options.runtime.discoverOptions(engine.workspace(url.searchParams.get("workspaceId") ?? undefined).path),
           );
+          return;
+        }
+        if (method === "POST" && path === "/api/workspaces") {
+          const input = z.strictObject({ name: z.string().trim().min(1).max(120), sourceWorkspaceId: z.string().min(1).max(100).optional() }).parse(body);
+          json(201, await engine.createWorkspace(input satisfies WorkspaceInput));
+          return;
+        }
+        if (method === "GET" && parts[1] === "workspaces" && parts[3] === "status") {
+          const workspace = engine.workspace(parts[2]);
+          json(200, await engine.git.workspaceStatus?.(workspace) ?? { status: "unavailable", error: "Git adapter 不支持查询状态" });
           return;
         }
         if (method === "POST" && path === "/api/attachments") {
@@ -350,6 +402,7 @@ export async function createHttpServer(options: {
             engine.createSession(
               body as {
                 title: string;
+                workspaceId?: string;
                 model?: string;
                 reasoning?: Session["reasoning"];
               },
@@ -400,12 +453,18 @@ export async function createHttpServer(options: {
           return;
         }
         if (method === "GET" && path === "/api/events") {
+          const workspaceId = url.searchParams.get("workspaceId");
+          if (workspaceId) engine.workspace(workspaceId);
           json(
             200,
             engine.store.events({
               sessionId: url.searchParams.get("sessionId") || undefined,
               graphId: url.searchParams.get("graphId") || undefined,
-              after: Number(url.searchParams.get("after") || 0),
+              after: url.searchParams.has("after") ? Number(url.searchParams.get("after")) : undefined,
+              kind: url.searchParams.get("kind") === "invocations" ? "invocations" : undefined,
+              workspace: workspaceId ? { id: workspaceId,
+                sessionIds: engine.state.sessions.filter((s) => s.workspaceId === workspaceId).map((s) => s.id),
+                graphIds: engine.state.graphs.filter((g) => g.workspaceId === workspaceId).map((g) => g.id) } : undefined,
             }),
           );
           return;
@@ -563,16 +622,14 @@ export async function createHttpServer(options: {
       return defaultProjectId ? engines.get(defaultProjectId) : undefined;
     },
     engines,
-    close: async () => {
+    close: () => closePromise ??= (async () => {
       closing = true;
       await Promise.all([...engines.values()].map((e) => e.shutdown()));
       for (const subscribers of streams.values())
         for (const s of subscribers) s.close();
-      await new Promise<void>((resolve, reject) =>
-        server.close((e) => (e ? reject(e) : resolve())),
-      );
+      if (server.listening) await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())));
       for (const engine of engines.values()) engine.close();
       await options.runtime.close?.();
-    },
+    })(),
   };
 }

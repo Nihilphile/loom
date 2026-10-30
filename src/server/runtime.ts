@@ -1,9 +1,10 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
+import { randomUUID } from "node:crypto";
+import { startManagedProcess, type ManagedProcess } from "./managed-process.ts";
 import type {
   AgentCommand,
   Runtime,
@@ -15,6 +16,7 @@ import type {
   Reasoning,
   Usage,
   RuntimeAcceptance,
+  RuntimeResources,
 } from "../shared/types.ts";
 
 interface CodexRuntimeOptions {
@@ -22,10 +24,12 @@ interface CodexRuntimeOptions {
   args?: string[];
   requestTimeoutMs?: number;
   shutdownTimeoutMs?: number;
+  idleTimeoutMs?: number;
   windowsSandbox?: "elevated" | "unelevated";
 }
 
 type JsonObject = Record<string, unknown>;
+type ExecutionPermissionMode = NonNullable<RuntimeInput["permissionMode"]>;
 const object = (value: unknown): JsonObject =>
   value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as JsonObject)
@@ -253,7 +257,9 @@ export class CodexRuntime implements Runtime {
     readOnly: true,
     fork: true,
   };
-  private readonly active = new Set<RuntimeHandle>();
+  private readonly backends = new Map<string, CodexBackend>();
+  private readonly launching = new Map<string, Promise<CodexBackend>>();
+  private readonly discoveries = new Set<Promise<ManagedProcess>>();
   private closed = false;
 
   constructor(private readonly options: CodexRuntimeOptions = {}) {}
@@ -261,15 +267,19 @@ export class CodexRuntime implements Runtime {
   async discoverOptions(cwd: string): Promise<RuntimeOptions> {
     if (this.closed) throw new Error("Runtime is closed");
     cwd = realpathSync.native(cwd);
-    const child = spawn(
+    const starting = startManagedProcess(
       this.options.executable ?? executable(),
       this.options.args ?? ["app-server", "--listen", "stdio://"],
       {
         cwd,
-        windowsHide: true,
-        stdio: ["pipe", "pipe", "pipe"],
+        env: process.env,
       },
     );
+    this.discoveries.add(starting);
+    let managed: ManagedProcess;
+    try { managed = await starting; }
+    catch (error) { this.discoveries.delete(starting); throw error; }
+    const child = managed.child;
     let sequence = 0;
     const pending = new Map<
       number,
@@ -286,12 +296,11 @@ export class CodexRuntime implements Runtime {
       }
       pending.clear();
     };
-    const exited = new Promise<void>((resolve) =>
-      child.on("close", () => {
-        fail(new Error("Codex metadata process exited"));
-        resolve();
-      }),
-    );
+    let finished = false;
+    let exitTimer: NodeJS.Timeout | undefined;
+    void managed.exited.then(() => {
+      if (!finished) exitTimer = setTimeout(() => fail(new Error("Codex metadata process exited")), 250);
+    });
     child.on("error", fail);
     child.stdin.on("error", fail);
     child.stderr.resume();
@@ -325,6 +334,7 @@ export class CodexRuntime implements Runtime {
         child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
       });
     try {
+      if (this.closed) throw new Error("Runtime is closed");
       await request("initialize", {
         clientInfo: { name: "loom", version: "0.1.0" },
         capabilities: { experimentalApi: true },
@@ -402,13 +412,11 @@ export class CodexRuntime implements Runtime {
       }
       return result;
     } finally {
-      child.stdin.end();
-      const timer = setTimeout(
-        () => child.kill(),
-        this.options.shutdownTimeoutMs ?? 5000,
-      );
-      await exited;
-      clearTimeout(timer);
+      finished = true;
+      clearTimeout(exitTimer);
+      fail(new Error("Codex metadata request ended"));
+      await managed.close();
+      this.discoveries.delete(starting);
     }
   }
 
@@ -456,6 +464,10 @@ export class CodexRuntime implements Runtime {
           );
         }
       }
+    const permissionMode: ExecutionPermissionMode =
+      input.permissionMode === "inherit" && !input.readOnly && !input.observer && !input.child
+        ? "inherit"
+        : "workspace";
     const reportCwd =
       process.platform === "win32" && input.readOnly
         ? input.writableRoots?.[0]
@@ -475,36 +487,211 @@ export class CodexRuntime implements Runtime {
         args.push("-c", `${key}=${JSON.stringify(value)}`);
     if (input.delegation || input.child)
       args.push("-c", "agents.enabled=false");
-    if (process.platform === "win32")
+    const windowsSandbox = this.options.windowsSandbox ?? process.env.CODEX_WINDOWS_SANDBOX
+      ?? (permissionMode === "workspace" ? "unelevated" : undefined);
+    if (process.platform === "win32" && windowsSandbox)
       args.push(
         "-c",
-        `windows.sandbox=${JSON.stringify(this.options.windowsSandbox ?? process.env.CODEX_WINDOWS_SANDBOX ?? "unelevated")}`,
+        `windows.sandbox=${JSON.stringify(windowsSandbox)}`,
       );
-    const child = spawn(
-      this.options.executable ?? executable(),
-      this.options.args ?? args,
-      {
-        cwd: input.cwd,
-        env:
-          input.observer || input.child
-            ? childEnvironment({ ...process.env, ...input.env })
-            : { ...process.env, ...input.env },
-        windowsHide: true,
-        detached: process.platform !== "win32",
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
-    const execution = new CodexExecution(child, input, onEvent, this.options);
-    const handle = execution.handle;
-    this.active.add(handle);
-    void handle.done.then(() => this.active.delete(handle));
-    execution.start();
-    return handle;
+    const owner = input.ownerId ?? randomUUID();
+    if (this.launching.has(owner)) throw new Error("Session runtime is starting");
+    const command = this.options.executable ?? executable();
+    const launchArgs = this.options.args ?? args;
+    const env = input.observer || input.child
+      ? childEnvironment({ ...process.env, ...input.env })
+      : { ...process.env, ...input.env };
+    const configuration = JSON.stringify({ command, args: launchArgs, cwd: input.cwd, env,
+      permissionMode, observer: input.observer, readOnly: input.readOnly, writableRoots: input.writableRoots });
+    const launch = (async () => {
+      let backend = this.backends.get(owner);
+      if (backend?.state === "active") throw new Error("Session already has an active turn");
+      if (backend && (backend.configuration !== configuration || !backend.usable)) {
+        await backend.close();
+        this.backends.delete(owner);
+        backend = undefined;
+      }
+      if (!backend) {
+        const managed = await startManagedProcess(command, launchArgs, { cwd: input.cwd, env });
+        backend = new CodexBackend(managed, configuration, this.options);
+        this.backends.set(owner, backend);
+        const owned = backend;
+        backend.onClosed = () => {
+          if (this.backends.get(owner) === owned) this.backends.delete(owner);
+        };
+      }
+      if (this.closed) {
+        await backend.close();
+        throw new Error("Runtime is closed");
+      }
+      return backend;
+    })();
+    this.launching.set(owner, launch);
+    try {
+      const backend = await launch;
+      return backend.start(input, onEvent, permissionMode, !input.ownerId);
+    } finally {
+      if (this.launching.get(owner) === launch) this.launching.delete(owner);
+    }
+  }
+
+  async resources(ownerId: string): Promise<RuntimeResources> {
+    if (this.launching.has(ownerId)) return { state: "starting", processes: [] };
+    return this.backends.get(ownerId)?.resources() ?? { state: "closed", processes: [] };
+  }
+
+  async stopResource(ownerId: string, resourceId: string): Promise<void> {
+    const backend = this.backends.get(ownerId);
+    if (!backend) throw new Error("Session has no managed processes");
+    await backend.stopResource(resourceId);
+  }
+
+  async closeSession(ownerId: string): Promise<void> {
+    const backend = await this.launching.get(ownerId) ?? this.backends.get(ownerId);
+    await backend?.close();
   }
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...this.active].map((handle) => handle.interrupt()));
+    await Promise.allSettled(this.launching.values());
+    const results = await Promise.allSettled([
+      ...[...this.backends.values()].map(backend => backend.close()),
+      ...[...this.discoveries].map(async pending => (await pending).close()),
+    ]);
+    const failed = results.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+  }
+}
+
+class CodexBackend {
+  state: RuntimeResources["state"] = "idle";
+  initialized = false;
+  readonly previousTurns = new Set<string>();
+  usage?: Usage;
+  onClosed?: () => void;
+  private sequence = 0;
+  private execution?: CodexExecution;
+  private idleTimer?: NodeJS.Timeout;
+  private exitTimer?: NodeJS.Timeout;
+  private processes: RuntimeResources["processes"] = [];
+  private closing?: Promise<void>;
+  private error?: string;
+  private exited = false;
+  private readonly lines;
+
+  constructor(
+    readonly managed: ManagedProcess,
+    readonly configuration: string,
+    private readonly options: CodexRuntimeOptions,
+  ) {
+    const child = managed.child;
+    this.lines = createInterface({ input: child.stdout });
+    this.lines.on("line", line => {
+      if (this.execution) this.execution.receive(line);
+      else {
+        try {
+          const packet = object(JSON.parse(line));
+          if (packet.id !== undefined && typeof packet.method === "string")
+            child.stdin.write(JSON.stringify({ id: packet.id, error: { code: -32000, message: "No active turn" } }) + "\n");
+        } catch {}
+      }
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => this.execution?.stderrReceived(chunk));
+    child.stdin.on("error", error => this.failed(error));
+    child.on("error", error => this.failed(error));
+    child.on("exit", () => {
+      if (child.pid !== managed.pid && this.state !== "closing" && this.state !== "closed") this.failed(new Error("Codex supervisor exited"));
+    });
+    void managed.exited.then(({ code, signal }) => {
+      this.exited = true;
+      if (this.state !== "closing" && this.state !== "closed") {
+        // Backend exit and final stdout arrive on different OS pipes.
+        this.exitTimer = setTimeout(() => this.failed(new Error(`Codex backend exited (${code ?? signal})`)), 250);
+      }
+    }, error => this.failed(error));
+  }
+
+  get usable() { return !this.exited && (this.state === "idle" || this.state === "active"); }
+  nextId() { return ++this.sequence; }
+
+  invalidate(error: unknown): void {
+    if (this.state === "closing" || this.state === "closed") return;
+    this.state = "failed";
+    this.error = message(error);
+  }
+
+  start(input: RuntimeInput, emit: (event: RuntimeEvent) => void, mode: ExecutionPermissionMode, transient: boolean): RuntimeHandle {
+    if (!this.usable || this.execution) throw new Error("Session runtime is unavailable or busy");
+    clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
+    this.state = "active";
+    const execution = new CodexExecution(this, input, emit, this.options, mode);
+    this.execution = execution;
+    execution.onFinish = (turnId) => {
+      if (this.execution !== execution) return;
+      if (turnId) this.previousTurns.add(turnId);
+      this.execution = undefined;
+      if (this.state === "closing" || this.state === "closed") return;
+      if (this.state === "active") this.state = "idle";
+      if (transient) void this.close().catch(() => {});
+      else this.scheduleCleanup();
+    };
+    execution.start();
+    return execution.handle;
+  }
+
+  private failed(error: unknown): void {
+    if (this.state === "closed" || this.state === "closing") return;
+    clearTimeout(this.exitTimer);
+    this.error = message(error);
+    this.state = "failed";
+    this.execution?.transportFailed(error);
+    if (this.state === "failed" && !this.idleTimer) this.scheduleCleanup();
+  }
+
+  private scheduleCleanup() {
+    clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => { this.idleTimer = undefined; void this.close().catch(() => {}); }, this.options.idleTimeoutMs ?? 300_000);
+    this.idleTimer.unref();
+  }
+
+  async resources(): Promise<RuntimeResources> {
+    if (this.state === "closed") return { state: "closed", processes: [] };
+    try {
+      this.processes = await this.managed.list();
+      return { state: this.state, processes: this.processes, ...(this.error ? { error: this.error } : {}) };
+    } catch (error) {
+      return { state: "failed", processes: this.processes, error: `${message(error)}; showing the last confirmed process list` };
+    }
+  }
+
+  async stopResource(id: string): Promise<void> {
+    const resource = (await this.managed.list()).find(value => value.id === id);
+    if (!resource) throw new Error("Resource no longer belongs to this session");
+    if (resource.role === "backend") await this.close();
+    else await this.managed.stop(id);
+  }
+
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
+    if (this.state === "closed") return Promise.resolve();
+    clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
+    clearTimeout(this.exitTimer);
+    this.state = "closing";
+    this.execution?.terminated();
+    this.closing = this.managed.close().then(() => {
+      this.state = "closed";
+      this.error = undefined;
+      this.lines.close();
+      this.onClosed?.();
+    }, error => {
+      this.state = "failed";
+      this.error = message(error);
+      throw error;
+    }).finally(() => { this.closing = undefined; });
+    return this.closing;
   }
 }
 
@@ -519,7 +706,6 @@ class CodexExecution {
     }
   >();
   private readonly messages = new Map<string, string>();
-  private sequence = 0;
   private threadId?: string;
   private turnId?: string;
   private usage?: Usage;
@@ -527,9 +713,8 @@ class CodexExecution {
   private turnRequested = false;
   private readonly previousTurns = new Set<string>();
   private lastPreviousTurn?: string;
-  private phase: "starting" | "running" | "stopping" | "closed" = "starting";
+  private phase: "starting" | "running" | "closed" = "starting";
   private interrupted = false;
-  private result?: RuntimeResult;
   private shutdownTimer?: NodeJS.Timeout;
   private stderr = "";
   private readonly secrets: string[];
@@ -540,13 +725,18 @@ class CodexExecution {
   private initialization?: Promise<void>;
   private readonly toolReplies = new Map<unknown, () => void>();
 
+  onFinish?: (turnId?: string) => void;
+
   constructor(
-    private readonly child: ChildProcessWithoutNullStreams,
+    private readonly backend: CodexBackend,
     private readonly input: RuntimeInput,
     private readonly onEvent: (event: RuntimeEvent) => void,
     private readonly options: CodexRuntimeOptions,
+    private readonly permissionMode: ExecutionPermissionMode,
   ) {
     this.threadId = input.threadId;
+    for (const id of backend.previousTurns) this.previousTurns.add(id);
+    if (input.threadId) this.baseline = backend.usage;
     this.secrets = Object.entries(input.env ?? {})
       .filter(
         ([key, value]) =>
@@ -562,44 +752,23 @@ class CodexExecution {
     this.handle = {
       accepted,
       done,
-      pid: child.pid,
+      pid: backend.managed.pid,
       interrupt: () => this.interrupt(),
       inject: (text, input) => this.inject(text, input),
     };
-    createInterface({ input: child.stdout }).on("line", (line) =>
-      this.receive(line),
-    );
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      this.stderr = (this.stderr + chunk).slice(-8000);
-      this.emit({ type: "log", text: chunk, detail: { source: "stderr" } });
-    });
-    child.stdin.on("error", (error) => this.fail(error));
-    child.on("error", (error) => this.fail(error));
-    child.on("close", (code, signal) => {
-      this.phase = "closed";
-      this.cancelToolReplies();
-      clearTimeout(this.shutdownTimer);
-      this.rejectPending(new Error("Codex process exited"));
-      this.setAcceptance({
-        status: this.turnRequested ? "uncertain" : "rejected",
-        reason: "Codex process exited before turn acceptance",
-      });
-      if (this.result?.status === "completed" && code !== 0)
-        this.result = this.snapshot(
-          "failed",
-          `Codex exited abnormally after turn completion (${code ?? signal})`,
-        );
-      this.resolveDone(
-        this.result ??
-          this.snapshot(
-            this.interrupted ? "interrupted" : "failed",
-            this.interrupted
-              ? undefined
-              : `Codex exited before turn completion (${code ?? signal}). ${this.stderr}`,
-          ),
-      );
-    });
+  }
+
+  stderrReceived(chunk: string): void {
+    this.stderr = (this.stderr + chunk).slice(-8000);
+    this.emit({ type: "log", text: chunk, detail: { source: "stderr" } });
+  }
+
+  transportFailed(error: unknown): void { this.fail(error); }
+
+  terminated(): void {
+    if (this.phase === "closed") return;
+    this.interrupted = true;
+    this.stop(this.snapshot("interrupted"));
   }
 
   start(): void {
@@ -607,11 +776,14 @@ class CodexExecution {
   }
 
   private async initialize(): Promise<void> {
-    await this.request("initialize", {
-      clientInfo: { name: "loom", version: "0.1.0" },
-      capabilities: { experimentalApi: true },
-    });
-    this.write({ method: "initialized" });
+    if (!this.backend.initialized) {
+      await this.request("initialize", {
+        clientInfo: { name: "loom", version: "0.1.0" },
+        capabilities: { experimentalApi: true },
+      });
+      this.write({ method: "initialized" });
+      this.backend.initialized = true;
+    }
     if (this.phase !== "starting") return;
     const reportProfile =
       this.input.readOnly && this.input.writableRoots?.length
@@ -685,6 +857,18 @@ class CodexExecution {
         },
         network: { enabled: true },
       };
+    let inheritedPermissions: JsonObject = {};
+    if (this.permissionMode === "inherit") {
+      const effective = object(await this.request("config/read", {
+        cwd: this.input.cwd,
+        includeLayers: false,
+      }));
+      const settings = object(effective.config);
+      const profile = string(settings.default_permissions);
+      if (profile) inheritedPermissions = { permissions: profile };
+      else if (settings.sandbox_mode === "read-only" || settings.sandbox_mode === "workspace-write" || settings.sandbox_mode === "danger-full-access")
+        inheritedPermissions = { sandbox: settings.sandbox_mode };
+    }
     const response = object(
       await this.request(
         this.input.fork
@@ -705,11 +889,11 @@ class CodexExecution {
           cwd: resolve(this.input.cwd),
           model: this.input.model,
           approvalPolicy: "never",
-          ...(reportProfile
-            ? { permissions: reportProfile }
-            : {
-                sandbox: this.input.readOnly ? "read-only" : "workspace-write",
-              }),
+          ...(this.permissionMode === "inherit"
+            ? inheritedPermissions
+            : reportProfile
+              ? { permissions: reportProfile }
+              : { sandbox: this.input.readOnly ? "read-only" : "workspace-write" }),
           config,
           ...(!this.threadId &&
           !this.input.fork &&
@@ -795,9 +979,11 @@ class CodexExecution {
           model: this.input.model,
           effort: this.input.reasoning,
           approvalPolicy: "never",
-          ...(reportProfile
-            ? { permissions: reportProfile }
-            : { sandboxPolicy }),
+          ...(this.permissionMode === "inherit"
+            ? {}
+            : reportProfile
+              ? { permissions: reportProfile }
+              : { sandboxPolicy }),
         }),
       );
     } catch (error) {
@@ -843,14 +1029,14 @@ class CodexExecution {
   }
 
   private write(value: unknown): void {
-    if (this.phase === "closed" || this.child.stdin.destroyed)
+    if (this.phase === "closed" || this.backend.managed.child.stdin.destroyed)
       throw new Error("Codex transport is closed");
-    this.child.stdin.write(`${JSON.stringify(value)}\n`);
+    this.backend.managed.child.stdin.write(`${JSON.stringify(value)}\n`);
   }
 
   private request(method: string, params: unknown): Promise<unknown> {
     return new Promise((resolve, reject) => {
-      const id = ++this.sequence;
+      const id = this.backend.nextId();
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Codex ${method} timed out`));
@@ -866,7 +1052,7 @@ class CodexExecution {
     });
   }
 
-  private receive(line: string): void {
+  receive(line: string): void {
     if (this.phase === "closed") return;
     let packet: JsonObject;
     try {
@@ -927,6 +1113,9 @@ class CodexExecution {
     }
     if (params.threadId && this.threadId && params.threadId !== this.threadId)
       return;
+    const notificationTurn = string(params.turnId || object(params.turn).id);
+    if (method !== "thread/tokenUsage/updated" && notificationTurn &&
+      (this.previousTurns.has(notificationTurn) || (this.turnId && notificationTurn !== this.turnId))) return;
     this.emit({ type: "log", detail: { method, params } });
     if (method === "model/rerouted" && string(params.toModel))
       this.emit({ type: "model.resolved", model: string(params.toModel) });
@@ -1008,6 +1197,7 @@ class CodexExecution {
           cachedInputTokens: Number(values[1]),
           outputTokens: Number(values[2]),
         };
+        if (!previous) this.backend.usage = current;
         if (
           !this.turnRequested ||
           (previous && params.turnId === this.lastPreviousTurn && !this.usage)
@@ -1079,8 +1269,8 @@ class CodexExecution {
       this.toolReplies.delete(id);
       if (
         this.phase === "closed" ||
-        this.child.stdin.destroyed ||
-        this.child.stdin.writableEnded
+        this.backend.managed.child.stdin.destroyed ||
+        this.backend.managed.child.stdin.writableEnded
       )
         return;
       try {
@@ -1108,8 +1298,7 @@ class CodexExecution {
       params.threadId !== this.threadId ||
       params.turnId !== this.turnId ||
       !this.turnRequested ||
-      this.interrupted ||
-      this.phase === "stopping"
+      this.interrupted
     ) {
       reply(false, { error: "Agent tool is unavailable for this execution" });
       return;
@@ -1162,7 +1351,8 @@ class CodexExecution {
   }
 
   private fail(error: unknown): void {
-    if (this.phase === "stopping" || this.phase === "closed") return;
+    if (this.phase === "closed") return;
+    this.backend.invalidate(error);
     this.setAcceptance({
       status:
         this.turnRequested && !(error instanceof RpcRejection)
@@ -1176,74 +1366,45 @@ class CodexExecution {
         message(error),
       ),
     );
+    void this.backend.close().catch(() => {});
   }
 
   private stop(result: RuntimeResult): void {
-    if (this.phase === "stopping" || this.phase === "closed") return;
+    if (this.phase === "closed") return;
     this.cancelToolReplies();
-    this.phase = "stopping";
-    this.result = result;
+    this.phase = "closed";
     this.setAcceptance({
       status: this.turnRequested ? "uncertain" : "rejected",
       reason: "Execution stopped before turn acceptance",
     });
     clearTimeout(this.shutdownTimer);
-    this.rejectPending(new Error("Codex execution stopped"));
-    this.child.stdin.end();
-    this.shutdownTimer = setTimeout(
-      () => this.kill(),
-      this.options.shutdownTimeoutMs ?? 5000,
-    );
-  }
-
-  private kill(): void {
-    if (this.phase === "closed" || !this.child.pid) return;
-    if (this.result?.status === "completed")
-      this.result = this.snapshot(
-        "failed",
-        "Codex process did not exit after turn completion",
-      );
-    if (process.platform === "win32") {
-      const killer = spawn(
-        "taskkill",
-        ["/pid", String(this.child.pid), "/T", "/F"],
-        { windowsHide: true, stdio: "ignore" },
-      );
-      killer.on("error", () => this.child.kill("SIGKILL"));
-      killer.on("exit", (code) => {
-        if (code !== 0) this.child.kill("SIGKILL");
-      });
-    } else {
-      try {
-        process.kill(-this.child.pid, "SIGKILL");
-      } catch {
-        this.child.kill("SIGKILL");
-      }
-    }
+    this.rejectPending(new Error("Codex turn ended"));
+    this.onFinish?.(this.turnId ?? result.completedTurnId);
+    this.resolveDone(result);
   }
 
   private async interrupt(): Promise<void> {
     if (this.phase === "closed") return;
-    if (this.phase === "stopping") {
-      await this.handle.done;
-      return;
-    }
     this.interrupted = true;
     this.cancelToolReplies();
+    this.shutdownTimer ??= setTimeout(() => {
+      this.stop(this.snapshot("interrupted"));
+      void this.backend.close().catch(() => {});
+    }, this.options.shutdownTimeoutMs ?? 5000);
     if (this.threadId && this.turnId) {
-      this.shutdownTimer ??= setTimeout(() => {
-        this.stop(this.snapshot("interrupted"));
-        this.kill();
-      }, this.options.shutdownTimeoutMs ?? 5000);
-      try {
-        await this.request("turn/interrupt", {
-          threadId: this.threadId,
-          turnId: this.turnId,
-        });
-      } catch (error) {
-        this.fail(error);
-      }
-    } else this.stop(this.snapshot("interrupted"));
+      void this.request("turn/interrupt", {
+        threadId: this.threadId,
+        turnId: this.turnId,
+      }).catch(error => {
+        if (this.phase !== "closed") {
+          this.fail(error);
+          void this.backend.close().catch(() => {});
+        }
+      });
+    } else {
+      this.stop(this.snapshot("interrupted"));
+      await this.backend.close();
+    }
     await this.handle.done;
   }
 

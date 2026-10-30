@@ -20,6 +20,7 @@ import type {
   Runtime,
   GitAdapter,
   Session,
+  SessionResources,
   Graph,
   GraphInput,
   Task,
@@ -45,6 +46,8 @@ import type {
   AgentReceipt,
   TaskDelivery,
   IntegrationReceipt,
+  ProjectWorkspace,
+  WorkspaceInput,
 } from "../shared/types.ts";
 import { SessionInputs, contextItem } from "./session-inputs.ts";
 import { ControllerError, contentWindow, controllerPage, type ControllerCommand } from "../shared/controller.ts";
@@ -86,6 +89,7 @@ export class HarnessEngine {
   private integrations = new Map<string, Promise<void>>();
   private validators = new Map<string, RuntimeHandle>();
   private graphControls = new Map<string, Promise<Graph>>();
+  private workspacePublications = new Set<string>();
   constructor(
     root: string,
     readonly runtime: Runtime,
@@ -94,6 +98,20 @@ export class HarnessEngine {
   ) {
     this.store = new ProjectStore(root);
     this.state = this.store.load();
+    this.state.workspaces ??= [{ id: "main", name: "主工作区", kind: "main", path: this.state.project.path, createdAt: now() }];
+    for (const graph of this.state.graphs) {
+      if (!graph.workspaceId) {
+        if (graph.workspace) {
+          const id = `legacy-${graph.id}`;
+          this.state.workspaces.push({ id, name: graph.name, kind: "legacy", ...graph.workspace, createdAt: graph.createdAt });
+          graph.workspaceId = id;
+        } else graph.workspaceId = "main";
+      }
+    }
+    for (const session of this.state.sessions) {
+      session.workspaceId ??= this.state.graphs.find((g) => g.id === session.graphId)?.workspaceId
+        ?? this.state.sessions.find((s) => s.id === session.source?.sessionId)?.workspaceId ?? "main";
+    }
     this.state.preparations ??= [];
     this.state.interviews ??= defaultInterviews();
     this.state.feedback ??= [];
@@ -187,6 +205,7 @@ export class HarnessEngine {
   view(): AppState {
     return structuredClone({
       project: this.state.project,
+      workspaces: this.state.workspaces,
       sessions: this.state.sessions,
       graphs: this.state.graphs,
       letters: this.state.letters,
@@ -213,6 +232,49 @@ export class HarnessEngine {
     if (!value) throw new Error("会话不存在");
     return value;
   }
+  private runtimeOwner(id: string): string {
+    return JSON.stringify([this.state.project.id ?? this.state.project.path, id]);
+  }
+  async sessionResources(id: string): Promise<SessionResources> {
+    const session = this.session(id);
+    const unit = session.kind === "task" ? this.state.graphs.find(g => g.id === session.graphId)
+      ?.tasks.find(t => t.id === session.taskId)?.units.find(u => u.id === session.unitId) : undefined;
+    if (unit?.kind === "command" || session.executionOwner?.kind === "external" || !this.runtime.resources)
+      return { sessionId: id, state: "unavailable", processes: [] };
+    return { sessionId: id, ...await this.runtime.resources(this.runtimeOwner(id)) };
+  }
+  async stopSessionResource(id: string, resourceId: string): Promise<SessionResources> {
+    this.requireLoom(this.session(id));
+    if (!this.runtime.stopResource) throw new Error("Runtime does not manage session resources");
+    await this.runtime.stopResource(this.runtimeOwner(id), resourceId);
+    this.record("session.resource_stopped", "会话资源已停止", { sessionId: id });
+    return this.sessionResources(id);
+  }
+  async closeSessionResources(id: string): Promise<SessionResources> {
+    this.requireLoom(this.session(id));
+    if (!this.runtime.closeSession) throw new Error("Runtime does not manage session resources");
+    await this.interrupt(id);
+    await this.runtime.closeSession(this.runtimeOwner(id));
+    this.record("session.resources_closed", "会话后台资源已清理", { sessionId: id });
+    return this.sessionResources(id);
+  }
+  workspace(id = "main"): ProjectWorkspace {
+    const workspace = this.state.workspaces?.find((w) => w.id === id);
+    if (!workspace) throw new Error("工作区不存在");
+    return workspace;
+  }
+  async createWorkspace(input: WorkspaceInput): Promise<ProjectWorkspace> {
+    const name = text(input.name, "工作区名称");
+    if (name.length > 120) throw new Error("工作区名称不能超过 120 个字符");
+    const source = this.workspace(input.sourceWorkspaceId);
+    if (!this.git.createWorkspace) throw new Error("Git adapter 不支持创建工作区");
+    const id = randomUUID();
+    const directory = await this.git.createWorkspace(this.state.project.path, id, source);
+    const workspace: ProjectWorkspace = { id, name, kind: "feature", ...directory, createdAt: now() };
+    this.state.workspaces!.push(workspace);
+    this.record("workspace.created", "创建工作区", { detail: { workspaceId: id } });
+    return workspace;
+  }
   graph(id: string) {
     const value = this.state.graphs.find((g) => g.id === id);
     if (!value) throw new Error("Graph 不存在");
@@ -230,11 +292,15 @@ export class HarnessEngine {
   }
   createSession(input: {
     title: string;
+    workspaceId?: string;
     model?: string;
     reasoning?: Session["reasoning"];
   }): Session {
+    const workspace = this.workspace(input.workspaceId);
+    if (workspace.kind === "legacy") throw new Error("历史 Graph 工作区仅保留原执行，请创建新的 Workspace 开发");
     const session: Session = {
       id: randomUUID(),
+      workspaceId: workspace.id,
       title: text(input.title, "会话标题"),
       kind: "free",
       status: "idle",
@@ -308,12 +374,14 @@ export class HarnessEngine {
     if (typeof key !== "string" || key.length < 32 || key.length > 512)
       throw new ControllerError("UNAUTHORIZED", "A dedicated controller key is required", 401);
     let session = this.state.sessions.find((s) => s.id === id);
+    if (session && input.workspaceId !== undefined && input.workspaceId !== session.workspaceId)
+      throw new ControllerError("OWNERSHIP_CONFLICT", "The session workspace cannot change");
     if (session?.executionOwner?.kind === "external") {
       this.controllerSession(id, key);
       if (input.threadId && session.threadId !== input.threadId)
         throw new ControllerError("OWNERSHIP_CONFLICT", "The connected native thread identity cannot change");
       this.requireControllerThread(id, session.threadId);
-      return { sessionId: id, executionOwner: session.executionOwner, threadId: session.threadId };
+      return { sessionId: id, workspaceId: session.workspaceId, executionOwner: session.executionOwner, threadId: session.threadId };
     }
     if (session) {
       const observerPending = this.state.sessions.some((s) => this.forkSource(s)?.sessionId === id &&
@@ -340,7 +408,9 @@ export class HarnessEngine {
     }
     this.requireControllerThread(id, session?.threadId ?? input.threadId);
     if (!session) {
-      session = { id, title: input.title ?? "Desktop controller", kind: "free", status: "idle", messages: [], metrics: emptyMetrics(), turns: 0 };
+      const workspace = this.workspace(input.workspaceId);
+      if (workspace.kind === "legacy") throw new ControllerError("INVALID_ARGUMENT", "Create a new Workspace for this controller", 400);
+      session = { id, workspaceId: workspace.id, title: input.title ?? "Desktop controller", kind: "free", status: "idle", messages: [], metrics: emptyMetrics(), turns: 0 };
       this.state.sessions.push(session);
     }
     session.executionOwner = { kind: "external", client: "desktop" };
@@ -350,7 +420,7 @@ export class HarnessEngine {
     session.error = undefined;
     (this.state.controllerAccess ??= []).push({ sessionId: id, keyHash: hash(key), requests: [] });
     this.record("controller.connected", "Desktop owns this free session", { sessionId: id });
-    return { sessionId: id, executionOwner: session.executionOwner, threadId: session.threadId };
+    return { sessionId: id, workspaceId: session.workspaceId, executionOwner: session.executionOwner, threadId: session.threadId };
   }
   async controllerCommand(sessionId: string, key: string, command: ControllerCommand): Promise<unknown> {
     if (this.closing) throw new ControllerError("UNAVAILABLE", "Engine is closing", 503);
@@ -368,7 +438,7 @@ export class HarnessEngine {
     switch (command.op) {
       case "state":
         if (graph) return this.controllerGraphView(graph);
-        return { session: { id: session.id, title: session.title, executionOwner: session.executionOwner,
+        return { session: { id: session.id, workspaceId: session.workspaceId, title: session.title, executionOwner: session.executionOwner,
           threadId: session.threadId, frozenQueuedTurns: session.queue?.length ?? 0 },
           ...controllerPage(owned().map((g) => ({ id: g.id, name: g.name, status: g.status, createdAt: g.createdAt })), command.after, command.limit) };
       case "task_types":
@@ -378,7 +448,7 @@ export class HarnessEngine {
       case "graph_create": {
         const { fingerprint, prior } = receipt(command);
         if (prior) return { graphId: prior.resultId };
-        const created = this.makeGraph(command);
+        const created = this.makeGraph({ ...command, workspaceId: session.workspaceId });
         created.controllerSessionId = sessionId;
         created.subscription = command.subscription;
         this.state.graphs.push(created);
@@ -466,6 +536,7 @@ export class HarnessEngine {
       throw new Error("源会话尚无已完成轮次，暂时不能分叉");
     const session: Session = {
       id: randomUUID(),
+      workspaceId: source.workspaceId,
       title: input.title
         ? text(input.title, "标题")
         : `${kind === "interview" ? "访谈" : "侧聊"} · ${source.title}`,
@@ -474,7 +545,7 @@ export class HarnessEngine {
       model: source.model ?? source.acceptedConfig?.model,
       reasoning: source.reasoning ?? source.acceptedConfig?.reasoning,
       source: {
-        cwd: source.acceptedConfig?.cwd ?? this.state.project.path,
+        cwd: source.acceptedConfig?.cwd ?? this.workspace(source.workspaceId).path,
         sessionId: source.id,
         threadId: source.threadId,
         turnId: source.lastCompletedTurnId,
@@ -539,7 +610,7 @@ export class HarnessEngine {
       content: "",
       createdAt: now(),
       source: {
-        cwd: source.acceptedConfig?.cwd ?? this.state.project.path,
+        cwd: source.acceptedConfig?.cwd ?? this.workspace(source.workspaceId).path,
         sessionId: id,
         threadId: source.threadId ?? "",
         turnId: source.lastCompletedTurnId ?? "",
@@ -695,7 +766,7 @@ export class HarnessEngine {
           if (!this.runtime.discoverOptions)
             throw new Error("Runtime does not support skill discovery");
           const options = await this.runtime.discoverOptions(
-            this.state.project.path,
+            session.acceptedConfig?.cwd ?? session.source?.cwd ?? this.workspace(session.workspaceId).path,
           );
           for (const skill of input.skills)
             if (
@@ -732,7 +803,7 @@ export class HarnessEngine {
           );
           const config =
             session.acceptedConfig ??
-            this.configFor(session, this.state.project.path, target.purpose);
+            this.configFor(session, this.workspace(session.workspaceId).path, target.purpose);
           const prepared = this.inputs.prepare(
             session,
             target.id,
@@ -820,6 +891,8 @@ export class HarnessEngine {
             throw new Error(
               "Continue or cancel existing queued messages first",
             );
+          if (session.kind === "free" && this.workspacePublications.has(session.workspaceId ?? "main"))
+            throw new Error("工作区正在集成交付，请完成后再发送消息");
           remember();
           this.launchTurn(session, snapshot, attachments);
         }
@@ -862,6 +935,8 @@ export class HarnessEngine {
       input.attachmentIds ?? [],
     ),
   ) {
+    if (session.kind === "free" && this.workspacePublications.has(session.workspaceId ?? "main"))
+      throw new Error("工作区正在集成交付，请完成后再发送消息");
     session.model = input.model;
     session.reasoning = input.reasoning;
     this.launch(
@@ -872,7 +947,7 @@ export class HarnessEngine {
         : "chat",
       session.acceptedConfig?.cwd ??
         session.source?.cwd ??
-        this.state.project.path,
+        this.workspace(session.workspaceId).path,
       undefined,
       { attachments, skills: input.skills },
       input.mode === "queue",
@@ -886,6 +961,7 @@ export class HarnessEngine {
       this.jobs.has(session.id) ||
       session.status === "running" ||
       !session.queue?.length
+      || (session.kind === "free" && this.workspacePublications.has(session.workspaceId ?? "main"))
     )
       return;
     try {
@@ -905,8 +981,9 @@ export class HarnessEngine {
       });
     }
   }
-  private ensureStopped(session: Session) {
-    if (session.status === "running" || this.jobs.has(session.id))
+  private ensureStopped(session: Session, allowMail = false) {
+    if ((session.status === "running" || this.jobs.has(session.id)) &&
+        !(allowMail && this.state.executions.findLast((e) => e.sessionId === session.id)?.purpose === "mail"))
       throw new Error("此会话正在执行");
     for (const e of this.state.executions.filter(
       (e) => e.sessionId === session.id && e.error?.includes("服务中断"),
@@ -966,6 +1043,8 @@ export class HarnessEngine {
     };
   }
   private makeGraph(input: GraphInput) {
+    const workspace = this.workspace(input.workspaceId);
+    if (workspace.kind === "legacy") throw new Error("历史 Graph 工作区不能创建新图，请创建新的 Workspace");
     text(input.name, "Graph 名称");
     if (!Array.isArray(input.tasks) || !input.tasks.length)
       throw new Error("Graph 至少需要一个 Task");
@@ -975,6 +1054,7 @@ export class HarnessEngine {
       throw new Error("并发数需要在 1 至 8 之间");
     const graph: Graph = {
       id: randomUUID(),
+      workspaceId: workspace.id,
       name: input.name,
       status: "draft",
       tasks: input.tasks.map((t, i) => this.makeTask(t, i)),
@@ -1014,6 +1094,9 @@ export class HarnessEngine {
         this.session(input.controllerSessionId).kind !== "free"
       )
         throw new Error("主控必须是自由会话");
+      if (input.controllerSessionId && this.workspace(graph.workspaceId).kind !== "legacy" &&
+          this.session(input.controllerSessionId).workspaceId !== graph.workspaceId)
+        throw new Error("主控会话必须属于同一工作区");
       graph.controllerSessionId = input.controllerSessionId || undefined;
     }
     this.record("graph.subscription", "更新订阅", { graphId: id });
@@ -1130,6 +1213,7 @@ export class HarnessEngine {
         this.state.project.path,
         id,
         graph.runId,
+        this.workspace(graph.workspaceId),
       );
       graph.integration = { headSha: graph.workspace.baseCommit, deliveries: [] };
       this.record("graph.prepared", "Graph 基线已准备", { graphId: id });
@@ -1321,6 +1405,7 @@ export class HarnessEngine {
     this.pumping.add(graph.id);
     try {
       this.drainIntegration(graph);
+      graph.integration!.headSha = await this.git.integrationHead(graph.workspace);
       for (const task of graph.tasks) {
         if (graph.status !== "running") break;
         if (
@@ -1406,7 +1491,7 @@ export class HarnessEngine {
   private finishGraph(graph: Graph) {
     graph.finalSha = graph.integration!.headSha;
     graph.status = "done";
-    this.record("graph.done", "Graph 已完成，项目主分支未合并", { graphId: graph.id });
+    this.record("graph.done", "Graph 已完成，成果已发布到所属工作区", { graphId: graph.id });
   }
   private ensureValidatorStopped(delivery: TaskDelivery) {
     if (delivery.state.status !== "blocked" || !delivery.state.validatorPid) return;
@@ -1459,9 +1544,20 @@ export class HarnessEngine {
   }
   private drainIntegration(graph: Graph) {
     if (this.integrations.has(graph.id) || graph.status !== "running" || this.closing) return;
+    const workspaceId = graph.workspaceId ?? "main";
+    if (this.workspacePublications.has(workspaceId)) return;
     const delivery = graph.integration!.deliveries.find((d) => d.state.status === "queued");
     if (!delivery) return;
     const task = this.task(graph, delivery.taskId);
+    for (const session of this.state.sessions.filter((s) => s.workspaceId === workspaceId && s.kind === "free")) {
+      try { this.ensureStopped(session, true); }
+      catch (error) {
+        delivery.state = { status: "blocked", error: `工作区自由会话正在写入，请等待执行结束后重试交付。${errorText(error)}` };
+        this.block(graph, task, delivery.state.error);
+        return;
+      }
+    }
+    this.workspacePublications.add(workspaceId);
     delivery.state = { status: "integrating" };
     task.status = "integrating";
     this.record("task.integrating", "正在合并并验证实际候选", { graphId: graph.id, taskId: task.id });
@@ -1475,7 +1571,7 @@ export class HarnessEngine {
             const command = graph.integrationCommand;
             const handle = this.command(command, candidate.path, (event) => {
               this.record("integration.output", event.text ?? "", { graphId: graph.id, taskId: task.id });
-            });
+            }, workspaceId);
             this.validators.set(graph.id, handle);
             delivery.state = { status: "integrating", validatorPid: handle.pid };
             this.record("integration.validation", "验证合并候选", { graphId: graph.id, taskId: task.id });
@@ -1506,8 +1602,10 @@ export class HarnessEngine {
       }
     })().finally(() => {
       this.integrations.delete(graph.id);
+      this.workspacePublications.delete(workspaceId);
+      for (const session of this.state.sessions.filter((s) => s.workspaceId === workspaceId && s.kind === "free")) this.drainQueue(session);
       this.settlePause(graph);
-      this.schedule(graph);
+      for (const sibling of this.state.graphs.filter((g) => g.workspaceId === workspaceId)) this.schedule(sibling);
     });
     this.integrations.set(graph.id, job);
   }
@@ -1553,6 +1651,7 @@ export class HarnessEngine {
     if (!session) {
       session = {
         id: randomUUID(),
+        workspaceId: graph.workspaceId,
         title: `${task.id} · ${unit.name}`,
         kind: "task",
         graphId: graph.id,
@@ -1865,7 +1964,7 @@ export class HarnessEngine {
         if (!this.git.createChild) throw new Error("Git adapter does not support isolated child workspaces");
         const id = randomUUID();
         const child: Session = {
-          id, title: text(command.title, "title"), kind: "task", graphId: graph.id, taskId: task.id, unitId: unit.id,
+          id, workspaceId: parent.workspaceId, title: text(command.title, "title"), kind: "task", graphId: graph.id, taskId: task.id, unitId: unit.id,
           status: "idle", model, reasoning: effort, messages: [], metrics: emptyMetrics(), turns: 0,
           child: { parentSessionId: parent.id, depth, state: "preparing", access,
             workspace: { path: "", branch: "", baseCommit: "" }, output: "none" },
@@ -2108,9 +2207,10 @@ export class HarnessEngine {
         this.requireLoom(session);
         const handle =
           context?.unit.kind === "command"
-            ? this.command(context.unit.command!, cwd, onEvent)
+            ? this.command(context.unit.command!, cwd, onEvent, session.workspaceId)
             : await this.runtime.start(
                 {
+                  ownerId: this.runtimeOwner(session.id),
                   cwd,
                   ...turnInput,
                   prompt: preparation.prompt,
@@ -2118,6 +2218,7 @@ export class HarnessEngine {
                   model: config.model,
                   reasoning: config.reasoning,
                   readOnly: config.readOnly,
+                  permissionMode: session.kind === "free" && !session.child ? "inherit" : "workspace",
                   observer: !!session.source,
                   child: !!session.child,
                   delegation: session.kind === "task" || session.source ? (config.delegation?.enabled ? "managed" : "disabled") : undefined,
@@ -2142,6 +2243,7 @@ export class HarnessEngine {
                     : {
                         HARNESS_URL: this.endpoint,
                         HARNESS_PROJECT_ID: this.state.project.id ?? "",
+                        HARNESS_WORKSPACE_ID: session.workspaceId ?? "main",
                         ...(execution.tokenHash
                           ? { HARNESS_TOKEN: token }
                           : {}),
@@ -2285,6 +2387,23 @@ export class HarnessEngine {
         detail: { seconds, usage: result.usage },
       });
       this.finishInterview(session, result);
+      if ((context && purpose !== "mail") || session.child?.access === "write") {
+        try {
+          await this.runtime.closeSession?.(this.runtimeOwner(session.id));
+        } catch (error) {
+          const reason = `后台资源清理未完成，成果尚未发布：${errorText(error)}`;
+          session.queuePaused = true;
+          this.record("session.resources_failed", reason, { sessionId: session.id, graphId: execution.graphId });
+          if (session.child) {
+            session.child.resultExecutionId = execution.id;
+            session.child.state = "failed";
+            if (session.child.access === "write") session.child.output = "conflict";
+            session.child.error = reason;
+            this.childNotice(session, execution);
+          } else if (context) this.block(context.graph, context.task, reason);
+          return;
+        }
+      }
       if (session.child)
         await this.finishChild(session, execution, result);
       else if (context && purpose !== "mail")
@@ -2367,6 +2486,7 @@ export class HarnessEngine {
       if (unit) unit.metrics.toolCalls++;
     }
     this.record("runtime." + event.type, event.text || event.type, {
+      executionId: execution.id,
       sessionId: session.id,
       graphId: execution.graphId,
       taskId: execution.taskId,
@@ -2378,6 +2498,7 @@ export class HarnessEngine {
     command: string,
     cwd: string,
     onEvent: (e: RuntimeEvent) => void,
+    workspaceId = "main",
   ): RuntimeHandle {
     const proc = spawn(
       process.platform === "win32" ? "powershell.exe" : "/bin/sh",
@@ -2389,6 +2510,7 @@ export class HarnessEngine {
         env: {
           ...process.env,
           HARNESS_PROJECT_ID: this.state.project.id ?? "",
+          HARNESS_WORKSPACE_ID: workspaceId,
           HARNESS_URL: this.endpoint,
         },
         windowsHide: true,
@@ -2747,6 +2869,7 @@ export class HarnessEngine {
     }
     let roots = [
       this.state.project.path,
+      this.workspace(graph.workspaceId).path,
       ...graph.tasks.flatMap((t) => (t.workspace ? [t.workspace.path] : [])),
     ];
     if (token) {
@@ -2930,7 +3053,7 @@ export class HarnessEngine {
           session,
           "处理下面的 Mailbox 通知，需要裁决时给出建议。本轮不要修改项目代码。",
           "mail",
-          this.state.project.path,
+          this.workspace(session.workspaceId).path,
         );
         return;
       }

@@ -8,8 +8,10 @@
   },
   "scripts": {
     "dev": "npm run build && node dist/server/main.js",
-    "build": "tsc -p tsconfig.server.json && vite build",
+    "build": "tsc -p tsconfig.server.json && node scripts/copy-runtime-assets.mjs && vite build",
     "start": "node dist/server/main.js",
+    "stop": "node dist/cli.js stop",
+    "restart": "node dist/cli.js restart",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "cli": "tsx src/cli.ts"

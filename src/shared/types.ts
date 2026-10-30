@@ -8,6 +8,23 @@ export interface ProjectEntry {
   activeSessions?: number;
   activeGraphs?: number;
 }
+export type ProjectWorkspace = {
+  id: string;
+  name: string;
+  path: string;
+  createdAt: string;
+} & (
+  | { kind: "main" }
+  | { kind: "feature"; branch: string; baseCommit: string }
+  | { kind: "legacy"; branch: string; baseCommit: string }
+);
+export interface WorkspaceInput {
+  name: string;
+  sourceWorkspaceId?: string;
+}
+export type WorkspaceStatus =
+  | { status: "ready"; branch: string | null; dirty: boolean }
+  | { status: "unavailable"; error: string };
 export interface Attachment {
   id: string;
   name: string;
@@ -147,6 +164,7 @@ export interface ChatMessage {
 }
 export interface Session {
   id: string;
+  workspaceId?: string;
   title: string;
   kind: "free" | "task" | "sidechat" | "interview";
   executionOwner?: { kind: "loom" } | { kind: "external"; client: "desktop" };
@@ -243,6 +261,7 @@ export interface Task {
 }
 export interface GraphInput {
   name: string;
+  workspaceId?: string;
   tasks: TaskInput[];
   concurrency?: number;
   integrationCommand?: string;
@@ -271,6 +290,7 @@ export interface TaskDelivery {
 }
 export interface Graph {
   id: string;
+  workspaceId?: string;
   name: string;
   runId?: string;
   status:
@@ -311,6 +331,7 @@ export interface Letter extends LetterInput {
 }
 export interface HarnessEvent {
   id: number;
+  executionId?: string;
   at: string;
   type: string;
   message: string;
@@ -346,6 +367,7 @@ export interface Execution {
 export interface ProjectState {
   version: 1;
   project: { id?: string; path: string; name: string };
+  workspaces?: ProjectWorkspace[];
   sessions: Session[];
   graphs: Graph[];
   letters: Letter[];
@@ -361,6 +383,7 @@ export interface ProjectState {
 }
 export interface AppState {
   project: ProjectState["project"] | null;
+  workspaces?: ProjectWorkspace[];
   sessions: Session[];
   graphs: Graph[];
   letters: Letter[];
@@ -379,12 +402,14 @@ export interface RuntimeCapabilities {
   fork?: boolean;
 }
 export interface RuntimeInput {
+  ownerId?: string;
   cwd: string;
   prompt: string;
   threadId?: string;
   model?: string;
   reasoning?: Reasoning;
   readOnly?: boolean;
+  permissionMode?: "inherit" | "workspace";
   writableRoots?: string[];
   observer?: boolean;
   delegation?: "disabled" | "managed";
@@ -426,6 +451,21 @@ export interface RuntimeHandle {
     input?: Pick<RuntimeInput, "attachments" | "skills">,
   ): Promise<boolean>;
 }
+export interface RuntimeProcessInfo {
+  id: string;
+  pid: number;
+  name: string;
+  role: "backend" | "descendant";
+  memoryBytes: number;
+}
+export interface RuntimeResources {
+  state: "unavailable" | "starting" | "active" | "idle" | "closing" | "closed" | "failed";
+  processes: RuntimeProcessInfo[];
+  error?: string;
+}
+export interface SessionResources extends RuntimeResources {
+  sessionId: string;
+}
 export interface Runtime {
   name: string;
   capabilities: RuntimeCapabilities;
@@ -434,15 +474,21 @@ export interface Runtime {
     onEvent: (event: RuntimeEvent) => void,
   ): Promise<RuntimeHandle>;
   close?(): Promise<void>;
+  resources?(ownerId: string): Promise<RuntimeResources>;
+  stopResource?(ownerId: string, resourceId: string): Promise<void>;
+  closeSession?(ownerId: string): Promise<void>;
   discoverOptions?(cwd: string): Promise<RuntimeOptions>;
 }
 export interface GitAdapter {
+  workspaceStatus?(workspace: ProjectWorkspace): Promise<WorkspaceStatus>;
+  createWorkspace?(projectRoot: string, workspaceId: string, source: ProjectWorkspace): Promise<Workspace>;
   createChild?(parent: Workspace, sessionId: string): Promise<Workspace>;
   integrateChild?(parent: Workspace, child: Workspace, sha: string, operationId: string): Promise<string>;
   createGraph(
     projectRoot: string,
     graphId: string,
     runId: string,
+    target?: ProjectWorkspace,
   ): Promise<Workspace>;
   createTask(
     graph: Workspace,

@@ -1,6 +1,6 @@
 # Loom
 
-本地 Codex 工作台。自由会话和 Task 会话分区显示；DAG 按依赖调度，任务通过 CLI 交卷，程序执行审查、返修与 Git 快照。原型保留在 prototype/，正式界面由 web/ 提供。
+本地 Codex 工作台。每个 Workspace 拥有独立代码目录、自由会话和任务图；DAG 按依赖调度，任务通过 CLI 交卷，程序执行审查、返修与 Git 快照。原型保留在 prototype/，正式界面由 web/ 提供。
 
 ## 启动
 
@@ -11,7 +11,7 @@ npm ci
 npm run dev
 ```
 
-打开 http://127.0.0.1:4317 ，通过项目选择器输入本地文件夹的绝对路径。不存在的目录会新建并初始化 Git；已有目录保留原文件。加入过的项目保存在列表中，切换页面后原项目的会话和任务图继续执行。自由会话可用于一般目录；Task Graph 要求目录是有初始提交的 Git 仓库根目录。图从运行时的 HEAD 开始，不包含原目录未提交的修改。
+打开 http://127.0.0.1:4317 ，通过项目选择器输入本地文件夹的绝对路径。不存在的目录会新建并初始化 Git；已有目录保留原文件。主工作区使用项目原目录。点击「＋ Workspace」并输入功能名称，从选定工作区的已提交版本创建独立分支和代码目录。此后新建的会话和 Graph 自动归属当前工作区。选择其他对话或项目后，原执行继续运行。自由会话可用于一般目录；创建功能 Workspace 和运行 Graph 需要有初始提交的 Git 仓库。Graph 从所属工作区运行时的已提交 HEAD 开始，不包含未提交修改。
 
 也可以先构建，再指定项目启动：
 
@@ -20,16 +20,28 @@ npm run build
 npm start -- --project F:/your/project --port 4317
 ```
 
+在另一个终端停止或重启服务：
+
+```powershell
+npm run stop
+npm run restart
+npm run restart -- --port 4318
+```
+
+命令等待服务实际停止或新实例就绪。重启保留正在运行服务的端口、项目和运行环境，新实例在后台运行，日志写入 `.newharness/services/<port>.log`。服务未运行时，`restart` 按默认配置启动并沿用项目注册表，可用 `--port` 指定端口。需要指定项目时仍可使用 `npm start -- --project ...`。停止会中断运行中的 Agent 与验证进程并保存状态；重启后任务保持暂停，不自动续跑。默认等待 120 秒，可通过 `--timeout <毫秒>` 调整，超时不会强制结束进程。
+
+首次从不支持这些命令的旧服务升级，先在原启动终端按一次 `Ctrl+C`，再运行 `npm start`。之后即可使用上述命令。服务管理凭据只保存在本机，Unit 执行中的 CLI 不允许停止整个 Loom 服务。
+
 ## 使用
 
-1. Sessions 的“＋ 自由会话”创建独立 Codex 会话。每次后续消息恢复原 thread。
+1. Workspaces 是统一入口，同时列出项目内各个 Workspace、对话和 Graph。直接选择其中的对话发送消息；每组的「＋ 对话」和「＋ 图」在该工作区创建内容。各对话保留独立草稿，每次后续消息恢复原 thread。选择 Graph 时，工作区树继续显示在左侧。旧服务缺少工作区接口时，已有内容集中显示在主工作区，并提示重启后启用新建 Workspace。
 2. 新建 Graph，添加任务、依赖与 TaskType。内置“直接交付”和“实现与审查”。点击 Run graph 后，独立任务可以并行。
-3. Worker 生成报告并调用配套 CLI。正常结束且报告有效后，按 TaskType 进入 Reviewer 或交付队列。要求审查时，Reviewer 必须通过当前候选。队列串行合并、验证并推进 Graph 集成分支，此后 Task 才完成。返修复用各自原会话。
+3. Worker 生成报告并调用配套 CLI。正常结束且报告有效后，按 TaskType 进入 Reviewer 或交付队列。要求审查时，Reviewer 必须通过当前候选。同一工作区的交付串行合并、验证并推进工作区分支，同步代码目录后 Task 才完成。返修复用各自原会话。
 4. 软暂停阻止新派发和新交付出队，等待当前 Unit 及已开始的集成收尾。硬暂停中断执行和验证，并等待操作结束；已经发布的交付保留。完全暂停且交付核对完成后可改任务目标，已创建工作区的依赖和已交付任务不能原地改写。
 5. 每个 Unit 可查看会话、时间、Tool Calls、Input / Cached Input / Output Token 和收发件箱。Cached Input 是 Input 的子集，总量只相加 Input 与 Output。统计页提供会话、图、任务、成员和单次执行明细；旧执行缺少的数据标成未知。报告和 Letter 保存固定内容，修改源文件不会改变已发送内容。
 6. 下游等待所有前置 Task 成功集成，再从固定的 Graph 当前 HEAD 创建工作区，可能包含已经集成的独立任务。运行中的工作区保持原起点。所有 Task 集成后 Graph 完成，不再进行整图最终合并。Debug 可查看成果路径与提交。
 
-创建 Graph 时可配置集成验证命令。程序在隔离工作区合并每个候选，并在实际合并结果上执行命令，通过后才发布到 Graph 分支。未填写时明确记录未配置验证。冲突或验证失败阻塞该次交付，下游继续等待，其他独立任务和交付可以继续。解除阻塞重试固定候选，不重新执行已经验收的 Agent。项目原分支不会自动合并或推送。
+创建 Graph 时可配置集成验证命令。程序在隔离工作树合并每个候选，并在实际合并结果上执行命令，通过后才发布到所属工作区。未填写时明确记录未配置验证。冲突、验证失败、活动自由写会话或工作区未提交修改会阻塞该次交付并保留现场。解除阻塞重试固定候选，不重新执行已经验收的 Agent。功能工作区交付不修改项目原分支，不自动推送。旧 Graph 保留原执行目录和专用分支，显示在历史工作区中。
 
 自由会话支持模型和推理强度选择、`/` 命令菜单、`$skill` 检索与引用。模型和 Skill 从本机 Codex 查询。图片支持 PNG、JPEG、WebP，按原生图片输入发送；普通文件保存为可读文件引用。每个附件最大 10 MB，每条消息最多 12 个附件。
 
@@ -66,15 +78,15 @@ TaskType 的 units 可以包含 kind=command 和 command 字段。命令由本�
 
 项目原名 New Harness，现在统一称为 Loom。本次只更改产品名称与 CLI 入口，保留 `.newharness` 数据目录、`HARNESS_*` 环境变量、Git 内部引用和浏览器项目选择键。已有会话、项目列表与工作区直接沿用，无须迁移。代码仓库所在文件夹也无须改名。
 
-项目数据位于 `.newharness/state.sqlite`，状态和事件事务保存；报告位于 `.newharness/reports`，附件位于 `.newharness/attachments`，托管 Git 工作树位于 `.newharness/worktrees`。不删除这个目录来“重试”。全局 AgentTemplate 和 TaskType 位于 `~/.newharness/catalog.json`，项目列表位于 `~/.newharness/projects.json`。服务可通过 HARNESS_CATALOG 和 HARNESS_REGISTRY 指定其他文件。
+项目数据位于 `.newharness/state.sqlite`，状态和事件事务保存；报告位于 `.newharness/reports`，附件位于 `.newharness/attachments`，功能工作区位于 `.newharness/workspaces`，Graph 和 Task 执行工作树位于 `.newharness/worktrees`。不删除这些目录来“重试”。全局 AgentTemplate 和 TaskType 位于 `~/.newharness/catalog.json`，项目列表位于 `~/.newharness/projects.json`。服务可通过 HARNESS_CATALOG 和 HARNESS_REGISTRY 指定其他文件。
 
-运行适配器使用官方 Codex App Server，以支持运行中 steer 和中断。业务代码仅依赖 Runtime 接口。Windows 本机已验证 Codex 0.160.0；采用进程级 unelevated sandbox，不修改 Codex 全局配置。Reviewer 在独立报告目录执行，只读代码目录；本地汇报需要网络访问，因此不宣称网络隔离。CODEX_WINDOWS_SANDBOX 可显式指定 elevated，但此机器的 elevated helper 曾出现 ACL 错误。非 Windows 的细粒度权限尚未实机验收。
+运行适配器使用官方 Codex App Server，以支持运行中 steer 和中断。业务代码仅依赖 Runtime 接口。自由会话在新建及恢复时沿用 Codex 当前配置的权限，Task Agent 和受管理子 Agent 保持工作区限制，侧聊与访谈保持只读。Windows 本机已验证 Codex 0.160.0；自由会话沿用 Codex 的 Windows sandbox 配置，受限会话默认采用进程级 unelevated sandbox，CODEX_WINDOWS_SANDBOX 可显式覆盖此选项，不修改 Codex 全局配置。Reviewer 在独立报告目录执行，只读代码目录；本地汇报需要网络访问，因此不宣称网络隔离。非 Windows 的细粒度权限尚未实机验收。
 
 服务意外退出后不自动续跑。先检查阻塞说明、原进程、工作区与交付记录，再显式恢复。旧进程仍存活时，程序拒绝再次执行。已结束但尚未完成的快照或交付可通过解除阻塞重试同一操作。已发布的交付保持有效。不要同时用别的编辑器修改正在运行的托管工作树。
 
 ## 首版边界
 
-- 当前只开放独立 Task worktree；共享工作区的串行模式未开放。
+- Task 之间使用独立执行 worktree。同一产品 Workspace 的自由会话共享代码，Graph 按 Workspace 串行发布交付。
 - Reviewer 可写报告，尚未开放“只新增测试文件”的细粒度权限。
 - TaskType 首版一个入口、按结果激活下一成员；多个 Task 可并行，同一 Task 不同时运行多个成员。规则编辑使用 JSON。
 - Graph 引用节点、已交付任务重开及其下游失效、完整取消和交付回退留待后续实现。[后续设计](DESIGN-NOTES.md#返工与回退的后续设计) 已决定返工复用 session 并新建当前 Graph HEAD 的执行工作区，回退使用经过验证的逆向提交；当前没有这些操作入口。
